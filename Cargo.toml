@@ -1,0 +1,87 @@
+[workspace]
+members = [
+    "xtask",
+    "crates/forge-domain",
+    "crates/forge-platform",
+    "crates/forge-runtime",
+    "crates/forge-workspace",
+    "crates/forge-execution",
+    "crates/forge-persistence",
+    "crates/forge-control",
+    "crates/forge-mcp",
+    "crates/forge-ui",
+    "crates/forge-desktop",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+authors = ["Heterarchy Systems"]
+repository = "https://github.com/heterarchy-systems/heterarchy-forge"
+
+[workspace.dependencies]
+base64 = { version = "=0.22.1", default-features = false, features = ["std"] }
+blake3 = { version = "=1.8.7", default-features = false, features = ["std"] }
+directories = "6.0.0"
+objc2 = { version = "=0.6.4", default-features = false, features = ["std"] }
+objc2-app-kit = { version = "=0.3.2", default-features = false, features = [
+    "NSApplication",
+    "NSOpenPanel",
+    "NSPanel",
+    "NSResponder",
+    "NSSavePanel",
+    "NSWindow",
+] }
+rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled"] }
+rmcp = { version = "=3.1.4", default-features = false, features = ["server", "transport-io"] }
+rustix = { version = "=1.1.4", default-features = false, features = ["fs", "std"] }
+rustix-process = { package = "rustix", version = "=1.1.4", default-features = false, features = ["fs", "process", "std"] }
+similar = { version = "=3.2.0", default-features = false, features = ["std", "text"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+sha2 = "=0.10.9"
+slint = { version = "=1.17.1", default-features = false, features = [
+    "accessibility",
+    "backend-winit",
+    "compat-1-2",
+    "renderer-femtovg",
+    "std",
+    "system-tray",
+] }
+slint-build = "=1.17.1"
+thiserror = "2.0.20"
+toml = "=0.9.12"
+tokio = { version = "1.53.1", default-features = false, features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio-util = { version = "0.7.19", default-features = false, features = ["rt"] }
+tracing = { version = "0.1.44", default-features = false, features = ["std", "attributes"] }
+tracing-appender = "0.2.5"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["ansi", "env-filter", "fmt", "json", "registry"] }
+uuid = { version = "=1.25.0", features = ["v7"] }
+zstd = { version = "=0.13.3", default-features = false }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+await_holding_lock = "deny"
+dbg_macro = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+undocumented_unsafe_blocks = "deny"
+unwrap_used = "deny"
+large_futures = "warn"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+missing_const_for_fn = "allow"

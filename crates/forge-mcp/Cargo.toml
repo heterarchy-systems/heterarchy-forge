@@ -1,0 +1,25 @@
+[package]
+name = "forge-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+base64.workspace = true
+forge-control = { path = "../forge-control" }
+forge-domain = { path = "../forge-domain" }
+forge-persistence = { path = "../forge-persistence" }
+forge-platform = { path = "../forge-platform" }
+forge-workspace = { path = "../forge-workspace" }
+rmcp.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,113 @@
+export struct LocationRow {
+    machine-id: string,
+    revision: string,
+    display-name: string,
+    root: string,
+    state: string,
+}
+
+export struct WorkspaceRow {
+    label: string,
+    kind: string,
+    relative-display: string,
+    signals: string,
+}
+
+export struct ActivityRow {
+    id: string,
+    display-label: string,
+    state: string,
+    liveness: string,
+    revision: string,
+    created-at: string,
+    updated-at: string,
+}
+
+export struct DiffRow {
+    id: string,
+    path: string,
+    kind: string,
+    state: string,
+    summary: string,
+}
+
+export struct ApprovalRow {
+    id: string,
+    action: string,
+    scope: string,
+    expires-at: string,
+}
+
+// Optional durable contracts. Empty models remain valid product truth.
+// Goal rows are already reduced to operator-safe display facts by the desktop
+// projection boundary; Slint never derives lifecycle or completion authority.
+export struct GoalRow {
+    id: string,
+    title: string,
+    objective: string,
+    state: string,
+    revision: string,
+    success-criterion: string,
+    check-summary: string,
+    evidence-summary: string,
+    blocker: string,
+    terminal: bool,
+    can-pause: bool,
+    can-resume: bool,
+    can-cancel: bool,
+    can-complete: bool,
+}
+
+export struct DagNodeRow {
+    id: string,
+    label: string,
+    state: string,
+    objective: string,
+    acceptance: string,
+    depends-on: string,
+    waiting-on: string,
+    evidence: string,
+    revision: string,
+    current: bool,
+    terminal: bool,
+    column: int,
+    lane: int,
+}
+
+// Exact validated edges from the current durable DAG revision. Coordinates
+// are a bounded UI projection only; the Slint surface cannot author edges.
+export struct DagEdgeRow {
+    upstream-id: string,
+    downstream-id: string,
+    upstream-label: string,
+    downstream-label: string,
+    from-column: int,
+    from-lane: int,
+    to-column: int,
+    to-lane: int,
+    blocked: bool,
+    current-path: bool,
+}
+
+// Operator-safe narrative only; never private chain-of-thought.
+export struct WorkNarrativeRow {
+    phase: string,
+    action: string,
+    rationale: string,
+    evidence: string,
+    state: string,
+}
+
+export struct HarnessRow {
+    machine-id: string,
+    revision: string,
+    label: string,
+    value: string,
+    state: string,
+}
+
+export struct DoctorFindingRow {
+    area: string,
+    status: string,
+    detail: string,
+}

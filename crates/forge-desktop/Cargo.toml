@@ -1,0 +1,22 @@
+[package]
+name = "forge-desktop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+forge-control = { path = "../forge-control" }
+forge-domain = { path = "../forge-domain" }
+forge-persistence = { path = "../forge-persistence" }
+forge-platform = { path = "../forge-platform" }
+forge-runtime = { path = "../forge-runtime" }
+forge-ui = { path = "../forge-ui" }
+forge-workspace = { path = "../forge-workspace" }
+slint.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

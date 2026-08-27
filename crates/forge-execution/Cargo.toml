@@ -1,0 +1,19 @@
+[package]
+name = "forge-execution"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+blake3.workspace = true
+forge-domain = { path = "../forge-domain" }
+forge-workspace = { path = "../forge-workspace" }
+rustix-process.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+uuid.workspace = true
+
+[lints]
+workspace = true

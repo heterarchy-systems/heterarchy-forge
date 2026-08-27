@@ -1,0 +1,1754 @@
+//! Heterarchy Forge repository-local mechanical verification harness.
+//!
+//! This active Rust workspace uses `xtask` for rules, locked metadata,
+//! formatting, build/test/Clippy, dependency, and doctor gates.
+
+use std::env;
+use std::ffi::OsStr;
+use std::fmt;
+use std::fs;
+use std::io::{self, Read};
+use std::os::unix::process::CommandExt;
+use std::path::{Component, Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
+
+use serde_json::Value as JsonValue;
+use sha2::{Digest, Sha256};
+use toml::Value as TomlValue;
+
+const HARNESS_DIR: &str = ".agents/rust_dev_harness";
+const TASK_OWNERSHIP_RULE: &str = concat!("02-task-ownership-", "structured-concurrency-rules.md");
+const FORGE_PERSISTENCE_RULE: &str = "10-forge-persistence-sql-rules.md";
+const FORGE_PERSISTENCE_HARNESS: &str = "harness/forge-persistence/README.md";
+const FORGE_PERSISTENCE_MANIFEST: &str = "crates/forge-persistence/Cargo.toml";
+const FORBIDDEN_PERSISTENCE_DEPENDENCIES: &[&str] = &["diesel", "diesel-async", "sea-orm", "sqlx"];
+const NORMAL_RULES: &[&str] = &[
+    "README.md",
+    "00-overview.md",
+    "01-boundary.md",
+    "02-workspace-crate-rules.md",
+    "03-deterministic-state-machine-rules.md",
+    "04-ffi-interop-boundary-rules.md",
+    "05-error-panic-rules.md",
+    "06-testing-verification-rules.md",
+    "07-performance-memory-rules.md",
+    "08-observability-operations-rules.md",
+    "09-module-layout-rules.md",
+    FORGE_PERSISTENCE_RULE,
+];
+const TYPE_RULES: &[&str] = &[
+    "README.md",
+    "01-domain-newtype-invariant-rules.md",
+    "02-enum-state-sum-type-rules.md",
+    "03-option-result-outcome-rules.md",
+    "04-trait-generic-bound-rules.md",
+    "05-ownership-borrow-lifetime-rules.md",
+    "06-smart-pointer-interior-mutability-rules.md",
+    "07-send-sync-thread-safety-type-rules.md",
+    "08-conversion-parsing-cast-rules.md",
+    "09-public-api-type-evolution-rules.md",
+    "10-unsafe-type-invariant-rules.md",
+];
+const ASYNC_RULES: &[&str] = &[
+    "README.md",
+    "01-execution-model-runtime-rules.md",
+    TASK_OWNERSHIP_RULE,
+    "03-cancellation-timeout-select-rules.md",
+    "04-bounded-concurrency-backpressure-rules.md",
+    "05-shared-state-lock-channel-rules.md",
+    "06-blocking-cpu-parallelism-rules.md",
+    "07-send-sync-local-task-rules.md",
+    "08-async-error-shutdown-rules.md",
+    "09-async-testing-verification-rules.md",
+    "10-async-observability-performance-rules.md",
+];
+const REQUIRED_SKILL: &str = "skills/rust-engineering/SKILL.md";
+const ALEXANDRIA_SOURCE_COUNT: usize = 40;
+const FORBIDDEN_IMPLEMENTATION_EXTENSIONS: &[&str] = &[
+    "py", "pyi", "js", "jsx", "ts", "tsx", "mjs", "cjs", "go", "java", "kt", "kts", "swift", "c",
+    "cc", "cpp", "cxx", "m", "mm",
+];
+const WALK_SKIP_DIRS: &[&str] = &[
+    ".git",
+    ".agents",
+    ".chatgpt2codex",
+    ".heterarchy-forge",
+    ".opencode",
+    "target",
+];
+const MAX_POLICY_TEXT_BYTES: usize = 1_048_576;
+const MAX_DOCTOR_OUTPUT_BYTES: usize = 64 * 1024;
+const MAX_TOOL_VERSION_OUTPUT_BYTES: usize = 1_024;
+const PROCESS_CAPTURE_TIMEOUT: Duration = Duration::from_secs(30);
+const PROCESS_CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const PROCESS_CAPTURE_STREAM_COUNT: usize = 2;
+const REQUIRED_CARGO_DENY_VERSION: &str = "cargo-deny 0.20.2";
+const REQUIRED_CARGO_AUDIT_VERSION: &str = "cargo-audit 0.22.2";
+const MSRV_TOOLCHAIN: &str = "1.92.0";
+
+fn main() {
+    if let Err(error) = run() {
+        eprintln!("cargo xtask: {error}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<(), String> {
+    match env::args().nth(1).as_deref().unwrap_or("help") {
+        "rules" => rules(),
+        "fmt" => cargo(&["fmt", "--all", "--", "--check"]),
+        "check" => check(),
+        "test" => test(),
+        "ci" => ci(),
+        "doctor" => doctor(),
+        "deps" => deps(),
+        "supply-chain" => supply_chain(),
+        "extended" => extended(),
+        "perf" => perf(),
+        "msrv" => msrv(),
+        "persistence" => persistence(),
+        "help" | "--help" | "-h" => {
+            println!(
+                "usage: cargo xtask <rules|fmt|check|test|ci|doctor|deps|supply-chain|extended|perf|msrv|persistence>"
+            );
+            Ok(())
+        }
+        other => Err(format!("unknown command {other:?}")),
+    }
+}
+
+fn ci() -> Result<(), String> {
+    rules()?;
+    require_nonempty_file(&workspace_root().join("Cargo.lock"), "Cargo lockfile")?;
+    cargo(&["fmt", "--all", "--", "--check"])?;
+    check()?;
+    test()
+}
+
+fn check() -> Result<(), String> {
+    cargo(&["check", "--locked", "--workspace", "--all-targets"])?;
+    cargo(&[
+        "clippy",
+        "--locked",
+        "--workspace",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings",
+    ])
+}
+
+fn test() -> Result<(), String> {
+    cargo(&["test", "--locked", "--workspace", "--all-targets"])
+}
+
+fn persistence() -> Result<(), String> {
+    let root = workspace_root();
+    let harness_root = root.join(HARNESS_DIR);
+    verify_forge_persistence_policy(&root, &harness_root)?;
+    cargo(&[
+        "check",
+        "--locked",
+        "-p",
+        "forge-persistence",
+        "--all-targets",
+    ])?;
+    cargo(&[
+        "clippy",
+        "--locked",
+        "-p",
+        "forge-persistence",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings",
+    ])?;
+    cargo(&[
+        "test",
+        "--locked",
+        "-p",
+        "forge-persistence",
+        "--all-targets",
+    ])?;
+    println!("Heterarchy Forge persistence harness passed");
+    Ok(())
+}
+
+fn doctor() -> Result<(), String> {
+    let root = workspace_root();
+    let sandbox = DoctorSandbox::create()?;
+    rules()?;
+    command("rustc", &["--version"])?;
+    command("cargo", &["--version"])?;
+    command("cargo", &["fmt", "--version"])?;
+    command("cargo", &["clippy", "--version"])?;
+    command("rustup", &["run", MSRV_TOOLCHAIN, "rustc", "--version"])?;
+    require_tool_version("cargo-deny", REQUIRED_CARGO_DENY_VERSION, &root)?;
+    require_tool_version("cargo-audit", REQUIRED_CARGO_AUDIT_VERSION, &root)?;
+    require_nonempty_file(&root.join("Cargo.lock"), "Cargo lockfile")?;
+    cargo(&[
+        "build",
+        "--locked",
+        "-p",
+        "forge-desktop",
+        "-p",
+        "forge-mcp",
+    ])?;
+    run_doctor_binary(
+        &root,
+        "forge-desktop",
+        &[
+            "Heterarchy Forge doctor: PASS_WITH_WARNINGS",
+            "registry_health=NOT_INITIALIZED",
+            "runtime_phase=Running",
+        ],
+        sandbox.registry_path(),
+        sandbox.home(),
+    )?;
+    run_doctor_binary(
+        &root,
+        "forge-mcp",
+        &[
+            "mcp_doctor=PASS_WITH_WARNINGS",
+            "registry_health=NOT_INITIALIZED",
+            "runtime_ownership=PASS",
+            "tool_names=PASS",
+            "shutdown=PASS",
+        ],
+        sandbox.registry_path(),
+        sandbox.home(),
+    )?;
+    if sandbox.registry_path().exists() {
+        return Err(format!(
+            "doctor created the isolated registry {}",
+            sandbox.registry_path().display()
+        ));
+    }
+    println!("Heterarchy Forge Rust harness doctor passed");
+    Ok(())
+}
+
+fn run_doctor_binary(
+    root: &Path,
+    binary_name: &str,
+    markers: &[&str],
+    registry_path: &Path,
+    home: &Path,
+) -> Result<(), String> {
+    let doctor_binary = root.join("target/debug").join(binary_name);
+    let environment = [
+        (
+            OsStr::new("HETERARCHY_FORGE_REGISTRY_PATH"),
+            registry_path.as_os_str(),
+        ),
+        (OsStr::new("HOME"), home.as_os_str()),
+    ];
+    let captured = capture_process_with_env(
+        &doctor_binary,
+        &["--doctor"],
+        root,
+        MAX_DOCTOR_OUTPUT_BYTES,
+        &environment,
+    )?;
+    if !captured.status.success() {
+        return Err(format!(
+            "{} --doctor exited with status {}",
+            doctor_binary.display(),
+            captured.status
+        ));
+    }
+    if captured.stdout_total > MAX_DOCTOR_OUTPUT_BYTES
+        || captured.stderr_total > MAX_DOCTOR_OUTPUT_BYTES
+    {
+        return Err(format!(
+            "{} --doctor output exceeded the {}-byte per-stream cap",
+            doctor_binary.display(),
+            MAX_DOCTOR_OUTPUT_BYTES
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&captured.stdout);
+    for marker in markers {
+        if !stdout.contains(marker) {
+            return Err(format!(
+                "{} --doctor output is missing required marker {marker:?}",
+                doctor_binary.display()
+            ));
+        }
+    }
+    print!("{stdout}");
+    if !captured.stderr.is_empty() {
+        eprint!(
+            "{} --doctor stderr:\n{}",
+            doctor_binary.display(),
+            String::from_utf8_lossy(&captured.stderr)
+        );
+    }
+    Ok(())
+}
+
+struct DoctorSandbox {
+    root: PathBuf,
+    home: PathBuf,
+    registry: PathBuf,
+}
+
+impl DoctorSandbox {
+    fn create() -> Result<Self, String> {
+        let root = env::temp_dir().join(format!(
+            "heterarchy-forge-xtask-doctor-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        let home = root.join("home");
+        fs::create_dir_all(&home).map_err(|error| {
+            format!(
+                "cannot create isolated doctor HOME {}: {error}",
+                home.display()
+            )
+        })?;
+        Ok(Self {
+            registry: root.join("support").join("registry.sqlite3"),
+            root,
+            home,
+        })
+    }
+
+    fn home(&self) -> &Path {
+        &self.home
+    }
+
+    fn registry_path(&self) -> &Path {
+        &self.registry
+    }
+}
+
+impl Drop for DoctorSandbox {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+fn unique_suffix() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos())
+}
+
+fn deps() -> Result<(), String> {
+    let root = workspace_root();
+    require_nonempty_file(&root.join("Cargo.lock"), "Cargo lockfile")?;
+    require_nonempty_file(&root.join("deny.toml"), "cargo-deny policy")?;
+    require_tool_version("cargo-deny", REQUIRED_CARGO_DENY_VERSION, &root)?;
+    cargo(&["deny", "check"])
+}
+
+fn supply_chain() -> Result<(), String> {
+    let root = workspace_root();
+    deps()?;
+    require_tool_version("cargo-audit", REQUIRED_CARGO_AUDIT_VERSION, &root)?;
+    cargo(&["audit"])
+}
+
+fn extended() -> Result<(), String> {
+    ci()?;
+    msrv()?;
+    supply_chain()?;
+    cargo(&["test", "--locked", "--workspace", "--doc"])?;
+    cargo(&[
+        "--config",
+        "build.rustdocflags=[\"-D\",\"warnings\"]",
+        "doc",
+        "--locked",
+        "--workspace",
+        "--no-deps",
+    ])
+}
+
+fn msrv() -> Result<(), String> {
+    command_in(
+        "rustup",
+        &[
+            "run",
+            MSRV_TOOLCHAIN,
+            "cargo",
+            "check",
+            "--locked",
+            "--workspace",
+            "--all-targets",
+        ],
+        &workspace_root(),
+    )
+}
+
+fn perf() -> Result<(), String> {
+    if !workspace_has_bench_target()? {
+        return Err(
+            "performance command is unconfigured: no workspace benchmark target found".to_owned(),
+        );
+    }
+    println!("running benchmarks as measurement evidence; no release-budget PASS is implied");
+    cargo(&["bench", "--locked", "--workspace"])
+}
+
+fn require_tool_version(program: &str, expected: &str, root: &Path) -> Result<(), String> {
+    let captured = capture_process(
+        Path::new(program),
+        &["--version"],
+        root,
+        MAX_TOOL_VERSION_OUTPUT_BYTES,
+    )?;
+    if !captured.status.success() {
+        return Err(format!(
+            "{program} --version exited with {}",
+            captured.status
+        ));
+    }
+    if captured.stdout_total > MAX_TOOL_VERSION_OUTPUT_BYTES
+        || captured.stderr_total > MAX_TOOL_VERSION_OUTPUT_BYTES
+    {
+        return Err(format!(
+            "{program} --version output exceeded the bounded policy"
+        ));
+    }
+    let actual = String::from_utf8_lossy(&captured.stdout);
+    if actual.trim() == expected {
+        Ok(())
+    } else {
+        Err(format!(
+            "{program} version mismatch: expected {expected:?}, observed {:?}",
+            actual.trim()
+        ))
+    }
+}
+
+fn rules() -> Result<(), String> {
+    let root = workspace_root();
+    let harness_root = root.join(HARNESS_DIR);
+
+    require_nonempty_file(&root.join("AGENTS.md"), "root agent instructions")?;
+    require_nonempty_file(
+        &harness_root.join("PROJECT_PROFILE.md"),
+        "Rust project profile",
+    )?;
+    require_nonempty_file(&harness_root.join("README.md"), "Rust harness README")?;
+    require_nonempty_file(
+        &harness_root.join("ALEXANDRIA_MANIFEST.tsv"),
+        "Alexandria harness manifest",
+    )?;
+    let skill = read_bounded_text(&harness_root.join(REQUIRED_SKILL), "Rust engineering skill")
+        .map_err(|error| error.to_string())?;
+    if !skill.starts_with("---\n") || !skill.contains("\nname: rust-engineering\n") {
+        return Err("rust-engineering skill frontmatter is invalid".to_owned());
+    }
+
+    verify_rule_group(&harness_root.join("rules/normal_dev_rules"), NORMAL_RULES)?;
+    verify_rule_group(&harness_root.join("rules/type_dev_rules"), TYPE_RULES)?;
+    verify_rule_group(&harness_root.join("rules/async_dev_rules"), ASYNC_RULES)?;
+    verify_alexandria_manifest(&harness_root)?;
+    verify_forge_persistence_policy(&root, &harness_root)?;
+
+    verify_rust_only_sources(&root)?;
+    verify_workspace_manifest(&root)?;
+    let metadata = cargo_metadata(&root)?;
+    verify_manifest_lints(&metadata)?;
+    verify_locked_metadata(&metadata)?;
+
+    println!("Heterarchy Forge Rust rules verification passed");
+    Ok(())
+}
+
+fn verify_rule_group(root: &Path, rules: &[&str]) -> Result<(), String> {
+    for rule in rules {
+        require_nonempty_file(&root.join(rule), "active Rust rule")?;
+    }
+    Ok(())
+}
+
+fn verify_forge_persistence_policy(root: &Path, harness_root: &Path) -> Result<(), String> {
+    require_nonempty_file(
+        &harness_root
+            .join("rules/normal_dev_rules")
+            .join(FORGE_PERSISTENCE_RULE),
+        "FORGE persistence SQL rule",
+    )?;
+    require_nonempty_file(
+        &harness_root.join(FORGE_PERSISTENCE_HARNESS),
+        "FORGE persistence harness",
+    )?;
+
+    let alexandria_manifest = read_bounded_text(
+        &harness_root.join("ALEXANDRIA_MANIFEST.tsv"),
+        "Alexandria harness manifest",
+    )
+    .map_err(|error| error.to_string())?;
+    for local_asset in [
+        format!("rules/normal_dev_rules/{FORGE_PERSISTENCE_RULE}"),
+        FORGE_PERSISTENCE_HARNESS.to_owned(),
+    ] {
+        verify_forge_local_asset_not_manifested(&alexandria_manifest, &local_asset)?;
+    }
+
+    let workspace = read_toml_file(&root.join("Cargo.toml"), "workspace Cargo.toml")?;
+    let persistence = read_toml_file(
+        &root.join(FORGE_PERSISTENCE_MANIFEST),
+        "forge-persistence Cargo.toml",
+    )?;
+    verify_forge_persistence_manifests(&workspace, &persistence)
+}
+
+fn verify_forge_local_asset_not_manifested(
+    alexandria_manifest: &str,
+    local_asset: &str,
+) -> Result<(), String> {
+    let is_manifested = alexandria_manifest
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .any(|line| line.split('\t').nth(3) == Some(local_asset));
+    if is_manifested {
+        Err(format!(
+            "FORGE-local harness asset must not be Alexandria-manifested: {local_asset}"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn read_toml_file(path: &Path, label: &str) -> Result<TomlValue, String> {
+    let body = read_bounded_text(path, label).map_err(|error| error.to_string())?;
+    toml::from_str::<TomlValue>(&body)
+        .map_err(|error| format!("invalid {}: {error}", path.display()))
+}
+
+fn verify_forge_persistence_manifests(
+    workspace: &TomlValue,
+    persistence: &TomlValue,
+) -> Result<(), String> {
+    let rusqlite = toml_at(workspace, &["workspace", "dependencies", "rusqlite"])
+        .and_then(TomlValue::as_table)
+        .ok_or_else(|| "workspace.dependencies.rusqlite must be a dependency table".to_owned())?;
+    rusqlite
+        .get("version")
+        .and_then(TomlValue::as_str)
+        .filter(|version| !version.trim().is_empty())
+        .ok_or_else(|| "workspace rusqlite must declare an explicit registry version".to_owned())?;
+    if rusqlite
+        .get("default-features")
+        .and_then(TomlValue::as_bool)
+        != Some(false)
+    {
+        return Err("workspace rusqlite must keep default-features = false".to_owned());
+    }
+    let features = rusqlite
+        .get("features")
+        .and_then(TomlValue::as_array)
+        .ok_or_else(|| "workspace rusqlite features must be explicit".to_owned())?;
+    if !features
+        .iter()
+        .any(|feature| feature.as_str() == Some("bundled"))
+    {
+        return Err("workspace rusqlite must keep the bundled SQLite feature".to_owned());
+    }
+
+    if toml_at(persistence, &["package", "name"]).and_then(TomlValue::as_str)
+        != Some("forge-persistence")
+    {
+        return Err("FORGE persistence manifest package name changed unexpectedly".to_owned());
+    }
+    if toml_at(persistence, &["dependencies", "rusqlite", "workspace"]).and_then(TomlValue::as_bool)
+        != Some(true)
+    {
+        return Err(
+            "forge-persistence must inherit rusqlite from workspace dependencies".to_owned(),
+        );
+    }
+
+    for section in ["dependencies", "dev-dependencies", "build-dependencies"] {
+        let Some(dependencies) = persistence.get(section).and_then(TomlValue::as_table) else {
+            continue;
+        };
+        for (dependency_key, declaration) in dependencies {
+            let package_name = declaration
+                .as_table()
+                .and_then(|table| table.get("package"))
+                .and_then(TomlValue::as_str)
+                .unwrap_or(dependency_key);
+            if FORBIDDEN_PERSISTENCE_DEPENDENCIES.contains(&package_name) {
+                return Err(format!(
+                    "forge-persistence directly depends on forbidden persistence framework {package_name:?}; update the FORGE-local architecture rule and harness intentionally before changing authority"
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn verify_alexandria_manifest(harness_root: &Path) -> Result<(), String> {
+    let body = read_bounded_text(
+        &harness_root.join("ALEXANDRIA_MANIFEST.tsv"),
+        "Alexandria harness manifest",
+    )
+    .map_err(|error| error.to_string())?;
+    let mut paths = std::collections::BTreeSet::new();
+    let mut count = 0_usize;
+    for line in body.lines().filter(|line| !line.trim().is_empty()) {
+        let mut fields = line.split('\t');
+        let note_id = fields.next().unwrap_or_default();
+        let content_hash = fields.next().unwrap_or_default();
+        let body_hash = fields.next().unwrap_or_default();
+        let relative = fields.next().unwrap_or_default();
+        validate_alexandria_manifest_fields(note_id, content_hash, body_hash, relative)?;
+        if !paths.insert(relative.to_owned()) {
+            return Err(format!(
+                "Alexandria harness manifest duplicates {relative:?}"
+            ));
+        }
+        let source_path = harness_root.join(relative);
+        let metadata = fs::symlink_metadata(&source_path).map_err(|error| {
+            format!(
+                "cannot inspect materialized harness source {}: {error}",
+                source_path.display()
+            )
+        })?;
+        if !metadata.file_type().is_file() {
+            return Err(format!(
+                "materialized harness source {} is not a regular file",
+                source_path.display()
+            ));
+        }
+        let source = read_bounded_text(&source_path, "materialized harness source")
+            .map_err(|error| error.to_string())?;
+        if source.trim().len() < 32 {
+            return Err(format!(
+                "materialized harness source {} is unexpectedly empty",
+                source_path.display()
+            ));
+        }
+        let actual_hash = format!("{:x}", Sha256::digest(source.as_bytes()));
+        if actual_hash != body_hash {
+            return Err(format!(
+                "materialized harness source hash mismatch for {relative:?}"
+            ));
+        }
+        count += 1;
+    }
+    if count != ALEXANDRIA_SOURCE_COUNT {
+        return Err(format!(
+            "Alexandria harness manifest has {count} sources; expected {ALEXANDRIA_SOURCE_COUNT}"
+        ));
+    }
+    for retired in [
+        "rules/00-overview.md",
+        "rules/10-ownership-allocation-rules.md",
+        "skills/rust-forge-application-engineering",
+        "profiles/native-compute",
+    ] {
+        if fs::symlink_metadata(harness_root.join(retired)).is_ok() {
+            return Err(format!(
+                "retired Rust harness path remains active: {retired}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_alexandria_manifest_fields(
+    note_id: &str,
+    content_hash: &str,
+    body_hash: &str,
+    relative: &str,
+) -> Result<(), String> {
+    if !is_lowercase_uuid(note_id)
+        || !is_lowercase_sha256(content_hash)
+        || !is_lowercase_sha256(body_hash)
+        || !is_safe_relative_path(relative)
+    {
+        return Err("Alexandria harness manifest row is malformed".to_owned());
+    }
+    Ok(())
+}
+
+fn is_lowercase_uuid(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')
+            }
+        })
+}
+
+fn is_lowercase_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn is_safe_relative_path(value: &str) -> bool {
+    !value.is_empty()
+        && Path::new(value)
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+}
+
+fn verify_rust_only_sources(root: &Path) -> Result<(), String> {
+    let mut forbidden = Vec::new();
+    walk_forbidden_sources(root, root, &mut forbidden)?;
+    if forbidden.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Rust-only invariant violated by implementation source files:\n- {}",
+            forbidden.join("\n- ")
+        ))
+    }
+}
+
+fn walk_forbidden_sources(
+    root: &Path,
+    current: &Path,
+    forbidden: &mut Vec<String>,
+) -> Result<(), String> {
+    let entries = fs::read_dir(current)
+        .map_err(|error| format!("cannot scan {}: {error}", current.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("cannot read directory entry: {error}"))?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+        if file_type.is_dir() {
+            let name = entry.file_name();
+            if WALK_SKIP_DIRS.iter().any(|skip| name == *skip) {
+                continue;
+            }
+            walk_forbidden_sources(root, &path, forbidden)?;
+            continue;
+        }
+        if !file_type.is_file() {
+            continue;
+        }
+        let extension = path.extension().and_then(|value| value.to_str());
+        if extension.is_some_and(|value| FORBIDDEN_IMPLEMENTATION_EXTENSIONS.contains(&value)) {
+            let relative = path.strip_prefix(root).unwrap_or(&path);
+            forbidden.push(relative.display().to_string());
+        }
+    }
+    Ok(())
+}
+
+fn require_nonempty_file(path: &Path, label: &str) -> Result<(), String> {
+    let body = read_bounded_text(path, label).map_err(|error| error.to_string())?;
+    if body.trim().len() < 32 {
+        return Err(format!("{label} {} is unexpectedly empty", path.display()));
+    }
+    Ok(())
+}
+
+fn verify_workspace_manifest(root: &Path) -> Result<(), String> {
+    let body = read_bounded_text(&root.join("Cargo.toml"), "workspace Cargo.toml")
+        .map_err(|error| error.to_string())?;
+    let manifest = toml::from_str::<TomlValue>(&body)
+        .map_err(|error| format!("invalid workspace Cargo.toml: {error}"))?;
+    require_toml_str(&manifest, &["workspace", "resolver"], "3")?;
+    require_toml_str(&manifest, &["workspace", "package", "edition"], "2024")?;
+    require_toml_str(&manifest, &["workspace", "package", "rust-version"], "1.92")?;
+    require_toml_str(
+        &manifest,
+        &["workspace", "lints", "rust", "unsafe_code"],
+        "deny",
+    )?;
+    for lint in ["unsafe_op_in_unsafe_fn", "unused_must_use"] {
+        if toml_at(&manifest, &["workspace", "lints", "rust", lint]).is_none() {
+            return Err(format!("workspace Rust lint {lint:?} is missing"));
+        }
+    }
+    if toml_at(&manifest, &["workspace", "lints", "clippy"])
+        .and_then(TomlValue::as_table)
+        .is_none()
+    {
+        return Err("workspace Cargo.toml is missing [workspace.lints.clippy]".to_owned());
+    }
+    let toolchain_body = read_bounded_text(&root.join("rust-toolchain.toml"), "Rust toolchain")
+        .map_err(|error| error.to_string())?;
+    let toolchain = toml::from_str::<TomlValue>(&toolchain_body)
+        .map_err(|error| format!("invalid rust-toolchain.toml: {error}"))?;
+    require_toml_str(&toolchain, &["toolchain", "channel"], MSRV_TOOLCHAIN)?;
+    Ok(())
+}
+
+fn require_toml_str(root: &TomlValue, path: &[&str], expected: &str) -> Result<(), String> {
+    let actual = toml_at(root, path).and_then(TomlValue::as_str);
+    if actual == Some(expected) {
+        Ok(())
+    } else {
+        Err(format!(
+            "Cargo.toml field {} must be {expected:?}, got {actual:?}",
+            path.join(".")
+        ))
+    }
+}
+
+fn toml_at<'a>(root: &'a TomlValue, path: &[&str]) -> Option<&'a TomlValue> {
+    let mut current = root;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    Some(current)
+}
+
+fn verify_manifest_lints(metadata: &JsonValue) -> Result<(), String> {
+    for manifest in workspace_member_manifest_paths(metadata)? {
+        let body =
+            read_bounded_text(&manifest, "crate manifest").map_err(|error| error.to_string())?;
+        let parsed = toml::from_str::<TomlValue>(&body)
+            .map_err(|error| format!("invalid manifest {}: {error}", manifest.display()))?;
+        if !parsed
+            .get("lints")
+            .and_then(|lints| lints.get("workspace"))
+            .and_then(TomlValue::as_bool)
+            .unwrap_or(false)
+        {
+            return Err(format!(
+                "active crate manifest {} does not opt into [lints] workspace = true",
+                manifest.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn workspace_member_manifest_paths(metadata: &JsonValue) -> Result<Vec<PathBuf>, String> {
+    let packages = metadata
+        .get("packages")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| "cargo metadata is missing packages".to_owned())?;
+    let members = metadata
+        .get("workspace_members")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| "cargo metadata is missing workspace_members".to_owned())?;
+    let mut manifests = Vec::with_capacity(members.len());
+    for member in members {
+        let member_id = member
+            .as_str()
+            .ok_or_else(|| "workspace member id is invalid".to_owned())?;
+        let package = packages
+            .iter()
+            .find(|package| package.get("id").and_then(JsonValue::as_str) == Some(member_id))
+            .ok_or_else(|| format!("workspace member {member_id:?} is missing metadata"))?;
+        let manifest_path = package
+            .get("manifest_path")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| format!("workspace member {member_id:?} is missing manifest_path"))?;
+        manifests.push(PathBuf::from(manifest_path));
+    }
+    manifests.sort();
+    manifests.dedup();
+    Ok(manifests)
+}
+
+fn verify_locked_metadata(metadata: &JsonValue) -> Result<(), String> {
+    let packages = metadata
+        .get("packages")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| "cargo metadata is missing packages".to_owned())?;
+    let members = metadata
+        .get("workspace_members")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| "cargo metadata is missing workspace_members".to_owned())?;
+    let mut xtask_found = false;
+    for member in members {
+        let member_id = member
+            .as_str()
+            .ok_or_else(|| "workspace member id is invalid".to_owned())?;
+        let package = packages
+            .iter()
+            .find(|package| package.get("id").and_then(JsonValue::as_str) == Some(member_id))
+            .ok_or_else(|| format!("workspace member {member_id:?} is missing metadata"))?;
+        let name = package
+            .get("name")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| "workspace package is missing name".to_owned())?;
+        xtask_found |= name == "xtask";
+        if package.get("edition").and_then(JsonValue::as_str) != Some("2024") {
+            return Err(format!("workspace package {name:?} is not Edition 2024"));
+        }
+    }
+    if xtask_found {
+        Ok(())
+    } else {
+        Err("workspace does not contain the xtask package".to_owned())
+    }
+}
+
+fn cargo_metadata(root: &Path) -> Result<JsonValue, String> {
+    let arguments =
+        pinned_cargo_arguments(["metadata", "--locked", "--no-deps", "--format-version", "1"]);
+    let captured = capture_process(
+        Path::new("rustup"),
+        &arguments,
+        root,
+        MAX_DOCTOR_OUTPUT_BYTES * 16,
+    )?;
+    if !captured.status.success() {
+        return Err(format!(
+            "cargo metadata failed with status {}",
+            captured.status
+        ));
+    }
+    serde_json::from_slice(&captured.stdout)
+        .map_err(|error| format!("invalid cargo metadata JSON: {error}"))
+}
+
+fn workspace_has_bench_target() -> Result<bool, String> {
+    let metadata = cargo_metadata(&workspace_root())?;
+    let packages = metadata
+        .get("packages")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| "cargo metadata is missing packages".to_owned())?;
+    Ok(packages.iter().any(|package| {
+        package
+            .get("targets")
+            .and_then(JsonValue::as_array)
+            .is_some_and(|targets| {
+                targets.iter().any(|target| {
+                    target
+                        .get("kind")
+                        .and_then(JsonValue::as_array)
+                        .is_some_and(|kinds| {
+                            kinds.iter().any(|kind| kind.as_str() == Some("bench"))
+                        })
+                })
+            })
+    }))
+}
+
+#[derive(Debug)]
+struct BoundedCapture {
+    bytes: Vec<u8>,
+    total: usize,
+}
+
+#[derive(Debug)]
+enum BoundedReadError {
+    Io(io::Error),
+    TooLarge { actual: usize, maximum: usize },
+}
+
+fn read_bounded<R: Read>(reader: R, maximum: usize) -> Result<Vec<u8>, BoundedReadError> {
+    let capture = read_capped(reader, maximum)?;
+    if capture.total > maximum {
+        Err(BoundedReadError::TooLarge {
+            actual: capture.total,
+            maximum,
+        })
+    } else {
+        Ok(capture.bytes)
+    }
+}
+
+fn read_capped<R: Read>(mut reader: R, maximum: usize) -> Result<BoundedCapture, BoundedReadError> {
+    let capacity = maximum.saturating_add(1);
+    let mut bytes = Vec::with_capacity(capacity.min(64 * 1024));
+    let mut buffer = [0_u8; 8 * 1024];
+    let mut total = 0_usize;
+
+    while total < capacity {
+        let remaining = capacity - total;
+        let requested = remaining.min(buffer.len());
+        let read = reader
+            .read(&mut buffer[..requested])
+            .map_err(BoundedReadError::Io)?;
+        if read == 0 {
+            break;
+        }
+        total += read;
+        bytes.extend_from_slice(&buffer[..read]);
+    }
+    Ok(BoundedCapture { bytes, total })
+}
+
+#[derive(Debug)]
+enum BoundedTextError {
+    Read {
+        label: String,
+        path: PathBuf,
+        source: io::Error,
+    },
+    TooLarge {
+        label: String,
+        path: PathBuf,
+        actual: usize,
+        maximum: usize,
+    },
+    InvalidUtf8 {
+        label: String,
+        path: PathBuf,
+        source: std::string::FromUtf8Error,
+    },
+}
+
+impl fmt::Display for BoundedTextError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Read {
+                label,
+                path,
+                source,
+            } => {
+                write!(
+                    formatter,
+                    "cannot read {label} {}: {source}",
+                    path.display()
+                )
+            }
+            Self::TooLarge {
+                label,
+                path,
+                actual,
+                maximum,
+            } => write!(
+                formatter,
+                "{label} {} returned {actual} bytes; maximum is {maximum}",
+                path.display()
+            ),
+            Self::InvalidUtf8 {
+                label,
+                path,
+                source,
+            } => write!(
+                formatter,
+                "{label} {} is not valid UTF-8: {source}",
+                path.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BoundedTextError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Read { source, .. } => Some(source),
+            Self::InvalidUtf8 { source, .. } => Some(source),
+            Self::TooLarge { .. } => None,
+        }
+    }
+}
+
+fn read_bounded_text(path: &Path, label: &str) -> Result<String, BoundedTextError> {
+    let file = fs::File::open(path).map_err(|source| BoundedTextError::Read {
+        label: label.to_owned(),
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let bytes = read_bounded(file, MAX_POLICY_TEXT_BYTES).map_err(|error| match error {
+        BoundedReadError::Io(source) => BoundedTextError::Read {
+            label: label.to_owned(),
+            path: path.to_path_buf(),
+            source,
+        },
+        BoundedReadError::TooLarge { actual, maximum } => BoundedTextError::TooLarge {
+            label: label.to_owned(),
+            path: path.to_path_buf(),
+            actual,
+            maximum,
+        },
+    })?;
+    String::from_utf8(bytes).map_err(|source| BoundedTextError::InvalidUtf8 {
+        label: label.to_owned(),
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+#[derive(Debug)]
+struct CapturedProcess {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    stdout_total: usize,
+    stderr_total: usize,
+}
+
+#[derive(Clone, Copy)]
+enum CapturedStream {
+    Stdout,
+    Stderr,
+}
+
+enum ReaderOutcome {
+    Complete(Result<BoundedCapture, BoundedReadError>),
+    Panicked,
+}
+
+struct ProcessCaptureCompletion {
+    status: Option<ExitStatus>,
+    timed_out: bool,
+    cleanup_failed: bool,
+    stdout: ReaderOutcome,
+    stderr: ReaderOutcome,
+}
+
+impl ReaderOutcome {
+    fn requires_termination(&self, maximum: usize) -> bool {
+        match self {
+            Self::Complete(Ok(capture)) => capture.total > maximum,
+            Self::Complete(Err(_)) | Self::Panicked => true,
+        }
+    }
+}
+
+fn capture_process(
+    program: &Path,
+    arguments: &[&str],
+    cwd: &Path,
+    maximum: usize,
+) -> Result<CapturedProcess, String> {
+    capture_process_with_env(program, arguments, cwd, maximum, &[])
+}
+
+fn capture_process_with_env(
+    program: &Path,
+    arguments: &[&str],
+    cwd: &Path,
+    maximum: usize,
+    environment: &[(&OsStr, &OsStr)],
+) -> Result<CapturedProcess, String> {
+    capture_process_until_with_env(
+        program,
+        arguments,
+        cwd,
+        maximum,
+        Instant::now() + PROCESS_CAPTURE_TIMEOUT,
+        environment,
+    )
+}
+
+#[cfg(test)]
+fn capture_process_until(
+    program: &Path,
+    arguments: &[&str],
+    cwd: &Path,
+    maximum: usize,
+    deadline: Instant,
+) -> Result<CapturedProcess, String> {
+    capture_process_until_with_env(program, arguments, cwd, maximum, deadline, &[])
+}
+
+fn capture_process_until_with_env(
+    program: &Path,
+    arguments: &[&str],
+    cwd: &Path,
+    maximum: usize,
+    deadline: Instant,
+    environment: &[(&OsStr, &OsStr)],
+) -> Result<CapturedProcess, String> {
+    let mut child = spawn_captured_process(program, arguments, cwd, environment)?;
+    let Some(stdout) = child.stdout.take() else {
+        let error = format!("{} stdout pipe was unavailable", program.display());
+        return Err(terminate_then_report(&mut child, program, arguments, error));
+    };
+    let Some(stderr) = child.stderr.take() else {
+        let error = format!("{} stderr pipe was unavailable", program.display());
+        return Err(terminate_then_report(&mut child, program, arguments, error));
+    };
+
+    let mut status = None;
+    let mut timed_out = false;
+    let mut cleanup_failed = false;
+    let (stdout_result, stderr_result) = thread::scope(|scope| {
+        let (sender, receiver) = mpsc::sync_channel(PROCESS_CAPTURE_STREAM_COUNT);
+        let stdout_sender = sender.clone();
+        let stdout_reader = scope.spawn(move || {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                read_capped(stdout, maximum)
+            }))
+            .map_or(ReaderOutcome::Panicked, ReaderOutcome::Complete);
+            stdout_sender.send((CapturedStream::Stdout, outcome))
+        });
+        let stderr_reader = scope.spawn(move || {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                read_capped(stderr, maximum)
+            }))
+            .map_or(ReaderOutcome::Panicked, ReaderOutcome::Complete);
+            sender.send((CapturedStream::Stderr, outcome))
+        });
+
+        let mut stdout_result = None;
+        let mut stderr_result = None;
+        while stdout_result.is_none() || stderr_result.is_none() {
+            let now = Instant::now();
+            if now >= deadline && status.is_none() {
+                cleanup_failed |= !terminate_process_group(&mut child);
+                status = Some(wait_for_child(&mut child, program, arguments)?);
+                timed_out = true;
+            }
+            let wait = if status.is_some() {
+                PROCESS_CAPTURE_POLL_INTERVAL
+            } else {
+                deadline
+                    .saturating_duration_since(now)
+                    .min(PROCESS_CAPTURE_POLL_INTERVAL)
+            };
+            let (stream, outcome) = match receiver.recv_timeout(wait) {
+                Ok(result) => result,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(error) => {
+                    return Err(terminate_then_report(
+                        &mut child,
+                        program,
+                        arguments,
+                        format!("{} output reader disconnected: {error}", program.display()),
+                    ));
+                }
+            };
+            let requires_termination = outcome.requires_termination(maximum);
+            match stream {
+                CapturedStream::Stdout => stdout_result = Some(outcome),
+                CapturedStream::Stderr => stderr_result = Some(outcome),
+            }
+            if requires_termination && status.is_none() {
+                cleanup_failed |= !terminate_process_group(&mut child);
+                status = Some(wait_for_child(&mut child, program, arguments)?);
+            }
+        }
+
+        stdout_reader
+            .join()
+            .map_err(|_| format!("{} stdout reader panicked", program.display()))?
+            .map_err(|_| format!("{} stdout result delivery failed", program.display()))?;
+        stderr_reader
+            .join()
+            .map_err(|_| format!("{} stderr reader panicked", program.display()))?
+            .map_err(|_| format!("{} stderr result delivery failed", program.display()))?;
+
+        let stdout_result = stdout_result
+            .ok_or_else(|| format!("{} stdout result was unavailable", program.display()))?;
+        let stderr_result = stderr_result
+            .ok_or_else(|| format!("{} stderr result was unavailable", program.display()))?;
+        Ok::<_, String>((stdout_result, stderr_result))
+    })?;
+
+    finalize_captured_process(
+        &mut child,
+        program,
+        arguments,
+        maximum,
+        ProcessCaptureCompletion {
+            status,
+            timed_out,
+            cleanup_failed,
+            stdout: stdout_result,
+            stderr: stderr_result,
+        },
+    )
+}
+
+fn spawn_captured_process(
+    program: &Path,
+    arguments: &[&str],
+    cwd: &Path,
+    environment: &[(&OsStr, &OsStr)],
+) -> Result<Child, String> {
+    let mut command = Command::new(program);
+    command
+        .args(arguments)
+        .current_dir(cwd)
+        .envs(environment.iter().copied())
+        .process_group(0)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command.spawn().map_err(|error| {
+        format!(
+            "failed to start {} {arguments:?}: {error}",
+            program.display()
+        )
+    })
+}
+
+fn finalize_captured_process(
+    child: &mut Child,
+    program: &Path,
+    arguments: &[&str],
+    maximum: usize,
+    completion: ProcessCaptureCompletion,
+) -> Result<CapturedProcess, String> {
+    let status = match completion.status {
+        Some(status) => status,
+        None => wait_for_child(child, program, arguments)?,
+    };
+    if completion.cleanup_failed {
+        return Err(format!(
+            "failed to terminate process group for {} {arguments:?}",
+            program.display()
+        ));
+    }
+    if completion.timed_out {
+        return Err(format!(
+            "{} {arguments:?} exceeded the bounded capture timeout",
+            program.display()
+        ));
+    }
+    let stdout = map_capture_result(completion.stdout, program, "stdout", maximum)?;
+    let stderr = map_capture_result(completion.stderr, program, "stderr", maximum)?;
+    Ok(CapturedProcess {
+        status,
+        stdout: stdout.bytes,
+        stderr: stderr.bytes,
+        stdout_total: stdout.total,
+        stderr_total: stderr.total,
+    })
+}
+
+fn map_capture_result(
+    result: ReaderOutcome,
+    program: &Path,
+    stream: &str,
+    maximum: usize,
+) -> Result<BoundedCapture, String> {
+    match result {
+        ReaderOutcome::Complete(Ok(capture)) if capture.total <= maximum => Ok(capture),
+        ReaderOutcome::Complete(Ok(capture)) => Err(format!(
+            "{} {stream} returned {} bytes; maximum is {maximum}",
+            program.display(),
+            capture.total
+        )),
+        ReaderOutcome::Complete(Err(BoundedReadError::Io(error))) => Err(format!(
+            "failed to read {} {stream}: {error}",
+            program.display()
+        )),
+        ReaderOutcome::Complete(Err(BoundedReadError::TooLarge { actual, maximum })) => {
+            Err(format!(
+                "{} {stream} returned {actual} bytes; maximum is {maximum}",
+                program.display()
+            ))
+        }
+        ReaderOutcome::Panicked => Err(format!("{} {stream} reader panicked", program.display())),
+    }
+}
+
+fn terminate_and_reap(
+    child: &mut std::process::Child,
+    program: &Path,
+    arguments: &[&str],
+) -> Result<ExitStatus, String> {
+    let termination = terminate_process_group(child);
+    let status = wait_for_child(child, program, arguments)?;
+    if !termination {
+        return Err(format!(
+            "failed to terminate {} {arguments:?} before reaping it with status {status}",
+            program.display()
+        ));
+    }
+    Ok(status)
+}
+
+fn terminate_process_group(child: &mut Child) -> bool {
+    let pid = child.id();
+    let _term_sent = run_group_signal(pid, "-TERM");
+    let term_deadline = Instant::now() + Duration::from_millis(50);
+    while Instant::now() < term_deadline {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => thread::sleep(PROCESS_CAPTURE_POLL_INTERVAL),
+            Err(_) => return false,
+        }
+    }
+    let _kill_sent = run_group_signal(pid, "-KILL");
+    let group_deadline = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < group_deadline {
+        if !run_group_signal(pid, "-0") {
+            return true;
+        }
+        thread::sleep(PROCESS_CAPTURE_POLL_INTERVAL);
+    }
+    let _direct_kill = child.kill();
+    !run_group_signal(pid, "-0")
+}
+
+fn run_group_signal(pid: u32, signal: &str) -> bool {
+    let group = format!("-{pid}");
+    let mut command = Command::new("/bin/kill");
+    command
+        .arg(signal)
+        .arg("--")
+        .arg(group)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let Ok(mut killer) = command.spawn() else {
+        return false;
+    };
+    let deadline = Instant::now() + Duration::from_millis(100);
+    loop {
+        match killer.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if Instant::now() < deadline => {
+                thread::sleep(PROCESS_CAPTURE_POLL_INTERVAL);
+            }
+            Ok(None) | Err(_) => {
+                let _ignored = killer.kill();
+                let _ignored = killer.wait();
+                return false;
+            }
+        }
+    }
+}
+
+fn terminate_then_report(
+    child: &mut std::process::Child,
+    program: &Path,
+    arguments: &[&str],
+    primary_error: String,
+) -> String {
+    match terminate_and_reap(child, program, arguments) {
+        Ok(_) => primary_error,
+        Err(cleanup_error) => format!("{primary_error}; {cleanup_error}"),
+    }
+}
+
+fn wait_for_child(
+    child: &mut std::process::Child,
+    program: &Path,
+    arguments: &[&str],
+) -> Result<ExitStatus, String> {
+    child.wait().map_err(|error| {
+        format!(
+            "failed to wait for {} {arguments:?}: {error}",
+            program.display()
+        )
+    })
+}
+
+fn cargo(arguments: &[&str]) -> Result<(), String> {
+    let pinned_arguments = pinned_cargo_arguments(arguments.iter().copied());
+    command_in("rustup", &pinned_arguments, &workspace_root())
+}
+
+fn pinned_cargo_arguments<'a>(arguments: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
+    let iterator = arguments.into_iter();
+    let (minimum, _) = iterator.size_hint();
+    let mut pinned_arguments = Vec::with_capacity(minimum.saturating_add(3));
+    pinned_arguments.extend(["run", MSRV_TOOLCHAIN, "cargo"]);
+    pinned_arguments.extend(iterator);
+    pinned_arguments
+}
+
+fn command(program: &str, arguments: &[&str]) -> Result<(), String> {
+    command_in(program, arguments, &workspace_root())
+}
+
+fn command_in(program: impl AsRef<OsStr>, arguments: &[&str], cwd: &Path) -> Result<(), String> {
+    let program = program.as_ref();
+    let status = Command::new(program)
+        .args(arguments)
+        .current_dir(cwd)
+        .status()
+        .map_err(|error| {
+            format!(
+                "failed to start {} {arguments:?}: {error}",
+                program.to_string_lossy()
+            )
+        })?;
+    require_success(program, status, arguments)
+}
+
+fn require_success(program: &OsStr, status: ExitStatus, arguments: &[&str]) -> Result<(), String> {
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} {arguments:?} exited with status {status}",
+            program.to_string_lossy()
+        ))
+    }
+}
+
+fn workspace_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).parent().map_or_else(
+        || PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+        Path::to_path_buf,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::io::{self, Cursor, Read};
+    use std::path::Path;
+    use std::process::{Command, Stdio};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    use super::{
+        BoundedReadError, MAX_DOCTOR_OUTPUT_BYTES, capture_process, capture_process_until,
+        is_lowercase_sha256, is_lowercase_uuid, is_safe_relative_path, pinned_cargo_arguments,
+        read_bounded, read_capped, toml_at, validate_alexandria_manifest_fields,
+        verify_forge_local_asset_not_manifested, verify_forge_persistence_manifests,
+        workspace_member_manifest_paths,
+    };
+    use serde_json::json;
+    use toml::Value as TomlValue;
+
+    struct CountingReader {
+        remaining: usize,
+        consumed: Arc<AtomicUsize>,
+    }
+
+    impl Read for CountingReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let read = buffer.len().min(self.remaining);
+            buffer[..read].fill(b'x');
+            self.remaining -= read;
+            self.consumed.fetch_add(read, Ordering::Relaxed);
+            Ok(read)
+        }
+    }
+
+    #[test]
+    fn cargo_subprocess_arguments_are_pinned_to_repository_toolchain() {
+        assert_eq!(
+            pinned_cargo_arguments(["check", "--locked"]),
+            vec!["run", super::MSRV_TOOLCHAIN, "cargo", "check", "--locked"]
+        );
+    }
+
+    #[test]
+    fn bounded_reader_rejects_oversized_text_without_unbounded_storage() {
+        let result = read_bounded(Cursor::new(vec![b'x'; 9]), 8);
+        assert!(matches!(
+            result,
+            Err(BoundedReadError::TooLarge {
+                actual: 9,
+                maximum: 8
+            })
+        ));
+    }
+
+    #[test]
+    fn capped_reader_stops_after_observing_one_byte_beyond_the_limit() -> Result<(), String> {
+        let consumed = Arc::new(AtomicUsize::new(0));
+        let capture = read_capped(
+            CountingReader {
+                remaining: 64,
+                consumed: Arc::clone(&consumed),
+            },
+            8,
+        )
+        .map_err(|error| format!("bounded read failed: {error:?}"))?;
+
+        assert_eq!(capture.total, 9);
+        assert_eq!(capture.bytes.len(), 9);
+        assert_eq!(consumed.load(Ordering::Relaxed), 9);
+        Ok(())
+    }
+
+    #[test]
+    fn manifest_lint_opt_in_is_parsed_semantically() -> Result<(), String> {
+        let manifest = toml::from_str::<TomlValue>("[lints]\nworkspace = true\n")
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            toml_at(&manifest, &["lints", "workspace"]).and_then(TomlValue::as_bool),
+            Some(true)
+        );
+        let unrelated = toml::from_str::<TomlValue>("[lints.rust]\nunsafe_code = \"forbid\"\n")
+            .map_err(|error| error.to_string())?;
+        assert!(toml_at(&unrelated, &["lints", "workspace"]).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn forge_persistence_manifest_policy_accepts_rusqlite_and_rejects_orms() -> Result<(), String> {
+        let workspace = toml::from_str::<TomlValue>(
+            r#"
+[workspace.dependencies]
+rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled"] }
+"#,
+        )
+        .map_err(|error| error.to_string())?;
+        let persistence = toml::from_str::<TomlValue>(
+            r#"
+[package]
+name = "forge-persistence"
+
+[dependencies]
+rusqlite.workspace = true
+thiserror = "2"
+"#,
+        )
+        .map_err(|error| error.to_string())?;
+        assert!(verify_forge_persistence_manifests(&workspace, &persistence).is_ok());
+
+        let with_orm = toml::from_str::<TomlValue>(
+            r#"
+[package]
+name = "forge-persistence"
+
+[dependencies]
+rusqlite.workspace = true
+database = { package = "sea-orm", version = "2" }
+"#,
+        )
+        .map_err(|error| error.to_string())?;
+        assert!(verify_forge_persistence_manifests(&workspace, &with_orm).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn forge_persistence_assets_must_remain_outside_alexandria_manifest() {
+        let shared = "note\thash\tbody\trules/normal_dev_rules/README.md\n";
+        assert!(
+            verify_forge_local_asset_not_manifested(
+                shared,
+                "rules/normal_dev_rules/10-forge-persistence-sql-rules.md"
+            )
+            .is_ok()
+        );
+        let incorrectly_manifested =
+            "note\thash\tbody\trules/normal_dev_rules/10-forge-persistence-sql-rules.md\n";
+        assert!(
+            verify_forge_local_asset_not_manifested(
+                incorrectly_manifested,
+                "rules/normal_dev_rules/10-forge-persistence-sql-rules.md"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn alexandria_manifest_fields_reject_noncanonical_identity_hash_and_path() {
+        let uuid = "00beafc5-7667-4bac-b741-d8f27053d115";
+        let hash = "b5caf2f9231b6c2282126f1d6ac6b5d47c9b5232520e9b3434d5dd81545fd745";
+        assert!(is_lowercase_uuid(uuid));
+        assert!(is_lowercase_sha256(hash));
+        assert!(is_safe_relative_path("rules/normal_dev_rules/README.md"));
+        assert!(validate_alexandria_manifest_fields(uuid, hash, hash, "rules/README.md").is_ok());
+
+        assert!(!is_lowercase_uuid("00BEAFC5-7667-4bac-b741-d8f27053d115"));
+        assert!(!is_lowercase_sha256(&"G".repeat(64)));
+        assert!(!is_safe_relative_path("../rules/README.md"));
+        assert!(!is_safe_relative_path("/rules/README.md"));
+        assert!(
+            validate_alexandria_manifest_fields(uuid, hash, hash, "../rules/README.md").is_err()
+        );
+    }
+
+    #[test]
+    fn workspace_member_manifests_come_from_locked_metadata_not_directory_shape()
+    -> Result<(), String> {
+        let metadata = json!({
+            "workspace_members": ["nested 0.1.0 (path+file:///workspace/tools/nested)"],
+            "packages": [{
+                "id": "nested 0.1.0 (path+file:///workspace/tools/nested)",
+                "manifest_path": "/workspace/tools/nested/Cargo.toml"
+            }]
+        });
+
+        assert_eq!(
+            workspace_member_manifest_paths(&metadata)?,
+            vec![std::path::PathBuf::from(
+                "/workspace/tools/nested/Cargo.toml"
+            )]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn captured_process_rejects_large_output_at_the_per_stream_cap() {
+        let large = "x".repeat(MAX_DOCTOR_OUTPUT_BYTES + 1);
+        let result = capture_process(
+            Path::new("/usr/bin/printf"),
+            &["%s", &large],
+            Path::new("/"),
+            MAX_DOCTOR_OUTPUT_BYTES,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn captured_process_kills_and_reaps_an_endless_oversized_producer() -> Result<(), String> {
+        let pid_path = std::env::temp_dir().join(format!(
+            "heterarchy-forge-xtask-capture-{}-{}.pid",
+            std::process::id(),
+            line!()
+        ));
+        let pid_path_argument = pid_path
+            .to_str()
+            .ok_or_else(|| "temporary PID path was not valid UTF-8".to_owned())?;
+        let script = concat!(
+            "printf '%s' \"$$\" > \"$1\"; ",
+            "while :; do printf 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'; done"
+        );
+
+        let result = capture_process(
+            Path::new("/bin/sh"),
+            &["-c", script, "capture-test", pid_path_argument],
+            Path::new("/"),
+            1_024,
+        );
+        let pid = fs::read_to_string(&pid_path)
+            .map_err(|error| format!("failed to read producer PID: {error}"))?;
+        fs::remove_file(&pid_path)
+            .map_err(|error| format!("failed to remove producer PID file: {error}"))?;
+
+        let Err(error) = result else {
+            return Err("endless oversized output unexpectedly succeeded".to_owned());
+        };
+        assert!(error.contains("stdout returned 1025 bytes; maximum is 1024"));
+        let still_exists = Command::new("/bin/kill")
+            .args(["-0", pid.trim()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|error| format!("failed to inspect producer PID: {error}"))?
+            .success();
+        assert!(!still_exists, "producer remained alive or unreaped");
+        Ok(())
+    }
+
+    #[test]
+    fn captured_process_times_out_and_kills_pipe_holding_descendants() -> Result<(), String> {
+        let pid_path = std::env::temp_dir().join(format!(
+            "heterarchy-forge-xtask-descendant-{}-{}.pid",
+            std::process::id(),
+            line!()
+        ));
+        let pid_path_argument = pid_path
+            .to_str()
+            .ok_or_else(|| "temporary descendant PID path was not valid UTF-8".to_owned())?;
+        let script = "sleep 30 & child=$!; printf '%s' \"$child\" > \"$1\"; wait";
+        let started = Instant::now();
+        let result = capture_process_until(
+            Path::new("/bin/sh"),
+            &["-c", script, "capture-timeout", pid_path_argument],
+            Path::new("/"),
+            1_024,
+            Instant::now() + Duration::from_millis(50),
+        );
+        let descendant = fs::read_to_string(&pid_path)
+            .map_err(|error| format!("failed to read descendant PID: {error}"))?;
+        fs::remove_file(&pid_path)
+            .map_err(|error| format!("failed to remove descendant PID file: {error}"))?;
+
+        let Err(error) = result else {
+            return Err("silent pipe-holding descendant unexpectedly succeeded".to_owned());
+        };
+        assert!(error.contains("exceeded the bounded capture timeout"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let still_exists = Command::new("/bin/kill")
+            .args(["-0", descendant.trim()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|error| format!("failed to inspect descendant PID: {error}"))?
+            .success();
+        assert!(!still_exists, "pipe-holding descendant remained alive");
+        Ok(())
+    }
+}

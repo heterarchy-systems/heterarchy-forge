@@ -1,0 +1,138 @@
+# Heterarchy Forge dependency policy.
+#
+# This policy is intentionally scoped to the two supported macOS targets. It
+# treats unknown sources, wildcard requirements, advisories, and unreviewed
+# license families as release blockers. Duplicate versions remain warnings
+# because Slint's platform/rendering graph currently carries reviewed parallel
+# major/minor lines that cannot be collapsed by this application alone.
+
+[graph]
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+]
+all-features = false
+
+[advisories]
+# The current unmaintained notices are transitive Slint/image graph crates
+# with no safe upgrade in the pinned Slint release. A direct workspace
+# dependency becoming unmaintained remains release-blocking.
+unmaintained = "workspace"
+ignore = []
+
+[licenses]
+allow = [
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.93
+
+exceptions = [
+    # Owner: Heterarchy Forge release engineering.
+    # Scope: exact pinned Slint 1.17.1 crates only.
+    # Rationale: the desktop application uses Slint's Royalty-free 2.0 option.
+    # Remove or re-review every exception on a Slint upgrade/license change.
+    { crate = "slint@1.17.1", allow = ["LicenseRef-Slint-Royalty-free-2.0"] },
+    { crate = "slint-build@1.17.1", allow = ["LicenseRef-Slint-Royalty-free-2.0"] },
+    { crate = "slint-macros@1.17.1", allow = ["LicenseRef-Slint-Royalty-free-2.0"] },
+    { crate = "i-slint-backend-selector@1.17.1", allow = ["LicenseRef-Slint-Royalty-free-2.0"] },
+    { crate = "i-slint-backend-winit@1.17.1", allow = ["LicenseRef-Slint-Royalty-free-2.0"] },
+    { crate = "i-slint-common@1.17.1", allow = ["LicenseRef-Slint-Royalty-free-2.0"] },
+    { crate = "i-slint-compiler@1.17.1", allow = ["LicenseRef-Slint-Royalty-free-2.0"] },
+    { crate = "i-slint-core@1.17.1", allow = ["LicenseRef-Slint-Royalty-free-2.0"] },
+    { crate = "i-slint-core-macros@1.17.1", allow = ["LicenseRef-Slint-Royalty-free-2.0"] },
+    { crate = "i-slint-renderer-femtovg@1.17.1", allow = ["LicenseRef-Slint-Royalty-free-2.0"] },
+]
+
+[licenses.private]
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+highlight = "simplest-path"
+workspace-default-features = "warn"
+external-default-features = "allow"
+allow = []
+allow-workspace = true
+deny = []
+skip = []
+skip-tree = []
+
+[[bans.features]]
+crate = "rmcp@3.1.4"
+deny = [
+    "auth",
+    "base64",
+    "client",
+    "macros",
+    "transport-child-process",
+    "transport-streamable-http-client",
+    "transport-streamable-http-server",
+]
+
+[[bans.features]]
+# File CAS uses the fixed-width incremental API only. Memory mapping,
+# parallelism, unstable pure mode, trait adapters, and retention-oriented
+# zeroization add surface that this bounded local file adapter does not need.
+crate = "blake3@1.8.7"
+deny = [
+    "digest",
+    "mmap",
+    "pure",
+    "rayon",
+    "traits-preview",
+    "zeroize",
+]
+
+[[bans.features]]
+# Diff Evidence uses bounded line-oriented unified diffs only. Byte adapters,
+# inline spans, serialization, Unicode grapheme segmentation, hashbrown, and
+# browser clocks are outside the renderer contract.
+crate = "similar@3.2.0"
+deny = [
+    "bstr",
+    "bytes",
+    "hashbrown",
+    "inline",
+    "serde",
+    "unicode",
+    "unicode-segmentation",
+    "wasm32_web_time",
+    "web-time",
+]
+
+[[bans.features]]
+# Diff artifacts use single-threaded streaming compression with no dictionary
+# builder, legacy decoder, bindgen-at-build-time, experimental API, or LTO mode.
+crate = "zstd@0.13.3"
+deny = [
+    "arrays",
+    "bindgen",
+    "debug",
+    "doc-cfg",
+    "experimental",
+    "fat-lto",
+    "legacy",
+    "no_asm",
+    "pkg-config",
+    "thin",
+    "thin-lto",
+    "wasm",
+    "zdict_builder",
+    "zstdmt",
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
