@@ -23,21 +23,12 @@ docs/**
 PRODUCT.md
 .codex/
 .impeccable/
+# Repository-local public development harness
 .agents/*
 !.agents/rust_dev_harness/
-.agents/rust_dev_harness/*
-!.agents/rust_dev_harness/rules/
-.agents/rust_dev_harness/rules/*
-!.agents/rust_dev_harness/rules/normal_dev_rules/
-.agents/rust_dev_harness/rules/normal_dev_rules/*
-!.agents/rust_dev_harness/rules/normal_dev_rules/10-forge-persistence-sql-rules.md
-!.agents/rust_dev_harness/harness/
-.agents/rust_dev_harness/harness/*
-!.agents/rust_dev_harness/harness/forge-persistence/
-.agents/rust_dev_harness/harness/forge-persistence/*
-!.agents/rust_dev_harness/harness/forge-persistence/README.md
+!.agents/rust_dev_harness/**
+.agents/rust_dev_harness/ALEXANDRIA_MANIFEST.tsv
 .omx/
 opencode.json
 .opencode
-.agents/
 DESIGN.md

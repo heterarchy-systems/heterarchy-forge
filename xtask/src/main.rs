@@ -68,7 +68,7 @@ const ASYNC_RULES: &[&str] = &[
     "10-async-observability-performance-rules.md",
 ];
 const REQUIRED_SKILL: &str = "skills/rust-engineering/SKILL.md";
-const ALEXANDRIA_SOURCE_COUNT: usize = 40;
+const SHARED_HARNESS_SOURCE_COUNT: usize = 40;
 const FORBIDDEN_IMPLEMENTATION_EXTENSIONS: &[&str] = &[
     "py", "pyi", "js", "jsx", "ts", "tsx", "mjs", "cjs", "go", "java", "kt", "kts", "swift", "c",
     "cc", "cpp", "cxx", "m", "mm",
@@ -438,8 +438,8 @@ fn rules() -> Result<(), String> {
     )?;
     require_nonempty_file(&harness_root.join("README.md"), "Rust harness README")?;
     require_nonempty_file(
-        &harness_root.join("ALEXANDRIA_MANIFEST.tsv"),
-        "Alexandria harness manifest",
+        &harness_root.join("HARNESS_MANIFEST.tsv"),
+        "public harness manifest",
     )?;
     let skill = read_bounded_text(&harness_root.join(REQUIRED_SKILL), "Rust engineering skill")
         .map_err(|error| error.to_string())?;
@@ -450,7 +450,7 @@ fn rules() -> Result<(), String> {
     verify_rule_group(&harness_root.join("rules/normal_dev_rules"), NORMAL_RULES)?;
     verify_rule_group(&harness_root.join("rules/type_dev_rules"), TYPE_RULES)?;
     verify_rule_group(&harness_root.join("rules/async_dev_rules"), ASYNC_RULES)?;
-    verify_alexandria_manifest(&harness_root)?;
+    verify_harness_manifest(&harness_root)?;
     verify_forge_persistence_policy(&root, &harness_root)?;
 
     verify_rust_only_sources(&root)?;
@@ -482,16 +482,16 @@ fn verify_forge_persistence_policy(root: &Path, harness_root: &Path) -> Result<(
         "FORGE persistence harness",
     )?;
 
-    let alexandria_manifest = read_bounded_text(
-        &harness_root.join("ALEXANDRIA_MANIFEST.tsv"),
-        "Alexandria harness manifest",
+    let harness_manifest = read_bounded_text(
+        &harness_root.join("HARNESS_MANIFEST.tsv"),
+        "public harness manifest",
     )
     .map_err(|error| error.to_string())?;
     for local_asset in [
         format!("rules/normal_dev_rules/{FORGE_PERSISTENCE_RULE}"),
         FORGE_PERSISTENCE_HARNESS.to_owned(),
     ] {
-        verify_forge_local_asset_not_manifested(&alexandria_manifest, &local_asset)?;
+        verify_forge_local_asset_not_shared_manifested(&harness_manifest, &local_asset)?;
     }
 
     let workspace = read_toml_file(&root.join("Cargo.toml"), "workspace Cargo.toml")?;
@@ -502,17 +502,17 @@ fn verify_forge_persistence_policy(root: &Path, harness_root: &Path) -> Result<(
     verify_forge_persistence_manifests(&workspace, &persistence)
 }
 
-fn verify_forge_local_asset_not_manifested(
-    alexandria_manifest: &str,
+fn verify_forge_local_asset_not_shared_manifested(
+    harness_manifest: &str,
     local_asset: &str,
 ) -> Result<(), String> {
-    let is_manifested = alexandria_manifest
+    let is_manifested = harness_manifest
         .lines()
         .filter(|line| !line.trim().is_empty())
-        .any(|line| line.split('\t').nth(3) == Some(local_asset));
+        .any(|line| line.split('\t').nth(1) == Some(local_asset));
     if is_manifested {
         Err(format!(
-            "FORGE-local harness asset must not be Alexandria-manifested: {local_asset}"
+            "FORGE-local harness asset must not be shared-manifested: {local_asset}"
         ))
     } else {
         Ok(())
@@ -589,25 +589,24 @@ fn verify_forge_persistence_manifests(
     Ok(())
 }
 
-fn verify_alexandria_manifest(harness_root: &Path) -> Result<(), String> {
+fn verify_harness_manifest(harness_root: &Path) -> Result<(), String> {
     let body = read_bounded_text(
-        &harness_root.join("ALEXANDRIA_MANIFEST.tsv"),
-        "Alexandria harness manifest",
+        &harness_root.join("HARNESS_MANIFEST.tsv"),
+        "public harness manifest",
     )
     .map_err(|error| error.to_string())?;
     let mut paths = std::collections::BTreeSet::new();
     let mut count = 0_usize;
     for line in body.lines().filter(|line| !line.trim().is_empty()) {
         let mut fields = line.split('\t');
-        let note_id = fields.next().unwrap_or_default();
-        let content_hash = fields.next().unwrap_or_default();
         let body_hash = fields.next().unwrap_or_default();
         let relative = fields.next().unwrap_or_default();
-        validate_alexandria_manifest_fields(note_id, content_hash, body_hash, relative)?;
+        if fields.next().is_some() {
+            return Err("public harness manifest row has unexpected extra fields".to_owned());
+        }
+        validate_harness_manifest_fields(body_hash, relative)?;
         if !paths.insert(relative.to_owned()) {
-            return Err(format!(
-                "Alexandria harness manifest duplicates {relative:?}"
-            ));
+            return Err(format!("public harness manifest duplicates {relative:?}"));
         }
         let source_path = harness_root.join(relative);
         let metadata = fs::symlink_metadata(&source_path).map_err(|error| {
@@ -638,9 +637,9 @@ fn verify_alexandria_manifest(harness_root: &Path) -> Result<(), String> {
         }
         count += 1;
     }
-    if count != ALEXANDRIA_SOURCE_COUNT {
+    if count != SHARED_HARNESS_SOURCE_COUNT {
         return Err(format!(
-            "Alexandria harness manifest has {count} sources; expected {ALEXANDRIA_SOURCE_COUNT}"
+            "public harness manifest has {count} sources; expected {SHARED_HARNESS_SOURCE_COUNT}"
         ));
     }
     for retired in [
@@ -658,31 +657,11 @@ fn verify_alexandria_manifest(harness_root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_alexandria_manifest_fields(
-    note_id: &str,
-    content_hash: &str,
-    body_hash: &str,
-    relative: &str,
-) -> Result<(), String> {
-    if !is_lowercase_uuid(note_id)
-        || !is_lowercase_sha256(content_hash)
-        || !is_lowercase_sha256(body_hash)
-        || !is_safe_relative_path(relative)
-    {
-        return Err("Alexandria harness manifest row is malformed".to_owned());
+fn validate_harness_manifest_fields(body_hash: &str, relative: &str) -> Result<(), String> {
+    if !is_lowercase_sha256(body_hash) || !is_safe_relative_path(relative) {
+        return Err("public harness manifest row is malformed".to_owned());
     }
     Ok(())
-}
-
-fn is_lowercase_uuid(value: &str) -> bool {
-    value.len() == 36
-        && value.bytes().enumerate().all(|(index, byte)| {
-            if matches!(index, 8 | 13 | 18 | 23) {
-                byte == b'-'
-            } else {
-                byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')
-            }
-        })
 }
 
 fn is_lowercase_sha256(value: &str) -> bool {
@@ -1491,9 +1470,9 @@ mod tests {
 
     use super::{
         BoundedReadError, MAX_DOCTOR_OUTPUT_BYTES, capture_process, capture_process_until,
-        is_lowercase_sha256, is_lowercase_uuid, is_safe_relative_path, pinned_cargo_arguments,
-        read_bounded, read_capped, toml_at, validate_alexandria_manifest_fields,
-        verify_forge_local_asset_not_manifested, verify_forge_persistence_manifests,
+        is_lowercase_sha256, is_safe_relative_path, pinned_cargo_arguments, read_bounded,
+        read_capped, toml_at, validate_harness_manifest_fields,
+        verify_forge_local_asset_not_shared_manifested, verify_forge_persistence_manifests,
         workspace_member_manifest_paths,
     };
     use serde_json::json;
@@ -1604,20 +1583,23 @@ database = { package = "sea-orm", version = "2" }
     }
 
     #[test]
-    fn forge_persistence_assets_must_remain_outside_alexandria_manifest() {
-        let shared = "note\thash\tbody\trules/normal_dev_rules/README.md\n";
+    fn forge_persistence_assets_must_remain_outside_shared_harness_manifest() {
+        let hash = "a".repeat(64);
+        let shared = format!("{hash}\trules/normal_dev_rules/README.md\n");
         assert!(
-            verify_forge_local_asset_not_manifested(
-                shared,
+            verify_forge_local_asset_not_shared_manifested(
+                &shared,
                 "rules/normal_dev_rules/10-forge-persistence-sql-rules.md"
             )
             .is_ok()
         );
-        let incorrectly_manifested =
-            "note\thash\tbody\trules/normal_dev_rules/10-forge-persistence-sql-rules.md\n";
+        let incorrectly_manifested = format!(
+            "{hash}	rules/normal_dev_rules/10-forge-persistence-sql-rules.md
+"
+        );
         assert!(
-            verify_forge_local_asset_not_manifested(
-                incorrectly_manifested,
+            verify_forge_local_asset_not_shared_manifested(
+                &incorrectly_manifested,
                 "rules/normal_dev_rules/10-forge-persistence-sql-rules.md"
             )
             .is_err()
@@ -1625,21 +1607,16 @@ database = { package = "sea-orm", version = "2" }
     }
 
     #[test]
-    fn alexandria_manifest_fields_reject_noncanonical_identity_hash_and_path() {
-        let uuid = "00beafc5-7667-4bac-b741-d8f27053d115";
-        let hash = "b5caf2f9231b6c2282126f1d6ac6b5d47c9b5232520e9b3434d5dd81545fd745";
-        assert!(is_lowercase_uuid(uuid));
-        assert!(is_lowercase_sha256(hash));
+    fn public_harness_manifest_fields_reject_noncanonical_hash_and_path() {
+        let hash = "a".repeat(64);
+        assert!(is_lowercase_sha256(&hash));
         assert!(is_safe_relative_path("rules/normal_dev_rules/README.md"));
-        assert!(validate_alexandria_manifest_fields(uuid, hash, hash, "rules/README.md").is_ok());
+        assert!(validate_harness_manifest_fields(&hash, "rules/README.md").is_ok());
 
-        assert!(!is_lowercase_uuid("00BEAFC5-7667-4bac-b741-d8f27053d115"));
         assert!(!is_lowercase_sha256(&"G".repeat(64)));
         assert!(!is_safe_relative_path("../rules/README.md"));
         assert!(!is_safe_relative_path("/rules/README.md"));
-        assert!(
-            validate_alexandria_manifest_fields(uuid, hash, hash, "../rules/README.md").is_err()
-        );
+        assert!(validate_harness_manifest_fields(&hash, "../rules/README.md").is_err());
     }
 
     #[test]
