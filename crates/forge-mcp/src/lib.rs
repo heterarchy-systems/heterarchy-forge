@@ -13,6 +13,7 @@ mod http;
 mod process;
 mod protocol;
 mod service;
+#[path = "auth.rs"]
 mod token;
 
 pub use frame::{BoundedMcpFrameReader, MAX_MCP_FRAME_BYTES};

@@ -4,6 +4,7 @@ mod global_registry;
 mod harness_catalog;
 mod harness_skill_catalog;
 mod mcp_connection_settings_catalog;
+#[path = "mcp_auth_catalog.rs"]
 mod mcp_token_catalog;
 mod workspace_agent_dag;
 mod workspace_agents;

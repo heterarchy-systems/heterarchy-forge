@@ -22,6 +22,7 @@ mod goal;
 mod grant;
 mod harness;
 mod harness_verifier_coordinator;
+#[path = "mcp_auth.rs"]
 mod mcp_token;
 mod recovery;
 mod retention;

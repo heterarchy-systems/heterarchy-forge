@@ -15,6 +15,7 @@ mod harness_skill;
 mod harness_verifier;
 mod location;
 mod mcp_connection;
+#[path = "mcp_auth.rs"]
 mod mcp_token;
 mod recovery;
 mod runtime;

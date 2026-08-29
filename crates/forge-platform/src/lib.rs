@@ -3,6 +3,7 @@
 mod app_paths;
 mod logging;
 mod macos_folder_picker;
+#[path = "mcp_auth_store.rs"]
 mod mcp_token_pepper;
 
 pub use app_paths::{AppPathError, AppPaths};
