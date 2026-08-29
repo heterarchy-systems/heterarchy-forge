@@ -22,9 +22,11 @@ authors = ["Heterarchy Systems"]
 repository = "https://github.com/heterarchy-systems/heterarchy-forge"
 
 [workspace.dependencies]
+axum = { version = "=0.8.9", default-features = false, features = ["http1", "tokio"] }
 base64 = { version = "=0.22.1", default-features = false, features = ["std"] }
 blake3 = { version = "=1.8.7", default-features = false, features = ["std"] }
 directories = "6.0.0"
+getrandom = { version = "=0.4.3", default-features = false }
 objc2 = { version = "=0.6.4", default-features = false, features = ["std"] }
 objc2-app-kit = { version = "=0.3.2", default-features = false, features = [
     "NSApplication",
@@ -35,7 +37,7 @@ objc2-app-kit = { version = "=0.3.2", default-features = false, features = [
     "NSWindow",
 ] }
 rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled"] }
-rmcp = { version = "=3.1.4", default-features = false, features = ["server", "transport-io"] }
+rmcp = { version = "=3.1.4", default-features = false, features = ["server", "transport-io", "transport-streamable-http-server"] }
 rustix = { version = "=1.1.4", default-features = false, features = ["fs", "std"] }
 rustix-process = { package = "rustix", version = "=1.1.4", default-features = false, features = ["fs", "process", "std"] }
 similar = { version = "=3.2.0", default-features = false, features = ["std", "text"] }
@@ -51,9 +53,10 @@ slint = { version = "=1.17.1", default-features = false, features = [
     "system-tray",
 ] }
 slint-build = "=1.17.1"
+security-framework = { version = "=3.7.0", default-features = false }
 thiserror = "2.0.20"
 toml = "=0.9.12"
-tokio = { version = "1.53.1", default-features = false, features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1.53.1", default-features = false, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "0.7.19", default-features = false, features = ["rt"] }
 tracing = { version = "0.1.44", default-features = false, features = ["std", "attributes"] }
 tracing-appender = "0.2.5"

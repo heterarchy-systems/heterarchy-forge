@@ -73,6 +73,16 @@ fn binary_stdio_emits_only_json_rpc_and_exits_on_eof() -> Result<(), Box<dyn std
             "diff_doctor",
             "diff_retention_plan",
             "diff_artifact_doctor",
+            "agent_attach",
+            "agent_set_focus",
+            "agent_publish_work",
+            "agent_get_context",
+            "agent_detach",
+            "goal_list",
+            "goal_get",
+            "dag_get_current",
+            "dag_authoring_grant_discover",
+            "dag_replan_commit",
         ]
     );
     assert!(registry.is_file());
@@ -111,6 +121,11 @@ fn binary_doctor_missing_registry_is_read_only_and_reports_warning()
     }
     assert!(!registry.exists());
     assert!(!registry.parent().ok_or("registry parent missing")?.exists());
+    assert!(
+        !home
+            .join("Library/Application Support/Heterarchy Forge/mcp-tokens.sqlite3")
+            .exists()
+    );
     std::fs::remove_dir_all(root)?;
     Ok(())
 }

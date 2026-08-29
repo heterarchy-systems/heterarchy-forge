@@ -5,7 +5,7 @@
 //! bundle without executing it. Verifier execution remains a later sandboxed
 //! command boundary.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
@@ -26,11 +26,12 @@ use crate::{ConfinedFilesystemError, ConfinedWorkspace};
 
 pub const HARNESS_MANIFEST_FILE_NAME: &str = "harness.toml";
 pub const HARNESS_MANAGED_STATE_PATH: &str = ".agents/.heterarchy.toml";
-const HARNESS_MANAGED_STATE_SCHEMA_VERSION: u32 = 1;
+const HARNESS_MANAGED_STATE_SCHEMA_VERSION: u32 = 2;
+const HARNESS_MANAGED_STATE_LEGACY_SCHEMA_VERSION: u32 = 1;
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 pub const MAX_HARNESS_MANAGED_FILE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_MANAGED_FILE_BYTES: u64 = MAX_HARNESS_MANAGED_FILE_BYTES as u64;
-const MAX_TOTAL_MANAGED_BYTES: u64 = 16 * 1024 * 1024;
+pub const MAX_HARNESS_TOTAL_MANAGED_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_RELATIVE_PATH_BYTES: usize = 4_096;
 const MAX_PATH_COMPONENTS: usize = 16;
 const MAX_VERIFIER_NAME_BYTES: usize = 128;
@@ -45,6 +46,51 @@ const MAX_VERIFIER_PATH_ENTRIES: usize = 64;
 pub struct HarnessManagedAsset {
     relative_path: PathBuf,
     bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum HarnessManagedFileOwnership {
+    Heterarchy,
+    External,
+}
+
+impl HarnessManagedFileOwnership {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Heterarchy => "heterarchy",
+            Self::External => "external",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, HarnessPreviewError> {
+        match value {
+            "heterarchy" => Ok(Self::Heterarchy),
+            "external" => Ok(Self::External),
+            _ => Err(HarnessPreviewError::InvalidManagedManifest),
+        }
+    }
+}
+
+#[must_use]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HarnessManagedFileRecord {
+    path: WorkspaceRelativePath,
+    hash: FileContentHash,
+    size: FileByteCount,
+    ownership: HarnessManagedFileOwnership,
+}
+
+#[must_use]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HarnessManagedState {
+    schema_version: u32,
+    bundle_id: HarnessBundleId,
+    bundle_version: HarnessVersion,
+    content_hash: HarnessContentHash,
+    install_root: PathBuf,
+    agents_managed: bool,
+    deletion_authority: bool,
+    managed_files: Vec<HarnessManagedFileRecord>,
 }
 
 impl HarnessManagedAsset {
@@ -221,6 +267,7 @@ impl HarnessPreviewItem {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HarnessInstallPreview {
     descriptor: HarnessBundleDescriptor,
+    managed_state: HarnessManagedState,
     items: Vec<HarnessPreviewItem>,
     creates: usize,
     merges: usize,
@@ -231,6 +278,10 @@ pub struct HarnessInstallPreview {
 impl HarnessInstallPreview {
     pub const fn descriptor(&self) -> &HarnessBundleDescriptor {
         &self.descriptor
+    }
+
+    const fn managed_state(&self) -> &HarnessManagedState {
+        &self.managed_state
     }
 
     pub fn items(&self) -> &[HarnessPreviewItem] {
@@ -265,7 +316,10 @@ impl HarnessInstallPreview {
         self.conflicts == 0
             && self.items.iter().all(|item| {
                 item.disposition() != HarnessPreviewDisposition::Merge
-                    || item.kind() == HarnessPreviewKind::AgentsFile
+                    || matches!(
+                        item.kind(),
+                        HarnessPreviewKind::AgentsFile | HarnessPreviewKind::ManagedManifest
+                    )
             })
     }
 }
@@ -282,6 +336,8 @@ pub enum HarnessPreviewError {
     InvalidAgentsDocument,
     #[error("Harness managed manifest exceeds the supported bound")]
     ManagedManifestTooLarge,
+    #[error("Harness managed manifest is invalid or does not prove bounded ownership")]
+    InvalidManagedManifest,
 }
 
 #[must_use]
@@ -290,6 +346,117 @@ pub struct HarnessMaterializationReceipt {
     preview: HarnessInstallPreview,
     written_files: usize,
     merged_agents: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HarnessLifecycleMode {
+    Update,
+    Switch,
+    Remove,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HarnessLifecycleDisposition {
+    Create,
+    Replace,
+    Remove,
+    Preserve,
+    Unchanged,
+    Conflict,
+}
+
+#[must_use]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HarnessLifecyclePreviewItem {
+    path: WorkspaceRelativePath,
+    kind: HarnessPreviewKind,
+    disposition: HarnessLifecycleDisposition,
+}
+
+impl HarnessLifecyclePreviewItem {
+    pub fn path(&self) -> &WorkspaceRelativePath {
+        &self.path
+    }
+
+    pub const fn kind(&self) -> HarnessPreviewKind {
+        self.kind
+    }
+
+    pub const fn disposition(&self) -> HarnessLifecycleDisposition {
+        self.disposition
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HarnessLifecycleEffect {
+    Write {
+        path: WorkspaceRelativePath,
+        expected: FilePathState,
+        content: Vec<u8>,
+    },
+    Delete {
+        path: WorkspaceRelativePath,
+        expected: FilePathState,
+    },
+}
+
+#[must_use]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HarnessLifecyclePreview {
+    mode: HarnessLifecycleMode,
+    current_descriptor: HarnessBundleDescriptor,
+    target_descriptor: Option<HarnessBundleDescriptor>,
+    items: Vec<HarnessLifecyclePreviewItem>,
+    effects: Vec<HarnessLifecycleEffect>,
+    conflicts: usize,
+}
+
+impl HarnessLifecyclePreview {
+    pub const fn mode(&self) -> HarnessLifecycleMode {
+        self.mode
+    }
+
+    pub const fn current_descriptor(&self) -> &HarnessBundleDescriptor {
+        &self.current_descriptor
+    }
+
+    pub const fn target_descriptor(&self) -> Option<&HarnessBundleDescriptor> {
+        self.target_descriptor.as_ref()
+    }
+
+    pub fn items(&self) -> &[HarnessLifecyclePreviewItem] {
+        &self.items
+    }
+
+    pub const fn conflicts(&self) -> usize {
+        self.conflicts
+    }
+
+    pub const fn can_apply(&self) -> bool {
+        self.conflicts == 0
+    }
+}
+
+#[must_use]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HarnessLifecycleReceipt {
+    preview: HarnessLifecyclePreview,
+    written_files: usize,
+    deleted_files: usize,
+}
+
+impl HarnessLifecycleReceipt {
+    pub const fn preview(&self) -> &HarnessLifecyclePreview {
+        &self.preview
+    }
+
+    pub const fn written_files(&self) -> usize {
+        self.written_files
+    }
+
+    pub const fn deleted_files(&self) -> usize {
+        self.deleted_files
+    }
 }
 
 impl HarnessMaterializationReceipt {
@@ -315,6 +482,22 @@ pub enum HarnessMaterializationError {
     #[error("Harness Apply requires conflict resolution before materialization")]
     Conflict,
     #[error("Harness Apply filesystem effect failed")]
+    Filesystem(#[from] ConfinedFilesystemError),
+}
+
+#[derive(Debug, Error)]
+pub enum HarnessLifecycleError {
+    #[error(transparent)]
+    Preview(#[from] HarnessPreviewError),
+    #[error("Harness lifecycle managed state does not match the durable applied Harness")]
+    ManagedStateMismatch,
+    #[error("Harness lifecycle action does not match the current/target Bundle identities")]
+    InvalidMode,
+    #[error("Harness lifecycle has unresolved ownership or content conflicts")]
+    Conflict,
+    #[error("Harness lifecycle Preview is stale")]
+    PreviewChanged,
+    #[error("Harness lifecycle filesystem effect failed")]
     Filesystem(#[from] ConfinedFilesystemError),
 }
 
@@ -430,6 +613,7 @@ pub fn preview_harness_install(
     filesystem: &ConfinedWorkspace,
     bundle: &InspectedHarnessBundle,
 ) -> Result<HarnessInstallPreview, HarnessPreviewError> {
+    let managed_state = build_managed_state(filesystem, bundle)?;
     let additional = usize::from(bundle.agents_template().is_some()).saturating_add(1);
     let mut items = Vec::with_capacity(bundle.managed_files().len().saturating_add(additional));
     for asset in bundle.managed_files() {
@@ -444,14 +628,7 @@ pub fn preview_harness_install(
     if let Some(template) = bundle.agents_template() {
         items.push(preview_agents_item(filesystem, bundle, template)?);
     }
-    let managed_manifest = managed_manifest_bytes(bundle)?;
-    items.push(preview_item(
-        filesystem,
-        WorkspaceRelativePath::new(PathBuf::from(HARNESS_MANAGED_STATE_PATH))
-            .map_err(|_| HarnessPreviewError::InvalidTarget)?,
-        HarnessPreviewKind::ManagedManifest,
-        &managed_manifest,
-    )?);
+    items.push(preview_managed_manifest_item(filesystem, &managed_state)?);
     let (creates, merges, unchanged, conflicts) = items.iter().fold(
         (0_usize, 0_usize, 0_usize, 0_usize),
         |(creates, merges, unchanged, conflicts), item| match item.disposition() {
@@ -463,6 +640,7 @@ pub fn preview_harness_install(
     );
     Ok(HarnessInstallPreview {
         descriptor: bundle.descriptor().clone(),
+        managed_state,
         items,
         creates,
         merges,
@@ -531,7 +709,7 @@ pub fn materialize_harness_install(
         false
     };
 
-    let managed_manifest = managed_manifest_bytes(bundle)?;
+    let managed_manifest = managed_state_bytes(expected_preview.managed_state())?;
     let manifest_path = WorkspaceRelativePath::new(PathBuf::from(HARNESS_MANAGED_STATE_PATH))
         .map_err(|_| HarnessPreviewError::InvalidTarget)?;
     let manifest_state =
@@ -546,14 +724,11 @@ pub fn materialize_harness_install(
             size: manifest_size,
         })
     {
-        if manifest_state != FilePathState::Absent {
-            return Err(HarnessMaterializationError::PreviewChanged);
-        }
         ensure_parent_tree(filesystem, &write_guard, &manifest_path)?;
         let _post = filesystem.write_bounded_atomic(
             &write_guard,
             &manifest_path,
-            FilePathState::Absent,
+            manifest_state,
             &managed_manifest,
             MAX_HARNESS_MANAGED_FILE_BYTES,
         )?;
@@ -572,6 +747,491 @@ pub fn materialize_harness_install(
         preview: final_preview,
         written_files,
         merged_agents,
+    })
+}
+
+/// Preview an explicit Update, Switch, or Remove against the exact durable
+/// applied Harness descriptor. Only files with manifest-proven Heterarchy
+/// ownership can be replaced or removed; external files are preserved unless
+/// they are absent and the target Bundle explicitly creates them.
+pub fn preview_harness_lifecycle(
+    filesystem: &ConfinedWorkspace,
+    current: &HarnessBundleDescriptor,
+    target: Option<&InspectedHarnessBundle>,
+) -> Result<HarnessLifecyclePreview, HarnessLifecycleError> {
+    let (managed_state, manifest_state) = read_current_managed_state(filesystem, current)?;
+    let mode = match target {
+        Some(bundle) if bundle.descriptor().id() == current.id() => HarnessLifecycleMode::Update,
+        Some(_) => HarnessLifecycleMode::Switch,
+        None => HarnessLifecycleMode::Remove,
+    };
+    let mut parts = preview_lifecycle_managed_files(filesystem, &managed_state, target)?;
+
+    if let Some((item, effect)) = preview_lifecycle_agents(
+        filesystem,
+        managed_state.bundle_id,
+        managed_state.agents_managed,
+        target,
+    )? {
+        parts.conflicts += usize::from(item.disposition == HarnessLifecycleDisposition::Conflict);
+        if let Some(effect) = effect {
+            parts.effects.push(effect);
+        }
+        parts.items.push(item);
+    }
+    append_lifecycle_manifest(&mut parts, manifest_state, target)?;
+
+    Ok(HarnessLifecyclePreview {
+        mode,
+        current_descriptor: current.clone(),
+        target_descriptor: target.map(|bundle| bundle.descriptor().clone()),
+        items: parts.items,
+        effects: parts.effects,
+        conflicts: parts.conflicts,
+    })
+}
+
+pub fn materialize_harness_lifecycle(
+    filesystem: &ConfinedWorkspace,
+    current: &HarnessBundleDescriptor,
+    target: Option<&InspectedHarnessBundle>,
+    expected_preview: &HarnessLifecyclePreview,
+) -> Result<HarnessLifecycleReceipt, HarnessLifecycleError> {
+    let expected_target = target.map(InspectedHarnessBundle::descriptor);
+    if expected_preview.current_descriptor() != current
+        || expected_preview.target_descriptor() != expected_target
+        || !expected_preview.can_apply()
+    {
+        return Err(HarnessLifecycleError::Conflict);
+    }
+    let write_guard = filesystem.acquire_write_guard()?;
+    let current_preview = preview_harness_lifecycle(filesystem, current, target)?;
+    if &current_preview != expected_preview {
+        return Err(HarnessLifecycleError::PreviewChanged);
+    }
+
+    let mut written_files = 0_usize;
+    let mut deleted_files = 0_usize;
+    for effect in &expected_preview.effects {
+        match effect {
+            HarnessLifecycleEffect::Write {
+                path,
+                expected,
+                content,
+            } => {
+                ensure_parent_tree(filesystem, &write_guard, path).map_err(
+                    |error| match error {
+                        HarnessMaterializationError::Preview(error) => {
+                            HarnessLifecycleError::Preview(error)
+                        }
+                        HarnessMaterializationError::Filesystem(error) => {
+                            HarnessLifecycleError::Filesystem(error)
+                        }
+                        HarnessMaterializationError::PreviewChanged
+                        | HarnessMaterializationError::Conflict => HarnessLifecycleError::Conflict,
+                    },
+                )?;
+                let _post = filesystem.write_bounded_atomic(
+                    &write_guard,
+                    path,
+                    *expected,
+                    content,
+                    MAX_HARNESS_MANAGED_FILE_BYTES,
+                )?;
+                written_files += 1;
+            }
+            HarnessLifecycleEffect::Delete { path, expected } => {
+                let _post = filesystem.delete_bounded_atomic(
+                    &write_guard,
+                    path,
+                    *expected,
+                    MAX_HARNESS_MANAGED_FILE_BYTES,
+                )?;
+                deleted_files += 1;
+            }
+        }
+    }
+    Ok(HarnessLifecycleReceipt {
+        preview: expected_preview.clone(),
+        written_files,
+        deleted_files,
+    })
+}
+
+#[derive(Debug)]
+struct LifecycleManagedFileResult {
+    disposition: HarnessLifecycleDisposition,
+    effect: Option<HarnessLifecycleEffect>,
+    target_record: Option<HarnessManagedFileRecord>,
+}
+
+#[derive(Debug, Default)]
+struct LifecyclePreviewParts {
+    items: Vec<HarnessLifecyclePreviewItem>,
+    effects: Vec<HarnessLifecycleEffect>,
+    target_records: Vec<HarnessManagedFileRecord>,
+    conflicts: usize,
+}
+
+fn preview_lifecycle_managed_files(
+    filesystem: &ConfinedWorkspace,
+    managed_state: &HarnessManagedState,
+    target: Option<&InspectedHarnessBundle>,
+) -> Result<LifecyclePreviewParts, HarnessLifecycleError> {
+    let current_records = managed_state
+        .managed_files
+        .iter()
+        .map(|record| (record.path.as_path().to_path_buf(), record))
+        .collect::<BTreeMap<_, _>>();
+    let target_assets = target
+        .map(|bundle| {
+            bundle
+                .managed_files()
+                .iter()
+                .map(|asset| (bundle.install_root().join(asset.relative_path()), asset))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+    let mut paths = current_records.keys().cloned().collect::<BTreeSet<_>>();
+    paths.extend(target_assets.keys().cloned());
+    let mut parts = LifecyclePreviewParts {
+        target_records: Vec::with_capacity(target_assets.len()),
+        ..LifecyclePreviewParts::default()
+    };
+    for raw_path in paths {
+        let old = current_records.get(&raw_path).copied();
+        let desired = target_assets.get(&raw_path).copied();
+        let path =
+            WorkspaceRelativePath::new(raw_path).map_err(|_| HarnessPreviewError::InvalidTarget)?;
+        let observed =
+            filesystem.observe_bounded_file_state(&path, MAX_HARNESS_MANAGED_FILE_BYTES)?;
+        let result = preview_lifecycle_managed_file(&path, observed, old, desired)?;
+        parts.conflicts += usize::from(result.disposition == HarnessLifecycleDisposition::Conflict);
+        parts.effects.extend(result.effect);
+        parts.target_records.extend(result.target_record);
+        parts.items.push(HarnessLifecyclePreviewItem {
+            path,
+            kind: HarnessPreviewKind::ManagedFile,
+            disposition: result.disposition,
+        });
+    }
+    Ok(parts)
+}
+
+fn append_lifecycle_manifest(
+    parts: &mut LifecyclePreviewParts,
+    manifest_state: FilePathState,
+    target: Option<&InspectedHarnessBundle>,
+) -> Result<(), HarnessLifecycleError> {
+    let manifest_path = WorkspaceRelativePath::new(PathBuf::from(HARNESS_MANAGED_STATE_PATH))
+        .map_err(|_| HarnessPreviewError::InvalidTarget)?;
+    if let Some(bundle) = target {
+        let target_state = HarnessManagedState {
+            schema_version: HARNESS_MANAGED_STATE_SCHEMA_VERSION,
+            bundle_id: bundle.descriptor().id(),
+            bundle_version: bundle.descriptor().version().clone(),
+            content_hash: bundle.descriptor().content_hash(),
+            install_root: bundle.install_root().to_path_buf(),
+            agents_managed: bundle.agents_template().is_some(),
+            deletion_authority: true,
+            managed_files: std::mem::take(&mut parts.target_records),
+        };
+        let content = managed_state_bytes(&target_state)?;
+        let desired = regular_state_for_bytes(&content)?;
+        let disposition = if manifest_state == desired {
+            HarnessLifecycleDisposition::Unchanged
+        } else {
+            parts.effects.push(HarnessLifecycleEffect::Write {
+                path: manifest_path.clone(),
+                expected: manifest_state,
+                content,
+            });
+            HarnessLifecycleDisposition::Replace
+        };
+        parts.items.push(HarnessLifecyclePreviewItem {
+            path: manifest_path,
+            kind: HarnessPreviewKind::ManagedManifest,
+            disposition,
+        });
+    } else {
+        parts.effects.push(HarnessLifecycleEffect::Delete {
+            path: manifest_path.clone(),
+            expected: manifest_state,
+        });
+        parts.items.push(HarnessLifecyclePreviewItem {
+            path: manifest_path,
+            kind: HarnessPreviewKind::ManagedManifest,
+            disposition: HarnessLifecycleDisposition::Remove,
+        });
+    }
+    Ok(())
+}
+
+fn preview_lifecycle_managed_file(
+    path: &WorkspaceRelativePath,
+    observed: FilePathState,
+    old: Option<&HarnessManagedFileRecord>,
+    desired: Option<&HarnessManagedAsset>,
+) -> Result<LifecycleManagedFileResult, HarnessLifecycleError> {
+    let old_state = old.map(|record| FilePathState::Regular {
+        hash: record.hash,
+        size: record.size,
+    });
+    let desired_content = desired.map(HarnessManagedAsset::bytes);
+    let desired_state = desired_content.map(regular_state_for_bytes).transpose()?;
+    let old_owned =
+        old.is_some_and(|record| record.ownership == HarnessManagedFileOwnership::Heterarchy);
+    let (disposition, effect, ownership) = match (old, desired_content, desired_state) {
+        (Some(_), None, _) if old_owned => {
+            if observed == FilePathState::Absent {
+                (HarnessLifecycleDisposition::Unchanged, None, None)
+            } else if Some(observed) == old_state {
+                (
+                    HarnessLifecycleDisposition::Remove,
+                    Some(HarnessLifecycleEffect::Delete {
+                        path: path.clone(),
+                        expected: observed,
+                    }),
+                    None,
+                )
+            } else {
+                (HarnessLifecycleDisposition::Conflict, None, None)
+            }
+        }
+        (Some(_), None, _) => (HarnessLifecycleDisposition::Preserve, None, None),
+        (_, Some(content), Some(desired_state)) if old_owned => {
+            if observed == desired_state {
+                (
+                    HarnessLifecycleDisposition::Unchanged,
+                    None,
+                    Some(HarnessManagedFileOwnership::Heterarchy),
+                )
+            } else if observed == FilePathState::Absent {
+                (
+                    HarnessLifecycleDisposition::Create,
+                    Some(HarnessLifecycleEffect::Write {
+                        path: path.clone(),
+                        expected: FilePathState::Absent,
+                        content: content.to_vec(),
+                    }),
+                    Some(HarnessManagedFileOwnership::Heterarchy),
+                )
+            } else if Some(observed) == old_state {
+                (
+                    HarnessLifecycleDisposition::Replace,
+                    Some(HarnessLifecycleEffect::Write {
+                        path: path.clone(),
+                        expected: observed,
+                        content: content.to_vec(),
+                    }),
+                    Some(HarnessManagedFileOwnership::Heterarchy),
+                )
+            } else {
+                (HarnessLifecycleDisposition::Conflict, None, None)
+            }
+        }
+        (_, Some(content), Some(desired_state)) => {
+            if observed == desired_state {
+                (
+                    HarnessLifecycleDisposition::Preserve,
+                    None,
+                    Some(HarnessManagedFileOwnership::External),
+                )
+            } else if observed == FilePathState::Absent {
+                (
+                    HarnessLifecycleDisposition::Create,
+                    Some(HarnessLifecycleEffect::Write {
+                        path: path.clone(),
+                        expected: FilePathState::Absent,
+                        content: content.to_vec(),
+                    }),
+                    Some(HarnessManagedFileOwnership::Heterarchy),
+                )
+            } else {
+                (HarnessLifecycleDisposition::Conflict, None, None)
+            }
+        }
+        (_, _, _) => (HarnessLifecycleDisposition::Conflict, None, None),
+    };
+    let target_record = match (desired_state, ownership) {
+        (Some(FilePathState::Regular { hash, size }), Some(ownership)) => {
+            Some(HarnessManagedFileRecord {
+                path: path.clone(),
+                hash,
+                size,
+                ownership,
+            })
+        }
+        _ => None,
+    };
+    Ok(LifecycleManagedFileResult {
+        disposition,
+        effect,
+        target_record,
+    })
+}
+
+fn preview_lifecycle_agents(
+    filesystem: &ConfinedWorkspace,
+    current_bundle_id: HarnessBundleId,
+    current_managed: bool,
+    target: Option<&InspectedHarnessBundle>,
+) -> Result<
+    Option<(HarnessLifecyclePreviewItem, Option<HarnessLifecycleEffect>)>,
+    HarnessLifecycleError,
+> {
+    let target_template = target.and_then(InspectedHarnessBundle::agents_template);
+    if !current_managed && target_template.is_none() {
+        return Ok(None);
+    }
+    let path = WorkspaceRelativePath::new(PathBuf::from("AGENTS.md"))
+        .map_err(|_| HarnessPreviewError::InvalidTarget)?;
+    let existing = filesystem.read_bounded_file(&path, MAX_HARNESS_MANAGED_FILE_BYTES)?;
+    let expected = existing
+        .as_ref()
+        .map_or(FilePathState::Absent, crate::ConfinedFileRead::state);
+    let existing_bytes = existing.as_ref().map(crate::ConfinedFileRead::content);
+    let target_id = target.map(|bundle| bundle.descriptor().id());
+    let (desired, conflict) = lifecycle_agents_document(
+        existing_bytes,
+        current_bundle_id,
+        current_managed,
+        target_id,
+        target_template.map(HarnessManagedAsset::bytes),
+    )?;
+    if conflict {
+        return Ok(Some((
+            HarnessLifecyclePreviewItem {
+                path,
+                kind: HarnessPreviewKind::AgentsFile,
+                disposition: HarnessLifecycleDisposition::Conflict,
+            },
+            None,
+        )));
+    }
+    let desired_state = regular_state_for_bytes(&desired)?;
+    let disposition = if expected == desired_state {
+        HarnessLifecycleDisposition::Unchanged
+    } else if expected == FilePathState::Absent {
+        HarnessLifecycleDisposition::Create
+    } else {
+        HarnessLifecycleDisposition::Replace
+    };
+    let effect = (expected != desired_state).then(|| HarnessLifecycleEffect::Write {
+        path: path.clone(),
+        expected,
+        content: desired,
+    });
+    Ok(Some((
+        HarnessLifecyclePreviewItem {
+            path,
+            kind: HarnessPreviewKind::AgentsFile,
+            disposition,
+        },
+        effect,
+    )))
+}
+
+fn lifecycle_agents_document(
+    existing: Option<&[u8]>,
+    current_bundle_id: HarnessBundleId,
+    current_managed: bool,
+    target_bundle_id: Option<HarnessBundleId>,
+    target_template: Option<&[u8]>,
+) -> Result<(Vec<u8>, bool), HarnessPreviewError> {
+    if current_managed
+        && target_bundle_id == Some(current_bundle_id)
+        && let Some(template) = target_template
+    {
+        let (content, disposition) = render_agents_document(existing, current_bundle_id, template)?;
+        return Ok((content, disposition == HarnessPreviewDisposition::Conflict));
+    }
+    let (base, remove_conflict) = if current_managed {
+        remove_agents_managed_block(existing, current_bundle_id)?
+    } else {
+        (existing.unwrap_or_default().to_vec(), false)
+    };
+    if remove_conflict {
+        return Ok((base, true));
+    }
+    let Some(template) = target_template else {
+        return Ok((base, false));
+    };
+    let target_bundle_id = target_bundle_id.ok_or(HarnessPreviewError::InvalidAgentsDocument)?;
+    let (content, disposition) = render_agents_document(Some(&base), target_bundle_id, template)?;
+    Ok((content, disposition == HarnessPreviewDisposition::Conflict))
+}
+
+fn remove_agents_managed_block(
+    existing: Option<&[u8]>,
+    bundle_id: HarnessBundleId,
+) -> Result<(Vec<u8>, bool), HarnessPreviewError> {
+    let Some(existing) = existing else {
+        return Ok((Vec::new(), false));
+    };
+    let existing =
+        std::str::from_utf8(existing).map_err(|_| HarnessPreviewError::InvalidAgentsDocument)?;
+    if existing.as_bytes().contains(&0) {
+        return Err(HarnessPreviewError::InvalidAgentsDocument);
+    }
+    let start = format!("<!-- heterarchy:harness:start {bundle_id} -->");
+    let end = format!("<!-- heterarchy:harness:end {bundle_id} -->");
+    let generic_start = "<!-- heterarchy:harness:start ";
+    let generic_end = "<!-- heterarchy:harness:end ";
+    let starts = existing.match_indices(&start).collect::<Vec<_>>();
+    let ends = existing.match_indices(&end).collect::<Vec<_>>();
+    if starts.is_empty() && ends.is_empty() {
+        return Ok((
+            existing.as_bytes().to_vec(),
+            existing.contains(generic_start) || existing.contains(generic_end),
+        ));
+    }
+    if starts.len() != 1 || ends.len() != 1 || starts[0].0 >= ends[0].0 {
+        return Ok((existing.as_bytes().to_vec(), true));
+    }
+    let after_end = ends[0]
+        .0
+        .checked_add(end.len())
+        .ok_or(HarnessPreviewError::InvalidAgentsDocument)?;
+    let without_owned = format!("{}{}", &existing[..starts[0].0], &existing[after_end..]);
+    if without_owned.contains(generic_start) || without_owned.contains(generic_end) {
+        return Ok((existing.as_bytes().to_vec(), true));
+    }
+    let mut bytes = without_owned.into_bytes();
+    if bytes.get(starts[0].0) == Some(&b'\n') {
+        bytes.remove(starts[0].0);
+    }
+    Ok((bytes, false))
+}
+
+fn read_current_managed_state(
+    filesystem: &ConfinedWorkspace,
+    current: &HarnessBundleDescriptor,
+) -> Result<(HarnessManagedState, FilePathState), HarnessLifecycleError> {
+    let path = WorkspaceRelativePath::new(PathBuf::from(HARNESS_MANAGED_STATE_PATH))
+        .map_err(|_| HarnessPreviewError::InvalidTarget)?;
+    let existing = filesystem
+        .read_bounded_file(&path, MAX_HARNESS_MANAGED_FILE_BYTES)?
+        .ok_or(HarnessLifecycleError::ManagedStateMismatch)?;
+    let state = parse_managed_state(existing.content())?;
+    if state.bundle_id != current.id()
+        || state.bundle_version != *current.version()
+        || state.content_hash != current.content_hash()
+    {
+        return Err(HarnessLifecycleError::ManagedStateMismatch);
+    }
+    Ok((state, existing.state()))
+}
+
+fn regular_state_for_bytes(bytes: &[u8]) -> Result<FilePathState, HarnessPreviewError> {
+    if bytes.len() > MAX_HARNESS_MANAGED_FILE_BYTES {
+        return Err(HarnessPreviewError::SourceTooLarge);
+    }
+    Ok(FilePathState::Regular {
+        hash: FileContentHash::from_bytes(*blake3::hash(bytes).as_bytes()),
+        size: FileByteCount::new(
+            u64::try_from(bytes.len()).map_err(|_| HarnessPreviewError::SourceTooLarge)?,
+        ),
     })
 }
 
@@ -765,49 +1425,327 @@ fn render_agents_document(
     Ok((merged.into_bytes(), disposition))
 }
 
-fn managed_manifest_bytes(bundle: &InspectedHarnessBundle) -> Result<Vec<u8>, HarnessPreviewError> {
-    let install_root = bundle
-        .install_root()
+fn build_managed_state(
+    filesystem: &ConfinedWorkspace,
+    bundle: &InspectedHarnessBundle,
+) -> Result<HarnessManagedState, HarnessPreviewError> {
+    let previous = read_managed_state_for_preview(filesystem)?;
+    let previous_owned = previous
+        .as_ref()
+        .filter(|state| state.bundle_id == bundle.descriptor().id() && state.deletion_authority)
+        .map(|state| {
+            state
+                .managed_files
+                .iter()
+                .map(|record| (record.path.as_path().to_path_buf(), record))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+
+    let mut managed_files = Vec::with_capacity(bundle.managed_files().len());
+    for asset in bundle.managed_files() {
+        let target = WorkspaceRelativePath::new(bundle.install_root().join(asset.relative_path()))
+            .map_err(|_| HarnessPreviewError::InvalidTarget)?;
+        let hash = FileContentHash::from_bytes(*blake3::hash(asset.bytes()).as_bytes());
+        let size = FileByteCount::new(
+            u64::try_from(asset.bytes().len()).map_err(|_| HarnessPreviewError::SourceTooLarge)?,
+        );
+        let observed =
+            filesystem.observe_bounded_file_state(&target, MAX_HARNESS_MANAGED_FILE_BYTES)?;
+        let ownership = match observed {
+            FilePathState::Absent => HarnessManagedFileOwnership::Heterarchy,
+            FilePathState::Regular {
+                hash: observed_hash,
+                size: observed_size,
+            } => previous_owned
+                .get(target.as_path())
+                .filter(|record| {
+                    record.ownership == HarnessManagedFileOwnership::Heterarchy
+                        && record.hash == observed_hash
+                        && record.size == observed_size
+                })
+                .map_or(HarnessManagedFileOwnership::External, |_| {
+                    HarnessManagedFileOwnership::Heterarchy
+                }),
+        };
+        managed_files.push(HarnessManagedFileRecord {
+            path: target,
+            hash,
+            size,
+            ownership,
+        });
+    }
+
+    Ok(HarnessManagedState {
+        schema_version: HARNESS_MANAGED_STATE_SCHEMA_VERSION,
+        bundle_id: bundle.descriptor().id(),
+        bundle_version: bundle.descriptor().version().clone(),
+        content_hash: bundle.descriptor().content_hash(),
+        install_root: bundle.install_root().to_path_buf(),
+        agents_managed: bundle.agents_template().is_some(),
+        deletion_authority: true,
+        managed_files,
+    })
+}
+
+fn preview_managed_manifest_item(
+    filesystem: &ConfinedWorkspace,
+    state: &HarnessManagedState,
+) -> Result<HarnessPreviewItem, HarnessPreviewError> {
+    let path = WorkspaceRelativePath::new(PathBuf::from(HARNESS_MANAGED_STATE_PATH))
+        .map_err(|_| HarnessPreviewError::InvalidTarget)?;
+    let desired = managed_state_bytes(state)?;
+    let source_hash = FileContentHash::from_bytes(*blake3::hash(&desired).as_bytes());
+    let source_size = FileByteCount::new(
+        u64::try_from(desired.len()).map_err(|_| HarnessPreviewError::SourceTooLarge)?,
+    );
+    let existing = filesystem.read_bounded_file(&path, MAX_HARNESS_MANAGED_FILE_BYTES)?;
+    let disposition = match existing {
+        None => HarnessPreviewDisposition::Create,
+        Some(existing) if existing.hash() == source_hash && existing.size() == source_size => {
+            HarnessPreviewDisposition::Unchanged
+        }
+        Some(existing) => match parse_managed_state(existing.content()) {
+            Ok(previous) if previous.bundle_id == state.bundle_id => {
+                HarnessPreviewDisposition::Merge
+            }
+            Ok(_) | Err(_) => HarnessPreviewDisposition::Conflict,
+        },
+    };
+    Ok(HarnessPreviewItem {
+        path,
+        kind: HarnessPreviewKind::ManagedManifest,
+        disposition,
+        source_hash,
+        source_size,
+    })
+}
+
+fn read_managed_state_for_preview(
+    filesystem: &ConfinedWorkspace,
+) -> Result<Option<HarnessManagedState>, HarnessPreviewError> {
+    let path = WorkspaceRelativePath::new(PathBuf::from(HARNESS_MANAGED_STATE_PATH))
+        .map_err(|_| HarnessPreviewError::InvalidTarget)?;
+    let Some(existing) = filesystem.read_bounded_file(&path, MAX_HARNESS_MANAGED_FILE_BYTES)?
+    else {
+        return Ok(None);
+    };
+    Ok(parse_managed_state(existing.content()).ok())
+}
+
+fn parse_managed_state(bytes: &[u8]) -> Result<HarnessManagedState, HarnessPreviewError> {
+    let text =
+        std::str::from_utf8(bytes).map_err(|_| HarnessPreviewError::InvalidManagedManifest)?;
+    let document: TomlValue =
+        toml::from_str(text).map_err(|_| HarnessPreviewError::InvalidManagedManifest)?;
+    let table = document
+        .as_table()
+        .ok_or(HarnessPreviewError::InvalidManagedManifest)?;
+    let header = parse_managed_state_header(table)?;
+    let managed_files = parse_managed_state_files(table, &header)?;
+    Ok(HarnessManagedState {
+        schema_version: header.schema_version,
+        bundle_id: header.bundle_id,
+        bundle_version: header.bundle_version,
+        content_hash: header.content_hash,
+        install_root: header.install_root,
+        agents_managed: header.agents_managed,
+        deletion_authority: header.deletion_authority,
+        managed_files,
+    })
+}
+
+#[derive(Debug)]
+struct ManagedStateHeader {
+    schema_version: u32,
+    bundle_id: HarnessBundleId,
+    bundle_version: HarnessVersion,
+    content_hash: HarnessContentHash,
+    install_root: PathBuf,
+    agents_managed: bool,
+    deletion_authority: bool,
+}
+
+fn parse_managed_state_header(
+    table: &toml::map::Map<String, TomlValue>,
+) -> Result<ManagedStateHeader, HarnessPreviewError> {
+    ensure_managed_state_exact_keys(
+        table.keys().map(String::as_str),
+        &[
+            "agents_managed",
+            "bundle_id",
+            "bundle_version",
+            "content_hash",
+            "deletion_authority",
+            "install_root",
+            "managed_files",
+            "schema_version",
+        ],
+    )?;
+    let schema_version = table
+        .get("schema_version")
+        .and_then(TomlValue::as_integer)
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| {
+            matches!(
+                *value,
+                HARNESS_MANAGED_STATE_LEGACY_SCHEMA_VERSION | HARNESS_MANAGED_STATE_SCHEMA_VERSION
+            )
+        })
+        .ok_or(HarnessPreviewError::InvalidManagedManifest)?;
+    let bundle_id = managed_state_required_string(table, "bundle_id")?
+        .parse::<HarnessBundleId>()
+        .map_err(|_| HarnessPreviewError::InvalidManagedManifest)?;
+    let bundle_version =
+        HarnessVersion::new(managed_state_required_string(table, "bundle_version")?.to_owned())
+            .map_err(|_| HarnessPreviewError::InvalidManagedManifest)?;
+    let content_hash = managed_state_required_string(table, "content_hash")?
+        .parse::<HarnessContentHash>()
+        .map_err(|_| HarnessPreviewError::InvalidManagedManifest)?;
+    let install_root = safe_install_root(managed_state_required_string(table, "install_root")?)
+        .map_err(|_| HarnessPreviewError::InvalidManagedManifest)?;
+    let agents_managed = table
+        .get("agents_managed")
+        .and_then(TomlValue::as_bool)
+        .ok_or(HarnessPreviewError::InvalidManagedManifest)?;
+    let deletion_authority = table
+        .get("deletion_authority")
+        .and_then(TomlValue::as_bool)
+        .ok_or(HarnessPreviewError::InvalidManagedManifest)?;
+    if (schema_version == HARNESS_MANAGED_STATE_LEGACY_SCHEMA_VERSION && deletion_authority)
+        || (schema_version == HARNESS_MANAGED_STATE_SCHEMA_VERSION && !deletion_authority)
+    {
+        return Err(HarnessPreviewError::InvalidManagedManifest);
+    }
+    Ok(ManagedStateHeader {
+        schema_version,
+        bundle_id,
+        bundle_version,
+        content_hash,
+        install_root,
+        agents_managed,
+        deletion_authority,
+    })
+}
+
+fn parse_managed_state_files(
+    table: &toml::map::Map<String, TomlValue>,
+    header: &ManagedStateHeader,
+) -> Result<Vec<HarnessManagedFileRecord>, HarnessPreviewError> {
+    let records = table
+        .get("managed_files")
+        .and_then(TomlValue::as_array)
+        .ok_or(HarnessPreviewError::InvalidManagedManifest)?;
+    if records.is_empty() || records.len() > usize::from(MAX_HARNESS_MANAGED_FILES) {
+        return Err(HarnessPreviewError::InvalidManagedManifest);
+    }
+    let mut unique = BTreeSet::new();
+    let managed_files = records
+        .iter()
+        .map(|record| {
+            let record = record
+                .as_table()
+                .ok_or(HarnessPreviewError::InvalidManagedManifest)?;
+            let allowed = if header.schema_version == HARNESS_MANAGED_STATE_SCHEMA_VERSION {
+                &["hash", "ownership", "path", "size"][..]
+            } else {
+                &["hash", "path", "size"][..]
+            };
+            ensure_managed_state_exact_keys(record.keys().map(String::as_str), allowed)?;
+            let path_text = managed_state_required_string(record, "path")?;
+            if !unique.insert(path_text.to_owned()) {
+                return Err(HarnessPreviewError::InvalidManagedManifest);
+            }
+            let path = WorkspaceRelativePath::new(PathBuf::from(path_text))
+                .map_err(|_| HarnessPreviewError::InvalidManagedManifest)?;
+            if !path.as_path().starts_with(&header.install_root) {
+                return Err(HarnessPreviewError::InvalidManagedManifest);
+            }
+            let hash = managed_state_required_string(record, "hash")?
+                .parse::<FileContentHash>()
+                .map_err(|_| HarnessPreviewError::InvalidManagedManifest)?;
+            let size = record
+                .get("size")
+                .and_then(TomlValue::as_integer)
+                .and_then(|value| u64::try_from(value).ok())
+                .filter(|value| *value <= MAX_MANAGED_FILE_BYTES)
+                .map(FileByteCount::new)
+                .ok_or(HarnessPreviewError::InvalidManagedManifest)?;
+            let ownership = if header.schema_version == HARNESS_MANAGED_STATE_SCHEMA_VERSION {
+                HarnessManagedFileOwnership::parse(managed_state_required_string(
+                    record,
+                    "ownership",
+                )?)?
+            } else {
+                HarnessManagedFileOwnership::External
+            };
+            Ok(HarnessManagedFileRecord {
+                path,
+                hash,
+                size,
+                ownership,
+            })
+        })
+        .collect::<Result<Vec<_>, HarnessPreviewError>>()?;
+    Ok(managed_files)
+}
+
+fn ensure_managed_state_exact_keys<'a>(
+    mut actual: impl Iterator<Item = &'a str>,
+    allowed: &[&str],
+) -> Result<(), HarnessPreviewError> {
+    if actual.all(|key| allowed.contains(&key)) {
+        Ok(())
+    } else {
+        Err(HarnessPreviewError::InvalidManagedManifest)
+    }
+}
+
+fn managed_state_required_string<'a>(
+    table: &'a toml::map::Map<String, TomlValue>,
+    key: &str,
+) -> Result<&'a str, HarnessPreviewError> {
+    table
+        .get(key)
+        .and_then(TomlValue::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or(HarnessPreviewError::InvalidManagedManifest)
+}
+
+fn managed_state_bytes(state: &HarnessManagedState) -> Result<Vec<u8>, HarnessPreviewError> {
+    let install_root = state
+        .install_root
         .to_str()
         .ok_or(HarnessPreviewError::InvalidTarget)?;
     let mut output = String::new();
-    writeln!(
-        &mut output,
-        "schema_version = {HARNESS_MANAGED_STATE_SCHEMA_VERSION}"
-    )
-    .map_err(|_| HarnessPreviewError::ManagedManifestTooLarge)?;
-    push_toml_string_field(
-        &mut output,
-        "bundle_id",
-        &bundle.descriptor().id().to_string(),
-    );
-    push_toml_string_field(
-        &mut output,
-        "bundle_version",
-        bundle.descriptor().version().as_str(),
-    );
-    push_toml_string_field(
-        &mut output,
-        "content_hash",
-        &bundle.descriptor().content_hash().to_string(),
-    );
+    writeln!(&mut output, "schema_version = {}", state.schema_version)
+        .map_err(|_| HarnessPreviewError::ManagedManifestTooLarge)?;
+    push_toml_string_field(&mut output, "bundle_id", &state.bundle_id.to_string());
+    push_toml_string_field(&mut output, "bundle_version", state.bundle_version.as_str());
+    push_toml_string_field(&mut output, "content_hash", &state.content_hash.to_string());
     push_toml_string_field(&mut output, "install_root", install_root);
+    writeln!(&mut output, "agents_managed = {}", state.agents_managed)
+        .map_err(|_| HarnessPreviewError::ManagedManifestTooLarge)?;
     writeln!(
         &mut output,
-        "agents_managed = {}",
-        bundle.agents_template().is_some()
+        "deletion_authority = {}",
+        state.deletion_authority
     )
     .map_err(|_| HarnessPreviewError::ManagedManifestTooLarge)?;
-    output.push_str("deletion_authority = false\n");
-    for asset in bundle.managed_files() {
-        let target = bundle.install_root().join(asset.relative_path());
-        let target = target.to_str().ok_or(HarnessPreviewError::InvalidTarget)?;
+    for record in &state.managed_files {
+        let target = record
+            .path
+            .as_path()
+            .to_str()
+            .ok_or(HarnessPreviewError::InvalidTarget)?;
         output.push_str("\n[[managed_files]]\n");
         push_toml_string_field(&mut output, "path", target);
-        let hash = FileContentHash::from_bytes(*blake3::hash(asset.bytes()).as_bytes());
-        push_toml_string_field(&mut output, "hash", &hash.to_string());
-        writeln!(&mut output, "size = {}", asset.bytes().len())
+        push_toml_string_field(&mut output, "hash", &record.hash.to_string());
+        writeln!(&mut output, "size = {}", record.size.get())
             .map_err(|_| HarnessPreviewError::ManagedManifestTooLarge)?;
+        if state.schema_version == HARNESS_MANAGED_STATE_SCHEMA_VERSION {
+            push_toml_string_field(&mut output, "ownership", record.ownership.as_str());
+        }
     }
     if output.len() > MAX_HARNESS_MANAGED_FILE_BYTES {
         return Err(HarnessPreviewError::ManagedManifestTooLarge);
@@ -966,7 +1904,7 @@ fn load_managed_assets(
                         .map_err(|_| HarnessBundleInspectionError::CapacityExceeded)?,
                 )
                 .ok_or(HarnessBundleInspectionError::CapacityExceeded)?;
-            if total_bytes > MAX_TOTAL_MANAGED_BYTES {
+            if total_bytes > MAX_HARNESS_TOTAL_MANAGED_BYTES {
                 return Err(HarnessBundleInspectionError::CapacityExceeded);
             }
             Ok(asset)
@@ -1247,6 +2185,17 @@ args = ["xtask", "rules"]
         Ok(root)
     }
 
+    fn workspace_root(label: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+        let serial = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "heterarchy-forge-harness-lifecycle-{label}-{}-{serial}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root)?;
+        let _layout = crate::WorkspaceStateLayout::initialize(&root)?;
+        Ok(root)
+    }
+
     #[test]
     fn generic_bundle_inspection_is_bounded_and_hash_detects_source_drift()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -1347,9 +2296,18 @@ args = ["xtask", "rules"]
         assert_eq!(receipt.written_files(), 4);
         assert!(receipt.merged_agents());
         assert!(workspace.join(HARNESS_MANAGED_STATE_PATH).is_file());
+        let managed_state =
+            parse_managed_state(&fs::read(workspace.join(HARNESS_MANAGED_STATE_PATH))?)?;
+        assert_eq!(
+            managed_state.schema_version,
+            HARNESS_MANAGED_STATE_SCHEMA_VERSION
+        );
+        assert!(managed_state.deletion_authority);
         assert!(
-            fs::read_to_string(workspace.join(HARNESS_MANAGED_STATE_PATH))?
-                .contains("deletion_authority = false")
+            managed_state
+                .managed_files
+                .iter()
+                .all(|record| record.ownership == HarnessManagedFileOwnership::Heterarchy)
         );
         assert_eq!(
             fs::read(workspace.join(".agents/rust_dev_harness/rules/base.md"))?,
@@ -1476,6 +2434,280 @@ args = ["xtask", "rules"]
                 .items()
                 .iter()
                 .all(|item| { item.disposition() == HarnessPreviewDisposition::Unchanged })
+        );
+        let managed_state =
+            parse_managed_state(&fs::read(workspace.join(HARNESS_MANAGED_STATE_PATH))?)?;
+        let preexisting = managed_state
+            .managed_files
+            .iter()
+            .find(|record| {
+                record.path.as_path() == Path::new(".agents/rust_dev_harness/rules/base.md")
+            })
+            .ok_or("pre-existing managed record missing")?;
+        assert_eq!(preexisting.ownership, HarnessManagedFileOwnership::External);
+        assert!(managed_state.managed_files.iter().any(|record| {
+            record.path.as_path() == Path::new(".agents/rust_dev_harness/skills/rust/SKILL.md")
+                && record.ownership == HarnessManagedFileOwnership::Heterarchy
+        }));
+
+        drop(filesystem);
+        fs::remove_dir_all(source)?;
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
+    #[test]
+    fn harness_update_replaces_only_owned_files_and_preserves_external_files()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let source = fixture_root("lifecycle-update-source")?;
+        let current = inspect_harness_bundle(&source)?;
+        let workspace = workspace_root("update")?;
+        fs::create_dir_all(workspace.join(".agents/rust_dev_harness/skills/rust"))?;
+        fs::write(
+            workspace.join(".agents/rust_dev_harness/skills/rust/SKILL.md"),
+            b"# Skill\n",
+        )?;
+        fs::write(
+            workspace.join("AGENTS.md"),
+            b"# User instructions\n\nPreserve this section.\n",
+        )?;
+        let layout = crate::WorkspaceStateLayout::inspect_existing(&workspace)?
+            .ok_or("workspace layout missing")?;
+        let filesystem = ConfinedWorkspace::open(&layout)?;
+        let install_preview = preview_harness_install(&filesystem, &current)?;
+        let _receipt = materialize_harness_install(&filesystem, &current, &install_preview)?;
+
+        fs::write(source.join("rules/base.md"), b"# Rules v2\n")?;
+        fs::write(
+            source.join("AGENTS.md.template"),
+            b"Read managed rules v2.\n",
+        )?;
+        let manifest = fs::read_to_string(source.join(HARNESS_MANIFEST_FILE_NAME))?
+            .replace("version = \"3.0.0\"", "version = \"3.1.0\"");
+        fs::write(source.join(HARNESS_MANIFEST_FILE_NAME), manifest)?;
+        let target = inspect_harness_bundle(&source)?;
+
+        let preview = preview_harness_lifecycle(&filesystem, current.descriptor(), Some(&target))?;
+        assert_eq!(preview.mode(), HarnessLifecycleMode::Update);
+        assert!(preview.can_apply());
+        assert!(preview.items().iter().any(|item| {
+            item.path().as_path() == Path::new(".agents/rust_dev_harness/rules/base.md")
+                && item.disposition() == HarnessLifecycleDisposition::Replace
+        }));
+        assert!(preview.items().iter().any(|item| {
+            item.path().as_path() == Path::new(".agents/rust_dev_harness/skills/rust/SKILL.md")
+                && item.disposition() == HarnessLifecycleDisposition::Preserve
+        }));
+
+        let receipt = materialize_harness_lifecycle(
+            &filesystem,
+            current.descriptor(),
+            Some(&target),
+            &preview,
+        )?;
+        assert!(receipt.written_files() >= 2);
+        assert_eq!(receipt.deleted_files(), 0);
+        assert_eq!(
+            fs::read(workspace.join(".agents/rust_dev_harness/rules/base.md"))?,
+            b"# Rules v2\n"
+        );
+        assert_eq!(
+            fs::read(workspace.join(".agents/rust_dev_harness/skills/rust/SKILL.md"))?,
+            b"# Skill\n"
+        );
+        let agents = fs::read_to_string(workspace.join("AGENTS.md"))?;
+        assert!(agents.starts_with("# User instructions\n\nPreserve this section.\n"));
+        assert!(agents.contains("Read managed rules v2."));
+        let state = parse_managed_state(&fs::read(workspace.join(HARNESS_MANAGED_STATE_PATH))?)?;
+        assert_eq!(state.bundle_version.as_str(), "3.1.0");
+        assert!(state.managed_files.iter().any(|record| {
+            record.path.as_path() == Path::new(".agents/rust_dev_harness/rules/base.md")
+                && record.ownership == HarnessManagedFileOwnership::Heterarchy
+        }));
+        assert!(state.managed_files.iter().any(|record| {
+            record.path.as_path() == Path::new(".agents/rust_dev_harness/skills/rust/SKILL.md")
+                && record.ownership == HarnessManagedFileOwnership::External
+        }));
+
+        drop(filesystem);
+        fs::remove_dir_all(source)?;
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
+    #[test]
+    fn harness_switch_removes_only_old_owned_files_and_replaces_agents_block()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let current_source = fixture_root("lifecycle-switch-current")?;
+        let current = inspect_harness_bundle(&current_source)?;
+        let target_source = fixture_root("lifecycle-switch-target")?;
+        let target_manifest = fs::read_to_string(target_source.join(HARNESS_MANIFEST_FILE_NAME))?
+            .replace(
+                "00000000-0000-0000-0000-000000000041",
+                "00000000-0000-0000-0000-000000000042",
+            )
+            .replace("name = \"Rust Dev Harness\"", "name = \"Next Harness\"")
+            .replace("version = \"3.0.0\"", "version = \"1.0.0\"")
+            .replace(
+                "install_root = \".agents/rust_dev_harness\"",
+                "install_root = \".agents/next_harness\"",
+            );
+        fs::write(
+            target_source.join(HARNESS_MANIFEST_FILE_NAME),
+            target_manifest,
+        )?;
+        fs::write(target_source.join("rules/base.md"), b"# Next Rules\n")?;
+        fs::write(
+            target_source.join("AGENTS.md.template"),
+            b"Read next managed rules.\n",
+        )?;
+        let target = inspect_harness_bundle(&target_source)?;
+        let workspace = workspace_root("switch")?;
+        fs::create_dir_all(workspace.join(".agents/rust_dev_harness/skills/rust"))?;
+        fs::write(
+            workspace.join(".agents/rust_dev_harness/skills/rust/SKILL.md"),
+            b"# Skill\n",
+        )?;
+        fs::write(workspace.join("AGENTS.md"), b"# User instructions\n")?;
+        let layout = crate::WorkspaceStateLayout::inspect_existing(&workspace)?
+            .ok_or("workspace layout missing")?;
+        let filesystem = ConfinedWorkspace::open(&layout)?;
+        let install_preview = preview_harness_install(&filesystem, &current)?;
+        let _receipt = materialize_harness_install(&filesystem, &current, &install_preview)?;
+
+        let preview = preview_harness_lifecycle(&filesystem, current.descriptor(), Some(&target))?;
+        assert_eq!(preview.mode(), HarnessLifecycleMode::Switch);
+        assert!(preview.can_apply());
+        assert!(preview.items().iter().any(|item| {
+            item.path().as_path() == Path::new(".agents/rust_dev_harness/rules/base.md")
+                && item.disposition() == HarnessLifecycleDisposition::Remove
+        }));
+        assert!(preview.items().iter().any(|item| {
+            item.path().as_path() == Path::new(".agents/rust_dev_harness/skills/rust/SKILL.md")
+                && item.disposition() == HarnessLifecycleDisposition::Preserve
+        }));
+        let receipt = materialize_harness_lifecycle(
+            &filesystem,
+            current.descriptor(),
+            Some(&target),
+            &preview,
+        )?;
+        assert!(receipt.deleted_files() >= 1);
+        assert!(
+            !workspace
+                .join(".agents/rust_dev_harness/rules/base.md")
+                .exists()
+        );
+        assert!(
+            workspace
+                .join(".agents/rust_dev_harness/skills/rust/SKILL.md")
+                .is_file()
+        );
+        assert_eq!(
+            fs::read(workspace.join(".agents/next_harness/rules/base.md"))?,
+            b"# Next Rules\n"
+        );
+        let agents = fs::read_to_string(workspace.join("AGENTS.md"))?;
+        assert!(agents.starts_with("# User instructions\n"));
+        assert!(!agents.contains("00000000-0000-0000-0000-000000000041"));
+        assert!(agents.contains("00000000-0000-0000-0000-000000000042"));
+        assert!(agents.contains("Read next managed rules."));
+        let state = parse_managed_state(&fs::read(workspace.join(HARNESS_MANAGED_STATE_PATH))?)?;
+        assert_eq!(state.bundle_id, target.descriptor().id());
+
+        drop(filesystem);
+        fs::remove_dir_all(current_source)?;
+        fs::remove_dir_all(target_source)?;
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
+    #[test]
+    fn harness_remove_deletes_only_owned_files_and_preserves_user_content()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let source = fixture_root("lifecycle-remove-source")?;
+        let current = inspect_harness_bundle(&source)?;
+        let workspace = workspace_root("remove")?;
+        fs::create_dir_all(workspace.join(".agents/rust_dev_harness/skills/rust"))?;
+        fs::write(
+            workspace.join(".agents/rust_dev_harness/skills/rust/SKILL.md"),
+            b"# Skill\n",
+        )?;
+        fs::write(
+            workspace.join("AGENTS.md"),
+            b"# User instructions\n\nNever remove this.\n",
+        )?;
+        let layout = crate::WorkspaceStateLayout::inspect_existing(&workspace)?
+            .ok_or("workspace layout missing")?;
+        let filesystem = ConfinedWorkspace::open(&layout)?;
+        let install_preview = preview_harness_install(&filesystem, &current)?;
+        let _receipt = materialize_harness_install(&filesystem, &current, &install_preview)?;
+
+        let preview = preview_harness_lifecycle(&filesystem, current.descriptor(), None)?;
+        assert_eq!(preview.mode(), HarnessLifecycleMode::Remove);
+        assert!(preview.can_apply());
+        let receipt =
+            materialize_harness_lifecycle(&filesystem, current.descriptor(), None, &preview)?;
+        assert!(receipt.deleted_files() >= 2);
+        assert!(
+            !workspace
+                .join(".agents/rust_dev_harness/rules/base.md")
+                .exists()
+        );
+        assert!(
+            workspace
+                .join(".agents/rust_dev_harness/skills/rust/SKILL.md")
+                .is_file()
+        );
+        assert!(!workspace.join(HARNESS_MANAGED_STATE_PATH).exists());
+        let agents = fs::read_to_string(workspace.join("AGENTS.md"))?;
+        assert!(agents.contains("# User instructions"));
+        assert!(agents.contains("Never remove this."));
+        assert!(!agents.contains("heterarchy:harness:start"));
+        assert!(!agents.contains("heterarchy:harness:end"));
+
+        drop(filesystem);
+        fs::remove_dir_all(source)?;
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
+    #[test]
+    fn harness_update_refuses_to_replace_drifted_owned_file()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let source = fixture_root("lifecycle-drift-source")?;
+        let current = inspect_harness_bundle(&source)?;
+        let workspace = workspace_root("drift")?;
+        let layout = crate::WorkspaceStateLayout::inspect_existing(&workspace)?
+            .ok_or("workspace layout missing")?;
+        let filesystem = ConfinedWorkspace::open(&layout)?;
+        let install_preview = preview_harness_install(&filesystem, &current)?;
+        let _receipt = materialize_harness_install(&filesystem, &current, &install_preview)?;
+        fs::write(
+            workspace.join(".agents/rust_dev_harness/rules/base.md"),
+            b"# User drift\n",
+        )?;
+        fs::write(source.join("rules/base.md"), b"# Rules v2\n")?;
+        let manifest = fs::read_to_string(source.join(HARNESS_MANIFEST_FILE_NAME))?
+            .replace("version = \"3.0.0\"", "version = \"3.1.0\"");
+        fs::write(source.join(HARNESS_MANIFEST_FILE_NAME), manifest)?;
+        let target = inspect_harness_bundle(&source)?;
+
+        let preview = preview_harness_lifecycle(&filesystem, current.descriptor(), Some(&target))?;
+        assert_eq!(preview.conflicts(), 1);
+        assert!(!preview.can_apply());
+        assert!(matches!(
+            materialize_harness_lifecycle(
+                &filesystem,
+                current.descriptor(),
+                Some(&target),
+                &preview,
+            ),
+            Err(HarnessLifecycleError::Conflict)
+        ));
+        assert_eq!(
+            fs::read(workspace.join(".agents/rust_dev_harness/rules/base.md"))?,
+            b"# User drift\n"
         );
 
         drop(filesystem);

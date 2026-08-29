@@ -8,6 +8,9 @@ use thiserror::Error;
 const APP_DIRECTORY_NAME: &str = "Heterarchy Forge";
 const GLOBAL_REGISTRY_FILE_NAME: &str = "registry.sqlite3";
 const HARNESS_CATALOG_FILE_NAME: &str = "harness-catalog.sqlite3";
+const MCP_TOKEN_CATALOG_FILE_NAME: &str = "mcp-tokens.sqlite3";
+const MCP_CONNECTION_SETTINGS_CATALOG_FILE_NAME: &str = "mcp-connection-settings.sqlite3";
+const SAVED_HARNESS_BUNDLES_DIRECTORY_NAME: &str = "saved-harness-bundles";
 const DIAGNOSTICS_DIRECTORY_NAME: &str = "diagnostics";
 
 /// User-writable application directories resolved according to host conventions.
@@ -66,6 +69,32 @@ impl AppPaths {
 
     pub fn harness_catalog_path(&self) -> PathBuf {
         self.application_support.join(HARNESS_CATALOG_FILE_NAME)
+    }
+
+    /// App-global local MCP bearer-token metadata catalog.
+    ///
+    /// Path discovery never creates the database or the corresponding
+    /// Keychain pepper; explicit connection management owns those effects.
+    pub fn mcp_token_catalog_path(&self) -> PathBuf {
+        self.application_support.join(MCP_TOKEN_CATALOG_FILE_NAME)
+    }
+
+    /// App-global durable MCP public endpoint and local-port settings.
+    ///
+    /// Path discovery never creates the database; explicit connection
+    /// settings management owns that durable effect.
+    pub fn mcp_connection_settings_catalog_path(&self) -> PathBuf {
+        self.application_support
+            .join(MCP_CONNECTION_SETTINGS_CATALOG_FILE_NAME)
+    }
+
+    /// Product-owned root for explicit `Save as Bundle` compositions.
+    ///
+    /// Discovery/boot does not create this directory. The explicit save action
+    /// owns that effect so opening FORGE cannot fabricate user compositions.
+    pub fn saved_harness_bundles_dir(&self) -> PathBuf {
+        self.application_support
+            .join(SAVED_HARNESS_BUNDLES_DIRECTORY_NAME)
     }
 
     /// Product-owned directory for explicit operator diagnostics exports.
@@ -138,6 +167,22 @@ mod tests {
         assert_eq!(
             paths.harness_catalog_path(),
             paths.application_support().join("harness-catalog.sqlite3")
+        );
+        assert_eq!(
+            paths.mcp_token_catalog_path(),
+            paths.application_support().join("mcp-tokens.sqlite3")
+        );
+        assert!(!paths.mcp_token_catalog_path().exists());
+        assert_eq!(
+            paths.mcp_connection_settings_catalog_path(),
+            paths
+                .application_support()
+                .join("mcp-connection-settings.sqlite3")
+        );
+        assert!(!paths.mcp_connection_settings_catalog_path().exists());
+        assert_eq!(
+            paths.saved_harness_bundles_dir(),
+            paths.application_support().join("saved-harness-bundles")
         );
         assert_eq!(
             paths.diagnostics_dir(),

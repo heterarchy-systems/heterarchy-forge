@@ -9,10 +9,11 @@
 
 import { AboutSlint, HorizontalBox, LineEdit, ListView, Palette, TextEdit, VerticalBox } from "std-widgets.slint";
 import { ForgeButton, PaneChevron, PaneHeader, EmptyState, PaneSplitter, ContextField, FlatRow, DagNodeCard, DagEdgeConnector, SettingsRow } from "components.slint";
+import { ReferenceWorkbench } from "reference-workbench.slint";
 import { ForgeTheme } from "theme.slint";
-import { LocationRow, WorkspaceRow, ActivityRow, DiffRow, ApprovalRow, GoalRow, DagNodeRow, DagEdgeRow, WorkNarrativeRow, HarnessRow, DoctorFindingRow } from "models.slint";
+import { LocationRow, WorkspaceRow, McpTokenRow, AgentRow, ActivityRow, DiffRow, ApprovalRow, GoalRow, DagNodeRow, DagEdgeRow, WorkNarrativeRow, HarnessRow, DoctorFindingRow } from "models.slint";
 
-export { LocationRow, WorkspaceRow, ActivityRow, DiffRow, ApprovalRow, GoalRow, DagNodeRow, DagEdgeRow, WorkNarrativeRow, HarnessRow, DoctorFindingRow } from "models.slint";
+export { LocationRow, WorkspaceRow, McpTokenRow, AgentRow, ActivityRow, DiffRow, ApprovalRow, GoalRow, DagNodeRow, DagEdgeRow, WorkNarrativeRow, HarnessRow, DoctorFindingRow } from "models.slint";
 
 export component AboutWindow inherits Window {
     init => { Palette.color-scheme = ColorScheme.dark; }
@@ -48,6 +49,8 @@ export component AppWindow inherits Window {
     in property <int> uptime-seconds: 0;
     in property <[LocationRow]> location-rows: [];
     in property <[WorkspaceRow]> workspace-rows: [];
+    in property <[McpTokenRow]> mcp-token-rows: [];
+    in property <[AgentRow]> agent-rows: [];
     in property <[ActivityRow]> activity-live-rows: [];
     in property <[ActivityRow]> activity-history-rows: [];
     in property <[DiffRow]> diff-rows: [];
@@ -59,15 +62,27 @@ export component AppWindow inherits Window {
     in-out property <int> dag-lane-count: 0;
     in property <[WorkNarrativeRow]> work-narrative-rows: [];
     in property <[HarnessRow]> harness-rows: [];
+    in property <[HarnessRow]> harness-skill-rows: [];
     in property <[HarnessRow]> harness-preview-rows: [];
+    in property <[HarnessRow]> harness-lifecycle-rows: [];
     in property <[HarnessRow]> harness-verifier-rows: [];
     in property <string> harness-library-status: "Loading registered Harness Bundles…";
+    in property <string> harness-skill-status: "Loading optional Skill Library…";
+    in property <string> harness-composition-status: "Choose a registered Harness Bundle as the explicit composition base.";
+    in property <string> harness-composition-base-name: "No Base Harness selected";
+    in property <int> harness-composition-base-index: -1;
+    in property <int> harness-composition-selected-skill-count: 0;
+    in-out property <string> harness-composition-name-input: "Composed Harness";
+    in-out property <string> harness-composition-version-input: "1.0.0";
     in property <string> harness-preview-status: "Select a registered Harness Bundle to preview Workspace changes.";
+    in property <string> harness-lifecycle-status: "No Harness lifecycle change is being reviewed.";
+    in property <string> harness-lifecycle-mode: "";
     in property <string> harness-verifier-status: "No declared Harness verifier run recorded.";
     in property <bool> harness-preview-applyable: false;
+    in property <bool> harness-lifecycle-applyable: false;
     in property <bool> harness-action-busy: false;
     in property <[DoctorFindingRow]> doctor-finding-rows: [];
-    in property <string> doctor-status: "Select a committed Workspace to run Doctor.";
+    in property <string> doctor-status: "확정된 Workspace를 선택하면 Doctor를 실행할 수 있습니다.";
     in property <string> doctor-summary: "";
     in property <string> doctor-export-content: "";
     in property <string> doctor-diagnostics-status: "No diagnostics exported for this Workspace.";
@@ -76,7 +91,7 @@ export component AppWindow inherits Window {
     in property <bool> doctor-truncated: false;
     in property <string> location-status: "Loading locations…";
     in property <string> workspace-status: "Select a Location to discover Workspaces.";
-    in property <string> activity-status: "Select a committed Workspace to view Activities.";
+    in property <string> activity-status: "확정된 Workspace를 선택하면 Activity를 볼 수 있습니다.";
     in property <string> selected-activity-id: "";
     in property <string> diff-status: "Select an Activity to inspect changes.";
     in property <bool> diff-view-open: false;
@@ -89,16 +104,55 @@ export component AppWindow inherits Window {
     in property <bool> approval-action-busy: false;
     in property <bool> goal-action-busy: false;
     in property <bool> auto-approval-enabled: false;
-    in property <string> approval-status: "Select a committed Workspace to inspect approvals.";
+    in property <string> approval-status: "확정된 Workspace를 선택하면 승인 요청을 볼 수 있습니다.";
     in property <int> selected-workspace-index: -1;
     in property <string> selected-workspace-id: "";
     in property <string> selected-workspace-revision: "";
     in property <string> selected-workspace-root: "";
-    in property <string> goal-status: "No Goal contract · Activity remains valid without one";
-    in-out property <string> dag-status: "No Chat-authored DAG for this Goal.";
+    in-out property <string> selected-agent-id: "";
+    in-out property <string> selected-agent-name: "";
+    in-out property <string> selected-agent-role: "";
+    in-out property <string> selected-agent-state: "";
+    in-out property <string> selected-agent-liveness: "";
+    in-out property <string> selected-agent-current-goal: "";
+    in-out property <string> selected-agent-current-node: "";
+    in-out property <string> selected-agent-public-summary: "";
+    in-out property <string> selected-agent-evidence: "";
+    in-out property <string> selected-agent-last-observed: "";
+    in-out property <string> agent-dag-grant-id: "";
+    in-out property <string> agent-dag-grant-goal-id: "";
+    in-out property <string> agent-dag-grant-status: "Goal과 DAG를 선택하면 이 Agent에게 5분간 한 번의 재계획 권한을 줄 수 있습니다.";
+    in-out property <string> agent-dag-grant-availability: "없음";
+    in-out property <bool> agent-dag-grant-active: false;
+    in-out property <string> mcp-public-origin-input: "";
+    in-out property <string> mcp-local-port-input: "7979";
+    in-out property <string> mcp-credential-label-input: "Codex Desktop";
+    in property <string> mcp-public-endpoint: "";
+    in property <string> mcp-local-endpoint: "http://127.0.0.1:7979/mcp";
+    in property <string> mcp-connection-status: "저장된 외부 MCP 주소가 없습니다.";
+    in property <string> mcp-server-status: "중지됨";
+    in property <string> mcp-server-detail: "외부 주소를 저장하면 로컬 서버를 시작할 수 있습니다.";
+    in property <string> mcp-public-route-status: "미검증 · DNS와 터널 연결은 외부에서 구성해야 합니다.";
+    in property <string> mcp-oauth-status: "미구성 · 현재는 Workspace bearer 접근 토큰 방식";
+    in property <bool> mcp-profile-configured: false;
+    in property <bool> mcp-server-running: false;
+    in property <bool> mcp-action-busy: false;
+    in property <bool> agent-action-busy: false;
+    in property <int> mcp-active-token-count: 0;
+    in-out property <int> selected-mcp-token-index: -1;
+    in-out property <string> mcp-token-review-mode: "";
+    in-out property <string> mcp-token-reveal: "";
+    in-out property <string> mcp-token-reveal-status: "";
+    in property <string> goal-status: "Goal이 없어도 Activity는 유효합니다.";
+    in-out property <string> dag-status: "이 Goal에 게시된 DAG가 없습니다.";
     in-out property <string> dag-revision: "";
+    in-out property <string> dag-head-revision: "";
+    // The native host may bind this to the platform's Reduce Motion setting.
+    // Rust shortens the same bounded transition to an opacity-only cut when
+    // this is true; keeping the switch explicit avoids hidden animation policy.
+    in-out property <bool> dag-reduced-motion: false;
     in property <string> work-narrative-status: "No operator-safe work narrative has been published.";
-    in property <string> harness-status: "Select a committed Workspace to inspect Harness state.";
+    in property <string> harness-status: "확정된 Workspace를 선택하면 하네스 상태를 볼 수 있습니다.";
     in property <string> applied-harness-name: "Not connected";
     in property <string> applied-harness-version: "";
     in property <string> applied-harness-source: "";
@@ -115,13 +169,17 @@ export component AppWindow inherits Window {
     in-out property <bool> settings-open: false;
     in-out property <int> settings-section: 0;
     in-out property <bool> evidence-open: false;
+    // Session-local visual navigation only. Domain semantics continue to come
+    // from the Rust-owned projections and callbacks below.
+    in-out property <int> active-page: 0;
+    in-out property <bool> workspace-view-open: false;
     in-out property <bool> goal-compose-open: false;
     in-out property <string> goal-objective-input: "";
     in-out property <string> goal-success-criterion-input: "";
-    in-out property <string> inspector-title: "Overall work";
+    in-out property <string> inspector-title: "전체 작업";
     in-out property <string> inspector-kind: "OVERVIEW";
-    in-out property <string> inspector-detail: "No structured work narrative is available yet.";
-    in-out property <string> inspector-evidence: "Select a Goal or DAG node to inspect its observable progress.";
+    in-out property <string> inspector-detail: "아직 공개된 구조화 작업 설명이 없습니다.";
+    in-out property <string> inspector-evidence: "Goal 또는 DAG 단계를 선택하면 관측 가능한 진행을 볼 수 있습니다.";
 
     private property <bool> minimum-layout: root.width < 1280px;
     private property <bool> wide-layout: root.width >= 1600px;
@@ -142,7 +200,7 @@ export component AppWindow inherits Window {
     private property <length> dag-node-height: 164px;
     private property <length> dag-column-gap: root.minimum-layout ? 58px : 72px;
     private property <length> dag-lane-gap: 18px;
-    private property <string> selected-activity-label: root.selected-activity-id == "" ? "No Activity selected" : "Activity selected";
+    private property <string> selected-activity-label: root.selected-activity-id == "" ? "선택한 Activity 없음" : "Activity 선택됨";
     in-out property <string> selected-goal-id: "";
     in-out property <string> selected-goal-revision: "";
     in-out property <string> selected-goal-state: "";
@@ -156,15 +214,20 @@ export component AppWindow inherits Window {
     in-out property <bool> selected-goal-can-resume: false;
     in-out property <bool> selected-goal-can-cancel: false;
     in-out property <bool> selected-goal-can-complete: false;
-    private property <string> selected-dag-id: "";
+    in-out property <string> selected-dag-id: "";
     private property <string> selected-dag-label: "";
     private property <string> selected-dag-state: "";
+    private property <string> selected-dag-state-label: "";
     private property <string> selected-dag-objective: "";
     private property <string> selected-dag-acceptance: "";
     private property <string> selected-dag-depends-on: "";
     private property <string> selected-dag-waiting-on: "";
     private property <string> selected-dag-evidence: "";
     private property <string> selected-dag-revision: "";
+    in-out property <string> selected-dag-agent-name: "";
+    in-out property <string> selected-dag-work-summary: "";
+    in-out property <string> selected-dag-public-summary: "";
+    in-out property <string> selected-dag-last-observed: "";
     private property <bool> selected-dag-current: false;
     private property <bool> selected-dag-terminal: false;
     private property <string> selected-diff-id: "";
@@ -178,11 +241,12 @@ export component AppWindow inherits Window {
         root.dag-column-count = 0;
         root.dag-lane-count = 0;
         root.dag-revision = "";
+        root.dag-head-revision = "";
         root.dag-status = root.selected-workspace-id == "" ?
                           "Select a Workspace and Goal to inspect a Chat-authored DAG." :
-                          "Loading durable DAG projection for the selected Workspace…";
+                          "선택한 Workspace의 durable DAG를 불러오는 중…";
         root.inspector-tab = 0;
-        root.selected-activity-label = "No Activity selected";
+        root.selected-activity-label = "선택한 Activity 없음";
         root.selected-goal-id = "";
         root.selected-goal-revision = "";
         root.selected-goal-state = "";
@@ -202,25 +266,61 @@ export component AppWindow inherits Window {
         root.selected-dag-id = "";
         root.selected-dag-label = "";
         root.selected-dag-state = "";
+        root.selected-dag-state-label = "";
         root.selected-dag-objective = "";
         root.selected-dag-acceptance = "";
         root.selected-dag-depends-on = "";
         root.selected-dag-waiting-on = "";
         root.selected-dag-evidence = "";
         root.selected-dag-revision = "";
+        root.selected-dag-agent-name = "";
+        root.selected-dag-work-summary = "";
+        root.selected-dag-public-summary = "";
+        root.selected-dag-last-observed = "";
+        root.selected-dag-agent-name = "";
+        root.selected-dag-work-summary = "";
+        root.selected-dag-public-summary = "";
+        root.selected-dag-last-observed = "";
         root.selected-dag-current = false;
         root.selected-dag-terminal = false;
         root.selected-diff-id = "";
         root.inspector-kind = "OVERVIEW";
-        root.inspector-title = root.selected-workspace-id == "" ? "No Workspace selected" : "Workspace overview";
-        root.inspector-detail = root.selected-workspace-id == "" ? "Select a Workspace to inspect durable work." : root.selected-workspace-root;
+        root.inspector-title = root.selected-workspace-id == "" ? "선택한 Workspace 없음" : "Workspace 요약";
+        root.inspector-detail = root.selected-workspace-id == "" ? "Workspace를 선택하면 durable 작업을 볼 수 있습니다." : root.selected-workspace-root;
         root.inspector-evidence = "Runtime " + root.runtime-status + " · live " + root.activity-live-rows.length + " · history " + root.activity-history-rows.length + " · approvals " + root.approval-rows.length;
+        root.selected-mcp-token-index = -1;
+        root.mcp-token-review-mode = "";
+        root.mcp-token-reveal = "";
+        root.mcp-token-reveal-status = "";
+        root.selected-agent-id = "";
+        root.selected-agent-name = "";
+        root.selected-agent-role = "";
+        root.selected-agent-state = "";
+        root.selected-agent-liveness = "";
+        root.selected-agent-current-goal = "";
+        root.selected-agent-current-node = "";
+        root.selected-agent-public-summary = "";
+        root.selected-agent-evidence = "";
+        root.selected-agent-last-observed = "";
+        root.agent-dag-grant-id = "";
+        root.agent-dag-grant-goal-id = "";
+        root.agent-dag-grant-status = "Goal과 DAG를 선택하면 이 Agent에게 5분간 한 번의 재계획 권한을 줄 수 있습니다.";
+        root.agent-dag-grant-availability = "없음";
+        root.agent-dag-grant-active = false;
     }
     changed selected-activity-id => {
         if root.selected-activity-id != "" {
             root.selected-goal-id = "";
             root.selected-dag-id = "";
             root.selected-diff-id = "";
+        }
+    }
+    changed selected-goal-id => {
+        // Re-discover only the grant bound to the newly selected exact Goal
+        // and DAG head. This keeps the Agent inspector truthful after the
+        // operator moves between Goals without exposing unrelated grants.
+        if root.selected-workspace-id != "" && root.selected-goal-id != "" && root.selected-agent-id != "" {
+            root.select-agent(root.selected-agent-id);
         }
     }
     changed goal-rows => {
@@ -245,704 +345,317 @@ export component AppWindow inherits Window {
             root.selected-goal-can-complete = false;
         }
     }
-    changed dag-node-rows => {
-        // A refreshed immutable DAG revision invalidates any session-local
-        // descendant selection. The desktop may re-select explicitly.
-        root.selected-dag-id = "";
-        root.selected-dag-label = "";
-        root.selected-dag-state = "";
-        root.selected-dag-objective = "";
-        root.selected-dag-acceptance = "";
-        root.selected-dag-depends-on = "";
-        root.selected-dag-waiting-on = "";
-        root.selected-dag-evidence = "";
-        root.selected-dag-revision = "";
-        root.selected-dag-current = false;
-        root.selected-dag-terminal = false;
-    }
-
     callback start-runtime(); callback stop-runtime(); callback restart-runtime(); callback quit-application();
-    callback add-location(string); callback refresh-locations(); callback discover-location(string, string); callback select-workspace(int);
+    callback add-location(string); callback open-workspace-folder(); callback refresh-locations(); callback discover-location(string, string); callback select-workspace(int);
     callback refresh-doctor();
     callback export-doctor-diagnostics();
     callback refresh-activities(); callback select-activity(string); callback view-diff(string); callback close-diff-view();
     callback create-goal(string, string); callback refresh-goals(); callback select-goal(string);
     callback select-dag-node(string);
+    callback select-agent(string);
+    callback select-agent-work-for-node(string);
+    callback issue-agent-dag-grant(string, string, string, string, string);
+    callback revoke-agent-dag-grant();
     callback pause-goal(string, string); callback resume-goal(string, string);
     callback cancel-goal(string, string); callback complete-goal(string, string);
     callback refresh-approvals(); callback approve-request(string); callback reject-request(string); callback set-auto-approval(bool);
     callback stop-workspace-work(); callback emergency-stop();
     callback register-harness(); callback refresh-harnesses();
     callback refresh-harness(string, string);
+    callback register-harness-skill(); callback refresh-harness-skills();
+    callback refresh-harness-skill(int);
+    callback select-harness-composition-base(int);
+    callback toggle-harness-composition-skill(int);
+    callback save-harness-composition(string, string);
     callback preview-harness(string, string);
     callback apply-harness-preview();
+    callback preview-harness-lifecycle(string, string);
+    callback preview-harness-remove();
+    callback apply-harness-lifecycle();
     callback run-harness-verifiers();
     callback refresh-harness-verifiers();
     callback verify-applied-harness();
+    callback save-mcp-connection(string, string);
+    callback refresh-mcp-connection();
+    callback start-mcp-server();
+    callback stop-mcp-server();
+    callback issue-mcp-token(string);
+    callback rotate-mcp-token(int);
+    callback revoke-mcp-token(int);
+    callback dismiss-mcp-token-reveal();
 
     Rectangle {
         width: 100%;
         height: 100%;
-        Rectangle {
-            x: 0px; y: 0px; width: 100%; height: 46px; background: ForgeTheme.chrome; border-color: ForgeTheme.separator; border-width: 1px;
-            accessible-role: banner;
-            accessible-label: "Application command bar";
-            HorizontalBox {
-                padding-left: 12px; padding-right: 10px; spacing: 10px;
-                Rectangle { width: 27px; height: 27px; background: ForgeTheme.ember; Text { text: "HF"; color: #090b0d; font-size: 10px; font-weight: 800; horizontal-alignment: center; vertical-alignment: center; } }
-                Text { text: "HETERARCHY FORGE"; color: ForgeTheme.text; font-size: 13px; font-weight: 700; letter-spacing: 1px; vertical-alignment: center; }
-                Rectangle { width: 1px; height: 22px; background: ForgeTheme.separator; }
-                Text { text: root.selected-workspace-id == "" ? "NO WORKSPACE AUTHORITY" : root.selected-workspace-root; accessible-label: "Workspace authority " + (root.selected-workspace-id == "" ? "not selected" : root.selected-workspace-root); color: root.selected-workspace-id == "" ? ForgeTheme.text-muted : ForgeTheme.text-secondary; font-family: "monospace"; font-size: 10px; overflow: elide; horizontal-stretch: 1; vertical-alignment: center; }
-                ForgeButton { label: root.settings-open ? "Workbench" : "Settings"; compact: true; active: root.settings-open; activated => { root.settings-open = !root.settings-open; } }
-                Text { text: root.runtime-status; color: root.runtime-status == "Running" ? ForgeTheme.success : #d99a60; font-size: 10px; font-weight: 700; vertical-alignment: center; }
-                if !root.minimum-layout : ForgeButton { label: "Restart"; compact: true; enabled: root.runtime-status == "Running"; activated => { root.restart-runtime(); } }
-                ForgeButton { label: "Emergency stop"; compact: true; danger: true; enabled: root.runtime-status != "Stopped"; activated => { root.emergency-stop(); } }
+        // Reference-driven workbench is now the sole visible AppWindow composition.
+        // Rust-owned projections and callbacks above remain the authority boundary.
+        // legacy composition while the migration is verified so that every
+        // Rust callback/property contract remains intact. Once parity is
+        // proven, the covered legacy layout can be removed without changing
+        // the worker/control boundary.
+        reference-workbench := ReferenceWorkbench {
+            x: 0px; y: 0px; width: 100%; height: 100%;
+            active-page <=> root.active-page;
+            workspace-view-open <=> root.workspace-view-open;
+            runtime-status: root.runtime-status;
+            runtime-detail: root.runtime-detail;
+            runtime-generation: root.runtime-generation;
+            uptime-seconds: root.uptime-seconds;
+
+            workspace-rows: root.workspace-rows;
+            selected-workspace-index: root.selected-workspace-index;
+            selected-workspace-id: root.selected-workspace-id;
+            selected-workspace-root: root.selected-workspace-root;
+            selected-workspace-revision: root.selected-workspace-revision;
+            workspace-status: root.workspace-status;
+            location-name-input <=> root.location-name-input;
+            folder-picker-open: root.folder-picker-open;
+            location-action-busy: root.location-action-busy;
+
+            agent-rows: root.agent-rows;
+            selected-agent-id: root.selected-agent-id;
+            selected-agent-name: root.selected-agent-name;
+            selected-agent-role: root.selected-agent-role;
+            selected-agent-state: root.selected-agent-state;
+            selected-agent-liveness: root.selected-agent-liveness;
+            selected-agent-current-goal: root.selected-agent-current-goal;
+            selected-agent-current-node: root.selected-agent-current-node;
+            selected-agent-public-summary: root.selected-agent-public-summary;
+            selected-agent-evidence: root.selected-agent-evidence;
+            selected-agent-last-observed: root.selected-agent-last-observed;
+            agent-action-busy: root.agent-action-busy;
+
+            goal-rows: root.goal-rows;
+            goal-status: root.goal-status;
+            goal-action-busy: root.goal-action-busy;
+            goal-objective-input <=> root.goal-objective-input;
+            goal-success-criterion-input <=> root.goal-success-criterion-input;
+            selected-goal-id: root.selected-goal-id;
+            selected-goal-revision: root.selected-goal-revision;
+            selected-goal-state: root.selected-goal-state;
+            selected-goal-objective: root.selected-goal-objective;
+            selected-goal-success-criterion: root.selected-goal-success-criterion;
+            selected-goal-check-summary: root.selected-goal-check-summary;
+            selected-goal-evidence-summary: root.selected-goal-evidence-summary;
+            selected-goal-blocker: root.selected-goal-blocker;
+            selected-goal-terminal: root.selected-goal-terminal;
+            selected-goal-can-pause: root.selected-goal-can-pause;
+            selected-goal-can-resume: root.selected-goal-can-resume;
+            selected-goal-can-cancel: root.selected-goal-can-cancel;
+            selected-goal-can-complete: root.selected-goal-can-complete;
+
+            dag-node-rows: root.dag-node-rows;
+            dag-edge-rows: root.dag-edge-rows;
+            dag-column-count: root.dag-column-count;
+            dag-lane-count: root.dag-lane-count;
+            dag-revision: root.dag-revision;
+            dag-head-revision: root.dag-head-revision;
+            dag-status: root.dag-status;
+            selected-dag-id: root.selected-dag-id;
+            selected-dag-agent-name: root.selected-dag-agent-name;
+            selected-dag-work-summary: root.selected-dag-work-summary;
+            selected-dag-public-summary: root.selected-dag-public-summary;
+            selected-dag-last-observed: root.selected-dag-last-observed;
+
+            activity-live-rows: root.activity-live-rows;
+            activity-history-rows: root.activity-history-rows;
+            activity-status: root.activity-status;
+            selected-activity-id: root.selected-activity-id;
+            work-narrative-rows: root.work-narrative-rows;
+            diff-rows: root.diff-rows;
+            diff-status: root.diff-status;
+            diff-view-open: root.diff-view-open;
+            diff-view-title: root.diff-view-title;
+            diff-view-content: root.diff-view-content;
+
+            harness-rows: root.harness-rows;
+            harness-skill-rows: root.harness-skill-rows;
+            harness-preview-rows: root.harness-preview-rows;
+            harness-lifecycle-rows: root.harness-lifecycle-rows;
+            harness-verifier-rows: root.harness-verifier-rows;
+            harness-library-status: root.harness-library-status;
+            harness-skill-status: root.harness-skill-status;
+            harness-composition-status: root.harness-composition-status;
+            harness-composition-base-name: root.harness-composition-base-name;
+            harness-composition-base-index: root.harness-composition-base-index;
+            harness-composition-selected-skill-count: root.harness-composition-selected-skill-count;
+            harness-composition-name-input <=> root.harness-composition-name-input;
+            harness-composition-version-input <=> root.harness-composition-version-input;
+            harness-preview-status: root.harness-preview-status;
+            harness-lifecycle-status: root.harness-lifecycle-status;
+            harness-lifecycle-mode: root.harness-lifecycle-mode;
+            harness-verifier-status: root.harness-verifier-status;
+            harness-preview-applyable: root.harness-preview-applyable;
+            harness-lifecycle-applyable: root.harness-lifecycle-applyable;
+            harness-action-busy: root.harness-action-busy;
+            harness-status: root.harness-status;
+            applied-harness-name: root.applied-harness-name;
+            applied-harness-version: root.applied-harness-version;
+            applied-harness-source: root.applied-harness-source;
+            applied-harness-hash: root.applied-harness-hash;
+            applied-harness-verification: root.applied-harness-verification;
+            applied-harness-verified-at: root.applied-harness-verified-at;
+
+            mcp-public-origin-input <=> root.mcp-public-origin-input;
+            mcp-local-port-input <=> root.mcp-local-port-input;
+            mcp-credential-label-input <=> root.mcp-credential-label-input;
+            mcp-public-endpoint: root.mcp-public-endpoint;
+            mcp-local-endpoint: root.mcp-local-endpoint;
+            mcp-connection-status: root.mcp-connection-status;
+            mcp-server-status: root.mcp-server-status;
+            mcp-server-detail: root.mcp-server-detail;
+            mcp-public-route-status: root.mcp-public-route-status;
+            mcp-server-running: root.mcp-server-running;
+            mcp-action-busy: root.mcp-action-busy;
+            mcp-token-rows: root.mcp-token-rows;
+            mcp-active-token-count: root.mcp-active-token-count;
+            mcp-token-reveal: root.mcp-token-reveal;
+            mcp-token-reveal-status: root.mcp-token-reveal-status;
+
+            approval-rows: root.approval-rows;
+            approval-status: root.approval-status;
+            approval-action-busy: root.approval-action-busy;
+            auto-approval-enabled: root.auto-approval-enabled;
+            doctor-finding-rows: root.doctor-finding-rows;
+            doctor-status: root.doctor-status;
+            doctor-summary: root.doctor-summary;
+            doctor-export-content: root.doctor-export-content;
+            doctor-action-busy: root.doctor-action-busy;
+
+            add-location(name) => { root.add-location(name); }
+            open-workspace-folder => { root.open-workspace-folder(); }
+            refresh-locations => { root.refresh-locations(); }
+            select-workspace(index) => { root.select-workspace(index); }
+            select-agent(index) => {
+                if index >= 0 && index < root.agent-rows.length {
+                    root.selected-agent-id = root.agent-rows[index].id;
+                    root.selected-agent-name = root.agent-rows[index].display-name;
+                    root.selected-agent-role = root.agent-rows[index].role;
+                    root.selected-agent-state = root.agent-rows[index].state;
+                    root.selected-agent-liveness = root.agent-rows[index].liveness;
+                    root.selected-agent-current-goal = root.agent-rows[index].current-goal;
+                    root.selected-agent-current-node = root.agent-rows[index].current-node;
+                    root.selected-agent-public-summary = root.agent-rows[index].public-summary;
+                    root.selected-agent-evidence = root.agent-rows[index].evidence;
+                    root.selected-agent-last-observed = root.agent-rows[index].last-observed;
+                    root.select-agent(root.agent-rows[index].id);
+                }
             }
+            agent-dag-grant-id: root.agent-dag-grant-id;
+            agent-dag-grant-goal-id: root.agent-dag-grant-goal-id;
+            agent-dag-grant-status: root.agent-dag-grant-status;
+            agent-dag-grant-availability: root.agent-dag-grant-availability;
+            agent-dag-grant-active: root.agent-dag-grant-active;
+            issue-agent-dag-grant(agent-id, goal-id, goal-revision, dag-revision, dag-head-revision) => {
+                root.issue-agent-dag-grant(agent-id, goal-id, goal-revision, dag-revision, dag-head-revision);
+            }
+            revoke-agent-dag-grant => { root.revoke-agent-dag-grant(); }
+            select-goal(index) => {
+                if index >= 0 && index < root.goal-rows.length {
+                    root.dag-node-rows = [];
+                    root.dag-edge-rows = [];
+                    root.dag-column-count = 0;
+                    root.dag-lane-count = 0;
+                    root.dag-revision = "";
+                    root.selected-goal-id = root.goal-rows[index].id;
+                    root.selected-goal-revision = root.goal-rows[index].revision;
+                    root.selected-goal-state = root.goal-rows[index].state;
+                    root.selected-goal-objective = root.goal-rows[index].objective;
+                    root.selected-goal-success-criterion = root.goal-rows[index].success-criterion;
+                    root.selected-goal-check-summary = root.goal-rows[index].check-summary;
+                    root.selected-goal-evidence-summary = root.goal-rows[index].evidence-summary;
+                    root.selected-goal-blocker = root.goal-rows[index].blocker;
+                    root.selected-goal-terminal = root.goal-rows[index].terminal;
+                    root.selected-goal-can-pause = root.goal-rows[index].can-pause;
+                    root.selected-goal-can-resume = root.goal-rows[index].can-resume;
+                    root.selected-goal-can-cancel = root.goal-rows[index].can-cancel;
+                    root.selected-goal-can-complete = root.goal-rows[index].can-complete;
+                    root.selected-dag-id = "";
+                    root.select-goal(root.goal-rows[index].id);
+                }
+            }
+            select-dag-node(index) => {
+                if index >= 0 && index < root.dag-node-rows.length {
+                    root.selected-agent-id = "";
+                    root.selected-dag-id = root.dag-node-rows[index].id;
+                    root.selected-dag-label = root.dag-node-rows[index].label;
+                    root.selected-dag-state = root.dag-node-rows[index].state;
+                    root.selected-dag-state-label = root.dag-node-rows[index].state-label;
+                    root.selected-dag-objective = root.dag-node-rows[index].objective;
+                    root.selected-dag-acceptance = root.dag-node-rows[index].acceptance;
+                    root.selected-dag-depends-on = root.dag-node-rows[index].depends-on;
+                    root.selected-dag-waiting-on = root.dag-node-rows[index].waiting-on;
+                    root.selected-dag-evidence = root.dag-node-rows[index].evidence;
+                    root.selected-dag-revision = root.dag-node-rows[index].revision;
+                    root.selected-dag-agent-name = "";
+                    root.selected-dag-work-summary = "";
+                    root.selected-dag-public-summary = "";
+                    root.selected-dag-last-observed = "";
+                    root.selected-dag-current = root.dag-node-rows[index].current;
+                    root.selected-dag-terminal = root.dag-node-rows[index].terminal;
+                    root.select-dag-node(root.dag-node-rows[index].id);
+                    root.select-agent-work-for-node(root.dag-node-rows[index].id);
+                }
+            }
+            create-goal(objective, criterion) => { root.create-goal(objective, criterion); }
+            refresh-goals => { root.refresh-goals(); }
+            pause-goal => { root.pause-goal(root.selected-goal-id, root.selected-goal-revision); }
+            resume-goal => { root.resume-goal(root.selected-goal-id, root.selected-goal-revision); }
+            cancel-goal => { root.cancel-goal(root.selected-goal-id, root.selected-goal-revision); }
+            complete-goal => { root.complete-goal(root.selected-goal-id, root.selected-goal-revision); }
+            register-harness => { root.register-harness(); }
+            refresh-harnesses => { root.refresh-harnesses(); }
+            refresh-harness(index) => {
+                if index >= 0 && index < root.harness-rows.length {
+                    root.refresh-harness(root.harness-rows[index].machine-id, root.harness-rows[index].revision);
+                }
+            }
+            select-harness-base(index) => { root.select-harness-composition-base(index); }
+            toggle-harness-skill(index) => { root.toggle-harness-composition-skill(index); }
+            register-harness-skill => { root.register-harness-skill(); }
+            refresh-harness-skills => { root.refresh-harness-skills(); }
+            refresh-harness-skill(index) => { root.refresh-harness-skill(index); }
+            save-harness-composition(name, version) => { root.save-harness-composition(name, version); }
+            preview-harness(index) => {
+                if index >= 0 && index < root.harness-rows.length {
+                    root.preview-harness(root.harness-rows[index].machine-id, root.harness-rows[index].revision);
+                }
+            }
+            apply-harness-preview => { root.apply-harness-preview(); }
+            preview-harness-lifecycle(index) => {
+                if index >= 0 && index < root.harness-rows.length {
+                    root.preview-harness-lifecycle(root.harness-rows[index].machine-id, root.harness-rows[index].revision);
+                }
+            }
+            preview-harness-remove => { root.preview-harness-remove(); }
+            apply-harness-lifecycle => { root.apply-harness-lifecycle(); }
+            run-harness-verifiers => { root.run-harness-verifiers(); }
+            refresh-harness-verifiers => { root.refresh-harness-verifiers(); }
+            verify-applied-harness => { root.verify-applied-harness(); }
+            save-mcp-connection(origin, port) => { root.save-mcp-connection(origin, port); }
+            refresh-mcp-connection => { root.refresh-mcp-connection(); }
+            start-mcp-server => { root.start-mcp-server(); }
+            stop-mcp-server => { root.stop-mcp-server(); }
+            issue-mcp-token(label) => { root.issue-mcp-token(label); }
+            rotate-mcp-token(index) => { root.rotate-mcp-token(index); }
+            revoke-mcp-token(index) => { root.revoke-mcp-token(index); }
+            dismiss-mcp-token-reveal => { root.dismiss-mcp-token-reveal(); }
+            refresh-activities => { root.refresh-activities(); }
+            select-activity(id) => { root.select-activity(id); }
+            view-diff(id) => { root.view-diff(id); }
+            close-diff-view => { root.close-diff-view(); }
+            refresh-approvals => { root.refresh-approvals(); }
+            approve-request(id) => { root.approve-request(id); }
+            reject-request(id) => { root.reject-request(id); }
+            set-auto-approval(enabled) => { root.set-auto-approval(enabled); }
+            stop-workspace-work => { root.stop-workspace-work(); }
+            emergency-stop => { root.emergency-stop(); }
+            start-runtime => { root.start-runtime(); }
+            stop-runtime => { root.stop-runtime(); }
+            restart-runtime => { root.restart-runtime(); }
+            refresh-doctor => { root.refresh-doctor(); }
+            export-doctor-diagnostics => { root.export-doctor-diagnostics(); }
         }
-
-        Rectangle {
-            x: 0px; y: 46px; width: 100%; height: root.height - 74px; background: ForgeTheme.void;
-            if root.settings-open : HorizontalBox {
-                width: 100%;
-                height: 100%;
-                horizontal-stretch: 1;
-                vertical-stretch: 1;
-                spacing: 0px;
-                Rectangle {
-                    width: root.minimum-layout ? 196px : 216px; background: ForgeTheme.rail; border-color: ForgeTheme.separator; border-width: 1px;
-                    accessible-role: navigation;
-                    accessible-label: "Settings categories";
-                    VerticalBox {
-                        spacing: 0px;
-                        PaneHeader { label: "SETTINGS"; detail: "SESSION"; }
-                        ForgeButton { horizontal-stretch: 1; label: "Workbench"; active: root.settings-section == 0; activated => { root.settings-section = 0; } }
-                        ForgeButton { horizontal-stretch: 1; label: "Appearance"; active: root.settings-section == 1; activated => { root.settings-section = 1; } }
-                        ForgeButton { horizontal-stretch: 1; label: "Keyboard"; active: root.settings-section == 2; activated => { root.settings-section = 2; } }
-                        ForgeButton { horizontal-stretch: 1; label: "Locations / Workspaces"; active: root.settings-section == 3; activated => { root.settings-section = 3; } }
-                        ForgeButton { horizontal-stretch: 1; label: "Execution / Safety"; active: root.settings-section == 4; activated => { root.settings-section = 4; } }
-                        ForgeButton { horizontal-stretch: 1; label: "Harness"; active: root.settings-section == 5; activated => { root.settings-section = 5; } }
-                        ForgeButton { horizontal-stretch: 1; label: "Data / Evidence"; active: root.settings-section == 6; activated => { root.settings-section = 6; } }
-                        Rectangle { vertical-stretch: 1; }
-                        Text { text: "Durable preferences are unavailable; controls here are session-local."; color: ForgeTheme.text-muted; font-size: 10px; wrap: word-wrap; }
-                    }
-                }
-                Rectangle {
-                    horizontal-stretch: 1; min-width: 620px; max-width: 1100px; background: ForgeTheme.void;
-                    accessible-role: main;
-                    accessible-label: "Settings domain";
-                    VerticalBox {
-                        padding: 18px; spacing: 8px;
-                        Text { text: root.settings-section == 0 ? "Workbench" : root.settings-section == 1 ? "Appearance" : root.settings-section == 2 ? "Keyboard" : root.settings-section == 3 ? "Locations / Workspaces" : root.settings-section == 4 ? "Execution / Safety" : root.settings-section == 5 ? "Harness" : "Data / Evidence"; color: ForgeTheme.text; font-size: 16px; font-weight: 700; }
-                        Text { text: "Interactive controls, read-only facts, and unavailable durable preferences"; color: ForgeTheme.text-secondary; font-size: 12px; }
-                        if root.settings-section == 0 : VerticalBox {
-                            spacing: 6px;
-                            SettingsRow { title: "Left Goal rail"; detail: "Session width and visibility"; value: "SESSION · " + (root.left-rail-collapsed ? "Collapsed" : "Visible"); }
-                            SettingsRow { title: "Context Inspector"; detail: "Session width and visibility"; value: "SESSION · " + (root.right-rail-collapsed ? "Collapsed" : "Visible"); }
-                            HorizontalBox { spacing: 8px; ForgeButton { label: root.left-rail-collapsed ? "Open Goal rail" : "Collapse Goal rail"; activated => { root.left-rail-collapsed = !root.left-rail-collapsed; } } ForgeButton { label: root.right-rail-collapsed ? "Open Inspector" : "Collapse Inspector"; activated => { root.right-rail-collapsed = !root.right-rail-collapsed; } } ForgeButton { label: "Reset layout"; activated => { root.left-rail-width = root.wide-layout ? 300px : root.minimum-layout ? 236px : 260px; root.right-rail-width = root.wide-layout ? 380px : root.minimum-layout ? 300px : 320px; root.left-rail-collapsed = false; root.right-rail-collapsed = false; } } }
-                        }
-                        if root.settings-section == 1 : VerticalBox { spacing: 6px; SettingsRow { title: "Obsidian Assay Bench"; detail: "Current high-density dark appearance"; value: "READ ONLY · Active"; } SettingsRow { title: "Theme / density / text scale"; detail: "Requires durable preference projection"; value: "Unavailable"; unavailable: true; } SettingsRow { title: "Reduced motion"; detail: "No decorative motion is emitted"; value: "READ ONLY · Static"; } }
-                        if root.settings-section == 2 : VerticalBox { spacing: 6px; SettingsRow { title: "Keyboard navigation"; detail: "Tab, Return/Space, splitter arrows"; value: "READ ONLY · Active"; } SettingsRow { title: "Shortcut remapping"; detail: "Requires durable command preferences"; value: "Unavailable"; unavailable: true; } }
-                        if root.settings-section == 3 : VerticalBox {
-                            spacing: 8px;
-                            SettingsRow { title: "Registered Locations"; detail: root.location-status; value: "INTERACTIVE · " + root.location-rows.length; }
-                            HorizontalBox { spacing: 8px; LineEdit { horizontal-stretch: 1; text <=> root.location-name-input; placeholder-text: "Location name"; accessible-label: "Location name"; enabled: !root.location-action-busy; } ForgeButton { label: root.folder-picker-open ? "Picker open" : "Add Location"; enabled: !root.folder-picker-open && !root.location-action-busy; activated => { root.add-location(root.location-name-input); } } ForgeButton { label: "Refresh"; enabled: !root.location-action-busy; activated => { root.refresh-locations(); } } }
-                            if root.location-rows.length > 0 : ListView { vertical-stretch: 1; for location[index] in root.location-rows : FlatRow { title: location.display-name; detail: location.root; state: location.state; activated => { root.discover-location(location.machine-id, location.revision); } } }
-                        }
-                        if root.settings-section == 4 : VerticalBox { spacing: 6px; SettingsRow { title: "Runtime"; detail: root.runtime-detail; value: "INTERACTIVE · " + root.runtime-status; } SettingsRow { title: "Auto Approval"; detail: "Conservative discovered-command scopes only"; value: "INTERACTIVE · " + (root.auto-approval-enabled ? "Enabled" : "Disabled"); } HorizontalBox { spacing: 8px; ForgeButton { label: root.runtime-status == "Stopped" ? "Start runtime" : "Stop runtime"; activated => { if root.runtime-status == "Stopped" { root.start-runtime(); } else { root.stop-runtime(); } } } ForgeButton { label: root.auto-approval-enabled ? "Disable Auto" : "Enable Auto"; activated => { root.set-auto-approval(!root.auto-approval-enabled); } } ForgeButton { label: "Stop Workspace"; danger: true; enabled: root.selected-workspace-id != ""; activated => { root.stop-workspace-work(); } } } }
-                        if root.settings-section == 5 : VerticalBox {
-                            spacing: 6px;
-                            SettingsRow { title: "Applied Harness"; detail: root.harness-status; value: "READ ONLY · " + root.applied-harness-name; unavailable: root.applied-harness-name == "Not connected"; }
-                            SettingsRow { title: "Source"; detail: "Registered Bundle source"; value: root.applied-harness-source == "" ? "Unavailable" : root.applied-harness-source; unavailable: root.applied-harness-source == ""; }
-                            SettingsRow { title: "Version"; detail: "Durable applied Bundle version"; value: root.applied-harness-version == "" ? "Unavailable" : root.applied-harness-version; unavailable: root.applied-harness-version == ""; }
-                            SettingsRow { title: "Content hash"; detail: "Durable applied Bundle fingerprint"; value: root.applied-harness-hash == "" ? "Unavailable" : root.applied-harness-hash; unavailable: root.applied-harness-hash == ""; }
-                            SettingsRow { title: "Verification"; detail: root.applied-harness-verified-at == "" ? "No source verification recorded" : "Verified at " + root.applied-harness-verified-at; value: root.applied-harness-verification; unavailable: root.applied-harness-name == "Not connected"; }
-                            ForgeButton { label: "Check Source Integrity"; enabled: !root.harness-action-busy && root.applied-harness-name != "Not connected"; activated => { root.verify-applied-harness(); } }
-                            SettingsRow { title: "Declared verifiers"; detail: root.harness-verifier-status; value: root.harness-verifier-rows.length == 0 ? "NO RUN" : root.harness-verifier-rows.length + " checks"; unavailable: root.applied-harness-name == "Not connected"; }
-                            HorizontalBox {
-                                spacing: 8px;
-                                ForgeButton { label: root.harness-action-busy ? "Working…" : "Run Verifiers"; enabled: !root.harness-action-busy && root.selected-workspace-id != "" && root.applied-harness-verification == "SOURCE VERIFIED"; activated => { root.run-harness-verifiers(); } }
-                                ForgeButton { label: "Refresh Verifiers"; enabled: !root.harness-action-busy && root.harness-verifier-rows.length > 0; activated => { root.refresh-harness-verifiers(); } }
-                            }
-                            if root.harness-verifier-rows.length > 0 : ListView {
-                                for verifier[index] in root.harness-verifier-rows : FlatRow { title: verifier.label; detail: verifier.value; state: verifier.state; }
-                            }
-                            SettingsRow { title: "Workspace materialization"; detail: root.harness-preview-status; value: root.harness-preview-rows.length == 0 ? "PREVIEW ONLY" : root.harness-preview-rows.length + " targets"; }
-                            SettingsRow { title: "Harness Library"; detail: root.harness-library-status; value: "INTERACTIVE · " + root.harness-rows.length + " registered"; }
-                            HorizontalBox {
-                                spacing: 8px;
-                                ForgeButton { label: root.harness-action-busy ? "Working…" : "Add Harness"; enabled: !root.harness-action-busy; activated => { root.register-harness(); } }
-                                ForgeButton { label: "Refresh"; enabled: !root.harness-action-busy; activated => { root.refresh-harnesses(); } }
-                            }
-                            if root.harness-rows.length == 0 : EmptyState { title: "No Harness Bundle registered"; detail: "Choose a local Harness Bundle directory containing harness.toml."; }
-                            if root.harness-rows.length > 0 : ListView {
-                                vertical-stretch: 1;
-                                for harness[index] in root.harness-rows : HorizontalBox {
-                                    spacing: 6px;
-                                    FlatRow { horizontal-stretch: 1; title: harness.label; detail: harness.value; state: harness.state; activated => { root.refresh-harness(harness.machine-id, harness.revision); } }
-                                    ForgeButton { label: "Preview"; compact: true; enabled: !root.harness-action-busy && root.selected-workspace-id != ""; activated => { root.preview-harness(harness.machine-id, harness.revision); } }
-                                }
-                            }
-                            if root.harness-preview-rows.length > 0 : ListView {
-                                vertical-stretch: 1;
-                                for item[index] in root.harness-preview-rows : FlatRow { title: item.label; detail: item.value; state: item.state; }
-                            }
-                            ForgeButton { label: root.harness-action-busy ? "Applying…" : "Apply Preview"; enabled: !root.harness-action-busy && root.harness-preview-applyable; activated => { root.apply-harness-preview(); } }
-                        }
-                        if root.settings-section == 6 : VerticalBox { spacing: 6px; SettingsRow { title: "Application Support"; detail: "Local application data root"; value: root.application-support-path == "" ? "UNAVAILABLE" : "READ ONLY · " + root.application-support-path; unavailable: root.application-support-path == ""; } SettingsRow { title: "Diff Evidence"; detail: root.diff-status; value: root.diff-rows.length + " rows"; } SettingsRow { title: "Layout persistence"; detail: "Pane widths are session-local"; value: "Unavailable"; unavailable: true; } }
-                        Rectangle { vertical-stretch: 1; }
-                    }
-                }
-            }
-
-            if !root.settings-open : HorizontalBox {
-                width: 100%;
-                height: 100%;
-                horizontal-stretch: 1;
-                vertical-stretch: 1;
-                spacing: 0px;
-                Rectangle {
-                    width: root.effective-left-width; background: ForgeTheme.rail; border-color: ForgeTheme.separator; border-width: 1px;
-                    accessible-role: navigation;
-                    accessible-label: "Workspace and Goal navigation";
-                    if root.left-rail-collapsed : VerticalBox { spacing: 8px; PaneChevron { points-right: true; accessible-name: "Open Goal rail"; activated => { root.left-rail-collapsed = false; } } Text { text: "GOAL"; color: ForgeTheme.text-secondary; font-size: 10px; font-weight: 700; horizontal-alignment: center; } Text { text: root.goal-rows.length + ""; color: ForgeTheme.ember-hot; font-family: "monospace"; font-size: 11px; horizontal-alignment: center; } }
-                    if !root.left-rail-collapsed : VerticalBox {
-                        spacing: 0px;
-                        Rectangle { height: 88px; background: ForgeTheme.chrome; border-color: ForgeTheme.separator; border-width: 1px; VerticalBox { padding: 9px; spacing: 4px; HorizontalBox { Text { text: "WORKSPACE SCOPE"; color: ForgeTheme.text-secondary; font-size: 10px; font-weight: 700; horizontal-stretch: 1; } PaneChevron { points-right: false; accessible-name: "Collapse Goal rail"; activated => { root.left-rail-collapsed = true; } } } Text { text: root.selected-workspace-id == "" ? "No Workspace selected" : root.selected-workspace-root; color: root.selected-workspace-id == "" ? ForgeTheme.text-muted : ForgeTheme.text; font-family: "monospace"; font-size: 10px; overflow: elide; } Text { text: root.selected-workspace-revision == "" ? "No durable authority" : "Revision " + root.selected-workspace-revision; color: ForgeTheme.text-muted; font-size: 10px; } } }
-                        HorizontalBox {
-                            spacing: 0px;
-                            PaneHeader { horizontal-stretch: 1; label: "GOALS"; detail: root.goal-rows.length + ""; }
-                            ForgeButton {
-                                label: root.goal-compose-open ? "Close" : "New";
-                                accessible-name: root.goal-compose-open ? "Close Goal composer" : "Create a Goal";
-                                compact: true;
-                                active: root.goal-compose-open;
-                                enabled: root.selected-workspace-id != "" && !root.goal-action-busy;
-                                activated => { root.goal-compose-open = !root.goal-compose-open; }
-                            }
-                            ForgeButton {
-                                label: "Refresh";
-                                accessible-name: "Refresh Goals";
-                                compact: true;
-                                enabled: root.selected-workspace-id != "" && !root.goal-action-busy;
-                                activated => { root.refresh-goals(); }
-                            }
-                        }
-                        if root.goal-compose-open : Rectangle {
-                            height: 106px;
-                            background: ForgeTheme.chrome;
-                            border-color: ForgeTheme.separator;
-                            border-width: 1px;
-                            VerticalBox {
-                                padding: 7px;
-                                spacing: 5px;
-                                LineEdit {
-                                    height: 28px;
-                                    text <=> root.goal-objective-input;
-                                    placeholder-text: "Objective";
-                                    accessible-label: "Goal objective";
-                                    enabled: root.selected-workspace-id != "" && !root.goal-action-busy;
-                                }
-                                LineEdit {
-                                    height: 28px;
-                                    text <=> root.goal-success-criterion-input;
-                                    placeholder-text: "Observable success criterion";
-                                    accessible-label: "Goal success criterion";
-                                    enabled: root.selected-workspace-id != "" && !root.goal-action-busy;
-                                }
-                                HorizontalBox {
-                                    spacing: 6px;
-                                    Text {
-                                        text: "Immutable after creation";
-                                        color: ForgeTheme.text-muted;
-                                        font-size: 10px;
-                                        vertical-alignment: center;
-                                        horizontal-stretch: 1;
-                                    }
-                                    ForgeButton {
-                                        label: root.goal-action-busy ? "Creating…" : "Create";
-                                        accessible-name: "Create Goal from objective and success criterion";
-                                        compact: true;
-                                        enabled: root.selected-workspace-id != "" && !root.goal-action-busy && root.goal-objective-input != "" && root.goal-success-criterion-input != "";
-                                        activated => { root.create-goal(root.goal-objective-input, root.goal-success-criterion-input); }
-                                    }
-                                }
-                            }
-                        }
-                        Rectangle {
-                            vertical-stretch: 4;
-                            background: ForgeTheme.void;
-                            if root.goal-rows.length == 0 : EmptyState {
-                                title: root.selected-workspace-id == "" ? "Select a Workspace" : "No durable Goal";
-                                detail: root.goal-status;
-                                action-label: root.selected-workspace-id == "" ? "Open Locations & Workspaces" : "Create Goal";
-                                action => {
-                                    if root.selected-workspace-id == "" {
-                                        root.settings-section = 3;
-                                        root.settings-open = true;
-                                    } else {
-                                        root.goal-compose-open = true;
-                                    }
-                                }
-                            }
-                            if root.goal-rows.length > 0 : ListView {
-                                for goal[index] in root.goal-rows : FlatRow {
-                                    title: goal.title;
-                                    detail: "rev " + goal.revision + " · " + goal.check-summary;
-                                    state: goal.blocker == "" ? goal.state : goal.state + " · BLOCKED";
-                                    selected: goal.id == root.selected-goal-id;
-                                    activated => {
-                                        root.dag-node-rows = [];
-                                        root.dag-edge-rows = [];
-                                        root.dag-column-count = 0;
-                                        root.dag-lane-count = 0;
-                                        root.dag-revision = "";
-                                        root.dag-status = "Loading durable DAG projection for the selected Goal…";
-                                        root.selected-goal-id = goal.id;
-                                        root.selected-goal-revision = goal.revision;
-                                        root.selected-goal-state = goal.state;
-                                        root.selected-goal-objective = goal.objective;
-                                        root.selected-goal-success-criterion = goal.success-criterion;
-                                        root.selected-goal-check-summary = goal.check-summary;
-                                        root.selected-goal-evidence-summary = goal.evidence-summary;
-                                        root.selected-goal-blocker = goal.blocker;
-                                        root.selected-goal-terminal = goal.terminal;
-                                        root.selected-goal-can-pause = goal.can-pause;
-                                        root.selected-goal-can-resume = goal.can-resume;
-                                        root.selected-goal-can-cancel = goal.can-cancel;
-                                        root.selected-goal-can-complete = goal.can-complete;
-                                        root.selected-dag-id = "";
-                                        root.selected-diff-id = "";
-                                        root.inspector-tab = 0;
-                                        root.inspector-kind = "GOAL · REV " + goal.revision;
-                                        root.inspector-title = goal.title;
-                                        root.inspector-detail = goal.success-criterion;
-                                        root.inspector-evidence = goal.evidence-summary;
-                                        root.select-goal(goal.id);
-                                    }
-                                }
-                            }
-                        }
-                        PaneHeader { label: "WORKSPACES"; detail: root.workspace-rows.length + ""; }
-                        Rectangle { vertical-stretch: 1; background: ForgeTheme.work; if root.workspace-rows.length == 0 : EmptyState { title: "No candidates"; detail: root.workspace-status; } if root.workspace-rows.length > 0 : ListView { for workspace[index] in root.workspace-rows : FlatRow { title: workspace.label; detail: workspace.relative-display; state: workspace.kind; selected: index == root.selected-workspace-index; activated => { root.select-workspace(index); } } } }
-                        ForgeButton { label: "Locations & Workspaces"; activated => { root.settings-section = 3; root.settings-open = true; } }
-                    }
-                }
-                PaneSplitter { label: "Resize Goal rail"; enabled: !root.left-rail-collapsed; current-width: root.effective-left-width; requested(width) => { root.left-rail-width = max(root.left-minimum, min(root.left-maximum, width)); } }
-
-                Rectangle {
-                    horizontal-stretch: 1; min-width: root.center-minimum; max-width: 10000px; background: ForgeTheme.void;
-                    accessible-role: main;
-                    accessible-label: "Goal DAG Activity and Evidence workbench";
-                    VerticalBox {
-                        spacing: 0px;
-                        Rectangle { height: 36px; background: ForgeTheme.chrome; border-color: ForgeTheme.separator; border-width: 1px; HorizontalBox { padding-left: 10px; padding-right: 10px; spacing: 8px; ContextField { horizontal-stretch: 4; label: "PATH"; value: root.selected-workspace-root == "" ? "No Workspace selected" : root.selected-workspace-root; } Rectangle { width: 1px; height: 18px; background: ForgeTheme.separator; } ContextField { horizontal-stretch: 2; label: "HARNESS"; value: "READ ONLY · " + root.applied-harness-name; warning: root.harness-rows.length == 0; } Rectangle { width: 1px; height: 18px; background: ForgeTheme.separator; } ContextField { min-width: 96px; horizontal-stretch: 2; label: "UPTIME"; value: root.uptime-seconds + "s"; value-min-width: 30px; } Rectangle { width: 1px; height: 18px; background: ForgeTheme.separator; } ContextField { min-width: 132px; horizontal-stretch: 3; label: "ACTIVITY"; value: root.selected-activity-label; } } }
-                        Rectangle {
-                            height: 132px;
-                            background: ForgeTheme.work;
-                            border-color: ForgeTheme.separator;
-                            border-width: 1px;
-                            if root.selected-goal-id == "" : VerticalBox {
-                                padding: 12px;
-                                spacing: 6px;
-                                Text {
-                                    text: root.goal-rows.length == 0 ? "No durable Goal" : "Choose a Goal to inspect";
-                                    color: ForgeTheme.text;
-                                    font-size: 16px;
-                                    font-weight: 700;
-                                }
-                                Text {
-                                    text: root.goal-status;
-                                    color: ForgeTheme.text-secondary;
-                                    font-size: 12px;
-                                    wrap: word-wrap;
-                                }
-                                Text {
-                                    text: root.selected-workspace-id == "" ? "Workspace required." : root.goal-rows.length == 0 ? "Create or refresh a Goal, then observe its immutable DAG and Activity evidence." : root.goal-rows.length + " bounded Goal contracts · select one to project its DAG without leaving this Workspace";
-                                    color: ForgeTheme.text-muted;
-                                    font-size: 11px;
-                                }
-                                Rectangle { vertical-stretch: 1; }
-                                HorizontalBox {
-                                    spacing: 6px;
-                                    Rectangle { horizontal-stretch: 1; }
-                                    ForgeButton {
-                                        label: "Refresh Goals";
-                                        accessible-name: "Refresh durable Goals";
-                                        compact: true;
-                                        enabled: root.selected-workspace-id != "" && !root.goal-action-busy;
-                                        activated => { root.refresh-goals(); }
-                                    }
-                                }
-                            }
-                            if root.selected-goal-id != "" : VerticalBox {
-                                padding: 10px;
-                                spacing: 5px;
-                                HorizontalBox {
-                                    spacing: 8px;
-                                    Text {
-                                        text: root.selected-goal-objective;
-                                        accessible-label: "Selected Goal objective " + root.selected-goal-objective;
-                                        color: ForgeTheme.text;
-                                        font-size: 15px;
-                                        font-weight: 700;
-                                        overflow: elide;
-                                        horizontal-stretch: 1;
-                                    }
-                                    Text {
-                                        text: root.selected-goal-state + " · REV " + root.selected-goal-revision;
-                                        color: root.selected-goal-state == "ACTIVE" ? ForgeTheme.success : root.selected-goal-state == "FAILED" || root.selected-goal-state == "CANCELLED" ? ForgeTheme.danger : ForgeTheme.text-secondary;
-                                        font-family: "monospace";
-                                        font-size: 10px;
-                                        font-weight: 600;
-                                        vertical-alignment: center;
-                                    }
-                                }
-                                Text {
-                                    text: "SUCCESS · " + root.selected-goal-success-criterion;
-                                    color: ForgeTheme.text-secondary;
-                                    font-size: 10px;
-                                    overflow: elide;
-                                }
-                                Text {
-                                    text: root.selected-goal-blocker == "" ? root.selected-goal-check-summary : "BLOCKER · " + root.selected-goal-blocker;
-                                    color: root.selected-goal-blocker == "" ? ForgeTheme.text-muted : ForgeTheme.danger;
-                                    font-size: 10px;
-                                    overflow: elide;
-                                }
-                                Rectangle { vertical-stretch: 1; }
-                                HorizontalBox {
-                                    spacing: 6px;
-                                    Text {
-                                        text: root.selected-goal-terminal ? "Terminal Goal · definition remains immutable" : root.selected-goal-can-complete ? "Hard checks satisfied" : "Completion remains evidence-gated";
-                                        color: root.selected-goal-can-complete ? ForgeTheme.success : ForgeTheme.text-muted;
-                                        font-size: 10px;
-                                        vertical-alignment: center;
-                                        horizontal-stretch: 1;
-                                        overflow: elide;
-                                    }
-                                    if root.selected-goal-can-pause : ForgeButton {
-                                        label: "Pause";
-                                        accessible-name: "Pause selected Goal";
-                                        compact: true;
-                                        enabled: !root.goal-action-busy;
-                                        activated => { root.pause-goal(root.selected-goal-id, root.selected-goal-revision); }
-                                    }
-                                    if root.selected-goal-can-resume : ForgeButton {
-                                        label: "Resume";
-                                        accessible-name: "Resume selected Goal";
-                                        compact: true;
-                                        enabled: !root.goal-action-busy;
-                                        activated => { root.resume-goal(root.selected-goal-id, root.selected-goal-revision); }
-                                    }
-                                    if !root.selected-goal-terminal : ForgeButton {
-                                        label: "Complete";
-                                        accessible-name: root.selected-goal-can-complete ? "Complete selected Goal" : "Selected Goal cannot complete until hard checks pass";
-                                        compact: true;
-                                        active: root.selected-goal-can-complete;
-                                        enabled: root.selected-goal-can-complete && !root.goal-action-busy;
-                                        activated => { root.complete-goal(root.selected-goal-id, root.selected-goal-revision); }
-                                    }
-                                    if !root.selected-goal-terminal : ForgeButton {
-                                        label: "Cancel";
-                                        accessible-name: "Cancel selected Goal";
-                                        compact: true;
-                                        danger: true;
-                                        enabled: root.selected-goal-can-cancel && !root.goal-action-busy;
-                                        activated => { root.cancel-goal(root.selected-goal-id, root.selected-goal-revision); }
-                                    }
-                                }
-                            }
-                        }
-                        Rectangle {
-                            vertical-stretch: 3; min-height: 220px; background: ForgeTheme.void; border-color: ForgeTheme.separator; border-width: 1px;
-                            VerticalBox {
-                                spacing: 0px;
-                                PaneHeader {
-                                    label: "DEPENDENCY GRAPH";
-                                    detail: root.dag-node-rows.length == 0 ? "NO DAG" : "REV " + root.dag-revision + " · " + root.dag-node-rows.length + " NODES · " + root.dag-edge-rows.length + " EDGES · " + root.dag-column-count + " COLS";
-                                }
-                                if root.dag-node-rows.length == 0 : EmptyState {
-                                    title: "No Chat-authored DAG";
-                                    detail: root.dag-status;
-                                    workflow-hint: "Workspace ready → Goal selected → DAG / Activity / Evidence observed";
-                                }
-                                if root.dag-node-rows.length > 0 : graph-scroll := Flickable {
-                                    accessible-role: list;
-                                    accessible-label: "Read-only dependency graph revision " + root.dag-revision + ", " + root.dag-node-rows.length + " nodes, " + root.dag-edge-rows.length + " exact edges, " + root.dag-column-count + " columns";
-                                    viewport-width: max(self.width, 24px + root.dag-column-count * root.dag-node-width + max(0, root.dag-column-count - 1) * root.dag-column-gap);
-                                    viewport-height: max(self.height, 24px + root.dag-lane-count * root.dag-node-height + max(0, root.dag-lane-count - 1) * root.dag-lane-gap);
-                                    Rectangle {
-                                        width: graph-scroll.viewport-width;
-                                        height: graph-scroll.viewport-height;
-                                        background: ForgeTheme.void;
-                                        // Exact validated edges render behind nodes. There is no
-                                        // adjacent-node spine or inferred critical path.
-                                        for edge[index] in root.dag-edge-rows : DagEdgeConnector {
-                                            x: 12px + edge.from-column * (root.dag-node-width + root.dag-column-gap) + root.dag-node-width;
-                                            y: min(
-                                                12px + edge.from-lane * (root.dag-node-height + root.dag-lane-gap) + root.dag-node-height / 2,
-                                                12px + edge.to-lane * (root.dag-node-height + root.dag-lane-gap) + root.dag-node-height / 2
-                                            );
-                                            // Validated DAG topology always projects downstream
-                                            // into a strictly later column; max is a rendering
-                                            // guard that prevents negative/zero width on stale UI input.
-                                            width: max(1px, 12px + edge.to-column * (root.dag-node-width + root.dag-column-gap) - self.x);
-                                            from-y: 12px + edge.from-lane * (root.dag-node-height + root.dag-lane-gap) + root.dag-node-height / 2;
-                                            to-y: 12px + edge.to-lane * (root.dag-node-height + root.dag-lane-gap) + root.dag-node-height / 2;
-                                            blocked: edge.blocked;
-                                            current-path: edge.current-path;
-                                            accessible-name: edge.upstream-label + " depends into " + edge.downstream-label +
-                                                (edge.blocked ? ", blocked dependency" : edge.current-path ? ", active downstream path" : ", dependency");
-                                        }
-                                        for node[index] in root.dag-node-rows : DagNodeCard {
-                                            x: 12px + node.column * (root.dag-node-width + root.dag-column-gap);
-                                            y: 12px + node.lane * (root.dag-node-height + root.dag-lane-gap);
-                                            width: root.dag-node-width;
-                                            height: root.dag-node-height;
-                                            node-id: node.id;
-                                            label: node.label;
-                                            state: node.state;
-                                            objective: node.objective;
-                                            acceptance: node.acceptance;
-                                            depends-on: node.depends-on;
-                                            waiting-on: node.waiting-on;
-                                            evidence: node.evidence;
-                                            revision: node.revision;
-                                            current: node.current;
-                                            terminal: node.terminal;
-                                            selected: node.id == root.selected-dag-id;
-                                            activated => {
-                                                root.selected-dag-id = node.id;
-                                                root.selected-dag-label = node.label;
-                                                root.selected-dag-state = node.state;
-                                                root.selected-dag-objective = node.objective;
-                                                root.selected-dag-acceptance = node.acceptance;
-                                                root.selected-dag-depends-on = node.depends-on;
-                                                root.selected-dag-waiting-on = node.waiting-on;
-                                                root.selected-dag-evidence = node.evidence;
-                                                root.selected-dag-revision = node.revision;
-                                                root.selected-dag-current = node.current;
-                                                root.selected-dag-terminal = node.terminal;
-                                                root.selected-diff-id = "";
-                                                root.inspector-tab = 0;
-                                                root.inspector-kind = "DAG NODE · REV " + node.revision;
-                                                root.inspector-title = node.label;
-                                                root.inspector-detail = node.objective;
-                                                root.inspector-evidence = node.evidence;
-                                                root.select-dag-node(node.id);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        Rectangle {
-                            vertical-stretch: 2; min-height: 190px; background: ForgeTheme.work; border-color: ForgeTheme.separator; border-width: 1px;
-                            if root.wide-layout : HorizontalBox {
-                                spacing: 7px;
-                                Rectangle { horizontal-stretch: 1; min-width: 280px; max-width: 10000px; background: ForgeTheme.void; VerticalBox { spacing: 0px; PaneHeader { label: "ACTIVITY"; detail: root.show-live-activities ? "LIVE " + root.activity-live-rows.length : "HISTORY " + root.activity-history-rows.length; } HorizontalBox { ForgeButton { label: "Live"; compact: true; active: root.show-live-activities; activated => { root.show-live-activities = true; } } ForgeButton { label: "History"; compact: true; active: !root.show-live-activities; activated => { root.show-live-activities = false; } } Rectangle { horizontal-stretch: 1; } ForgeButton { label: "Refresh"; compact: true; enabled: !root.activity-action-busy; activated => { root.refresh-activities(); } } } if root.show-live-activities && root.activity-live-rows.length == 0 : EmptyState { title: "No live Activity"; detail: root.selected-workspace-id == "" ? "Workspace required." : root.activity-status; } if !root.show-live-activities && root.activity-history-rows.length == 0 : EmptyState { title: "No Activity history"; detail: root.selected-workspace-id == "" ? "Workspace required." : root.activity-status; } if root.show-live-activities && root.activity-live-rows.length > 0 : ListView { for activity[index] in root.activity-live-rows : FlatRow { title: activity.display-label; detail: activity.liveness + " · rev " + activity.revision; state: activity.state; selected: activity.id == root.selected-activity-id; activated => { root.selected-activity-label = activity.display-label + " · " + activity.state; root.inspector-kind = "ACTIVITY"; root.inspector-title = activity.display-label; root.inspector-detail = activity.state + " · " + activity.liveness; root.inspector-evidence = "Revision " + activity.revision; root.select-activity(activity.id); } } } if !root.show-live-activities && root.activity-history-rows.length > 0 : ListView { for activity[index] in root.activity-history-rows : FlatRow { title: activity.display-label; detail: activity.liveness + " · rev " + activity.revision; state: activity.state; selected: activity.id == root.selected-activity-id; activated => { root.selected-activity-label = activity.display-label + " · " + activity.state; root.inspector-kind = "ACTIVITY"; root.inspector-title = activity.display-label; root.inspector-detail = activity.state + " · " + activity.liveness; root.inspector-evidence = "Revision " + activity.revision; root.select-activity(activity.id); } } } } }
-                                Rectangle { horizontal-stretch: 1; min-width: 280px; max-width: 10000px; background: ForgeTheme.void; VerticalBox { spacing: 0px; PaneHeader { label: "EVIDENCE / DIFF"; detail: root.diff-rows.length + ""; } if root.diff-view-open : VerticalBox { spacing: 6px; HorizontalBox { Text { text: root.diff-view-title; color: ForgeTheme.text; font-size: 11px; font-weight: 600; horizontal-stretch: 1; } ForgeButton { label: "Close"; compact: true; activated => { root.close-diff-view(); } } } TextEdit { text: root.diff-view-content; read-only: true; vertical-stretch: 1; font-family: "monospace"; font-size: 10px; } } if !root.diff-view-open && root.diff-rows.length == 0 : EmptyState { title: "No Diff selected"; detail: root.diff-status; } if !root.diff-view-open && root.diff-rows.length > 0 : ListView { for diff[index] in root.diff-rows : FlatRow { title: diff.path; detail: diff.summary; state: diff.kind + " · " + diff.state; selected: diff.id == root.selected-diff-id; activated => { root.selected-goal-id = ""; root.selected-dag-id = ""; root.selected-diff-id = diff.id; root.inspector-tab = 3; root.inspector-kind = "DIFF"; root.inspector-title = diff.path; root.inspector-detail = diff.kind + " · " + diff.state; root.inspector-evidence = diff.summary; root.view-diff(diff.id); } } } } }
-                            }
-                            if !root.wide-layout : VerticalBox {
-                                spacing: 0px;
-                                HorizontalBox { spacing: 6px; ForgeButton { label: "Activity"; compact: true; active: !root.evidence-open; activated => { root.evidence-open = false; } } ForgeButton { label: "Evidence"; compact: true; active: root.evidence-open; activated => { root.evidence-open = true; } } Rectangle { horizontal-stretch: 1; } ForgeButton { label: "Refresh"; compact: true; enabled: !root.activity-action-busy; activated => { root.refresh-activities(); } } }
-                                if !root.evidence-open : Rectangle { vertical-stretch: 1; background: ForgeTheme.void; if root.show-live-activities && root.activity-live-rows.length == 0 : EmptyState { title: "No live Activity"; detail: root.selected-workspace-id == "" ? "Workspace required." : root.activity-status; } if !root.show-live-activities && root.activity-history-rows.length == 0 : EmptyState { title: "No Activity history"; detail: root.selected-workspace-id == "" ? "Workspace required." : root.activity-status; } if root.show-live-activities && root.activity-live-rows.length > 0 : ListView { for activity[index] in root.activity-live-rows : FlatRow { title: activity.display-label; detail: activity.liveness; state: activity.state; selected: activity.id == root.selected-activity-id; activated => { root.selected-goal-id = ""; root.selected-dag-id = ""; root.selected-diff-id = ""; root.selected-activity-label = activity.display-label + " · " + activity.state; root.inspector-kind = "ACTIVITY"; root.inspector-title = activity.display-label; root.inspector-detail = activity.state + " · " + activity.liveness; root.inspector-evidence = "Revision " + activity.revision; root.select-activity(activity.id); } } } if !root.show-live-activities && root.activity-history-rows.length > 0 : ListView { for activity[index] in root.activity-history-rows : FlatRow { title: activity.display-label; detail: activity.liveness; state: activity.state; selected: activity.id == root.selected-activity-id; activated => { root.selected-goal-id = ""; root.selected-dag-id = ""; root.selected-diff-id = ""; root.selected-activity-label = activity.display-label + " · " + activity.state; root.inspector-kind = "ACTIVITY"; root.inspector-title = activity.display-label; root.inspector-detail = activity.state + " · " + activity.liveness; root.inspector-evidence = "Revision " + activity.revision; root.select-activity(activity.id); } } } }
-                                if root.evidence-open : Rectangle { vertical-stretch: 1; background: ForgeTheme.void; if root.diff-view-open : TextEdit { text: root.diff-view-content; read-only: true; font-family: "monospace"; font-size: 10px; } if !root.diff-view-open && root.diff-rows.length == 0 : EmptyState { title: "No Diff selected"; detail: root.diff-status; } if !root.diff-view-open && root.diff-rows.length > 0 : ListView { for diff[index] in root.diff-rows : FlatRow { title: diff.path; detail: diff.summary; state: diff.kind + " · " + diff.state; selected: diff.id == root.selected-diff-id; activated => { root.selected-goal-id = ""; root.selected-dag-id = ""; root.selected-diff-id = diff.id; root.inspector-tab = 3; root.inspector-kind = "DIFF"; root.inspector-title = diff.path; root.inspector-detail = diff.kind + " · " + diff.state; root.inspector-evidence = diff.summary; root.view-diff(diff.id); } } } }
-                            }
-                        }
-                    }
-                }
-                PaneSplitter { label: "Resize Context Inspector"; enabled: !root.right-rail-collapsed; reverse: true; current-width: root.effective-right-width; requested(width) => { root.right-rail-width = max(root.right-minimum, min(root.right-maximum, width)); } }
-                Rectangle {
-                    width: root.effective-right-width; background: ForgeTheme.rail; border-color: ForgeTheme.separator; border-width: 1px;
-                    accessible-role: complementary;
-                    accessible-label: "Selection Context Inspector and Safety";
-                    if root.right-rail-collapsed : VerticalBox { spacing: 8px; PaneChevron { points-right: false; accessible-name: "Open Context Inspector"; activated => { root.right-rail-collapsed = false; } } Text { text: "INFO"; color: ForgeTheme.text-secondary; font-size: 10px; font-weight: 700; horizontal-alignment: center; } Text { text: root.approval-rows.length + ""; color: root.approval-rows.length > 0 ? ForgeTheme.ember-hot : ForgeTheme.text-muted; font-family: "monospace"; font-size: 11px; horizontal-alignment: center; } }
-                    if !root.right-rail-collapsed : VerticalBox {
-                        spacing: 0px;
-                        HorizontalBox { PaneHeader { horizontal-stretch: 1; label: "CONTEXT INSPECTOR"; detail: root.inspector-kind; } PaneChevron { points-right: true; accessible-name: "Collapse Context Inspector"; activated => { root.right-rail-collapsed = true; } } }
-                        HorizontalBox { spacing: 4px; ForgeButton { label: "Overview"; compact: true; active: root.inspector-tab == 0; activated => { root.inspector-tab = 0; } } ForgeButton { label: "Narrative"; compact: true; active: root.inspector-tab == 1; activated => { root.inspector-tab = 1; } } ForgeButton { label: "Changes"; compact: true; active: root.inspector-tab == 2; activated => { root.inspector-tab = 2; } } ForgeButton { label: "Evidence"; compact: true; active: root.inspector-tab == 3; activated => { root.inspector-tab = 3; } } }
-                        Rectangle {
-                            vertical-stretch: 1; background: ForgeTheme.work; border-color: ForgeTheme.separator; border-width: 1px;
-                            if root.inspector-tab == 0 && root.selected-goal-id == "" && root.selected-dag-id == "" : VerticalBox {
-                                padding: 12px;
-                                spacing: 8px;
-                                Text { text: root.inspector-title; color: ForgeTheme.text; font-size: 15px; font-weight: 700; wrap: word-wrap; }
-                                Text { text: root.inspector-detail; color: ForgeTheme.text-secondary; font-size: 11px; wrap: word-wrap; }
-                                Rectangle { height: 1px; background: ForgeTheme.separator; }
-                                Text { text: "OBSERVABLE EVIDENCE"; color: ForgeTheme.text-muted; font-size: 10px; font-weight: 700; letter-spacing: 1px; }
-                                Text { text: root.inspector-evidence; color: ForgeTheme.text-secondary; font-size: 10px; wrap: word-wrap; }
-                                SettingsRow { title: "Workspace"; detail: root.selected-workspace-root == "" ? "No committed scope" : root.selected-workspace-root; value: root.selected-workspace-revision == "" ? "UNBOUND" : "REV " + root.selected-workspace-revision; unavailable: root.selected-workspace-id == ""; }
-                                SettingsRow { title: "Doctor"; detail: root.doctor-summary == "" ? "Read-only health projection is not loaded." : root.doctor-summary; value: root.doctor-status; unavailable: root.selected-workspace-id == ""; }
-                                ForgeButton { label: "Open diagnostics"; compact: true; enabled: root.selected-workspace-id != ""; activated => { root.inspector-tab = 5; } }
-                                SettingsRow { title: "Runtime"; detail: root.runtime-detail; value: "INTERACTIVE · " + root.runtime-status + " · " + root.uptime-seconds + "s"; }
-                                SettingsRow { title: "Activities"; detail: "Live / History"; value: root.activity-live-rows.length + " / " + root.activity-history-rows.length; }
-                                Rectangle { vertical-stretch: 1; }
-                                EmptyState {
-                                    height: 120px;
-                                    title: "No work object selected";
-                                    detail: "Select a work object to inspect observable evidence.";
-                                }
-                            }
-                            if root.inspector-tab == 0 && root.selected-dag-id != "" : VerticalBox {
-                                padding: 12px;
-                                spacing: 8px;
-                                HorizontalBox {
-                                    spacing: 8px;
-                                    Text {
-                                        text: root.selected-dag-label;
-                                        accessible-label: "Selected DAG node " + root.selected-dag-label;
-                                        color: ForgeTheme.text;
-                                        font-size: 15px;
-                                        font-weight: 700;
-                                        wrap: word-wrap;
-                                        horizontal-stretch: 1;
-                                    }
-                                    Text {
-                                        text: (root.selected-dag-current ? "CURRENT · " : "") + root.selected-dag-state;
-                                        color: root.selected-dag-state == "COMPLETED" || root.selected-dag-state == "READY" ? ForgeTheme.success : root.selected-dag-state == "FAILED" || root.selected-dag-state == "CANCELLED" ? ForgeTheme.danger : root.selected-dag-current ? ForgeTheme.ember-hot : ForgeTheme.text-secondary;
-                                        font-size: 10px;
-                                        font-weight: 700;
-                                    }
-                                }
-                                Text {
-                                    text: "Node " + root.selected-dag-id + " · DAG " + root.dag-revision + " · node revision " + root.selected-dag-revision;
-                                    color: ForgeTheme.text-muted;
-                                    font-family: "monospace";
-                                    font-size: 10px;
-                                    overflow: elide;
-                                }
-                                Rectangle { height: 1px; background: ForgeTheme.separator; }
-                                Text { text: "OBJECTIVE"; color: ForgeTheme.text-muted; font-size: 10px; font-weight: 700; letter-spacing: 1px; }
-                                Text { text: root.selected-dag-objective == "" ? "No objective projection" : root.selected-dag-objective; color: root.selected-dag-objective == "" ? ForgeTheme.text-muted : ForgeTheme.text-secondary; font-size: 11px; wrap: word-wrap; }
-                                Text { text: "ACCEPTANCE"; color: ForgeTheme.text-muted; font-size: 10px; font-weight: 700; letter-spacing: 1px; }
-                                Text { text: root.selected-dag-acceptance == "" ? "No acceptance projection" : root.selected-dag-acceptance; color: root.selected-dag-acceptance == "" ? ForgeTheme.text-muted : ForgeTheme.text-secondary; font-size: 10px; wrap: word-wrap; }
-                                SettingsRow { title: "Dependencies"; detail: root.selected-dag-depends-on == "" ? "Root node" : root.selected-dag-depends-on; value: root.selected-dag-depends-on == "" ? "ROOT" : "BOUND"; }
-                                SettingsRow { title: "Waiting on"; detail: root.selected-dag-waiting-on == "" ? "No unresolved dependency" : root.selected-dag-waiting-on; value: root.selected-dag-waiting-on == "" ? "NONE" : "BLOCKED"; unavailable: root.selected-dag-waiting-on != ""; }
-                                Text { text: "LINKED EVIDENCE"; color: ForgeTheme.text-muted; font-size: 10px; font-weight: 700; letter-spacing: 1px; }
-                                Text { text: root.selected-dag-evidence == "" ? "No linked durable evidence" : root.selected-dag-evidence; color: ForgeTheme.text-secondary; font-size: 10px; wrap: word-wrap; }
-                                Rectangle { vertical-stretch: 1; }
-                                Text {
-                                    text: root.selected-dag-terminal ? "Terminal node · historical state is immutable" : "Read-only projection · lifecycle authority remains outside the UI";
-                                    color: root.selected-dag-terminal ? ForgeTheme.text-secondary : ForgeTheme.text-muted;
-                                    font-size: 10px;
-                                }
-                            }
-                            if root.inspector-tab == 0 && root.selected-goal-id != "" && root.selected-dag-id == "" : VerticalBox {
-                                padding: 12px;
-                                spacing: 8px;
-                                HorizontalBox {
-                                    spacing: 8px;
-                                    Text {
-                                        text: root.selected-goal-objective;
-                                        accessible-label: "Selected Goal " + root.selected-goal-objective;
-                                        color: ForgeTheme.text;
-                                        font-size: 15px;
-                                        font-weight: 700;
-                                        wrap: word-wrap;
-                                        horizontal-stretch: 1;
-                                    }
-                                    Text {
-                                        text: root.selected-goal-state;
-                                        color: root.selected-goal-state == "ACTIVE" ? ForgeTheme.success : root.selected-goal-state == "FAILED" || root.selected-goal-state == "CANCELLED" ? ForgeTheme.danger : ForgeTheme.text-secondary;
-                                        font-size: 10px;
-                                        font-weight: 700;
-                                    }
-                                }
-                                Text {
-                                    text: "Goal " + root.selected-goal-id + " · revision " + root.selected-goal-revision;
-                                    color: ForgeTheme.text-muted;
-                                    font-family: "monospace";
-                                    font-size: 10px;
-                                    overflow: elide;
-                                }
-                                Rectangle { height: 1px; background: ForgeTheme.separator; }
-                                Text { text: "SUCCESS CRITERION"; color: ForgeTheme.text-muted; font-size: 10px; font-weight: 700; letter-spacing: 1px; }
-                                Text { text: root.selected-goal-success-criterion; color: ForgeTheme.text-secondary; font-size: 11px; wrap: word-wrap; }
-                                Text { text: "HARD CHECKS"; color: ForgeTheme.text-muted; font-size: 10px; font-weight: 700; letter-spacing: 1px; }
-                                Text { text: root.selected-goal-check-summary; color: root.selected-goal-can-complete ? ForgeTheme.success : ForgeTheme.text-secondary; font-size: 10px; wrap: word-wrap; }
-                                if root.selected-goal-blocker != "" : Rectangle {
-                                    height: 58px;
-                                    background: #1b1212;
-                                    border-color: ForgeTheme.danger;
-                                    border-width: 1px;
-                                    VerticalBox {
-                                        padding: 8px;
-                                        spacing: 3px;
-                                        Text { text: "COMPLETION BLOCKER"; color: ForgeTheme.danger; font-size: 10px; font-weight: 700; letter-spacing: 0.8px; }
-                                        Text { text: root.selected-goal-blocker; color: ForgeTheme.danger; font-size: 10px; wrap: word-wrap; }
-                                    }
-                                }
-                                Text { text: "LINKED EVIDENCE"; color: ForgeTheme.text-muted; font-size: 10px; font-weight: 700; letter-spacing: 1px; }
-                                Text { text: root.selected-goal-evidence-summary == "" ? "No linked durable evidence" : root.selected-goal-evidence-summary; color: ForgeTheme.text-secondary; font-size: 10px; wrap: word-wrap; }
-                                Rectangle { vertical-stretch: 1; }
-                                HorizontalBox {
-                                    spacing: 6px;
-                                    if root.selected-goal-can-pause : ForgeButton {
-                                        label: "Pause";
-                                        accessible-name: "Pause selected Goal";
-                                        compact: true;
-                                        enabled: !root.goal-action-busy;
-                                        activated => { root.pause-goal(root.selected-goal-id, root.selected-goal-revision); }
-                                    }
-                                    if root.selected-goal-can-resume : ForgeButton {
-                                        label: "Resume";
-                                        accessible-name: "Resume selected Goal";
-                                        compact: true;
-                                        enabled: !root.goal-action-busy;
-                                        activated => { root.resume-goal(root.selected-goal-id, root.selected-goal-revision); }
-                                    }
-                                    if !root.selected-goal-terminal : ForgeButton {
-                                        label: "Complete";
-                                        accessible-name: root.selected-goal-can-complete ? "Complete selected Goal" : "Selected Goal cannot complete until hard checks pass";
-                                        compact: true;
-                                        active: root.selected-goal-can-complete;
-                                        enabled: root.selected-goal-can-complete && !root.goal-action-busy;
-                                        activated => { root.complete-goal(root.selected-goal-id, root.selected-goal-revision); }
-                                    }
-                                    Rectangle { horizontal-stretch: 1; }
-                                    if !root.selected-goal-terminal : ForgeButton {
-                                        label: "Cancel Goal";
-                                        accessible-name: "Cancel selected Goal";
-                                        compact: true;
-                                        danger: true;
-                                        enabled: root.selected-goal-can-cancel && !root.goal-action-busy;
-                                        activated => { root.cancel-goal(root.selected-goal-id, root.selected-goal-revision); }
-                                    }
-                                }
-                            }
-                            if root.inspector-tab == 1 : Rectangle { if root.work-narrative-rows.length == 0 : EmptyState { title: "No published work step"; detail: root.work-narrative-status + " Private model reasoning is never displayed."; } if root.work-narrative-rows.length > 0 : ListView { for item[index] in root.work-narrative-rows : FlatRow { title: item.phase + " · " + item.action; detail: item.rationale; state: item.state; activated => { root.inspector-title = item.action; root.inspector-detail = item.rationale; root.inspector-evidence = item.evidence; } } } }
-                            if root.inspector-tab == 2 : VerticalBox { padding: 10px; spacing: 7px; Text { text: "Changes are Activity-scoped and read-only here."; color: ForgeTheme.text-secondary; font-size: 11px; wrap: word-wrap; } if root.diff-rows.length == 0 : EmptyState { title: "No committed changes"; detail: root.diff-status; } if root.diff-rows.length > 0 : ListView { for diff[index] in root.diff-rows : FlatRow { title: diff.path; detail: diff.summary; state: diff.kind + " · " + diff.state; selected: diff.id == root.selected-diff-id; activated => { root.selected-goal-id = ""; root.selected-dag-id = ""; root.selected-diff-id = diff.id; root.inspector-tab = 3; root.inspector-kind = "DIFF"; root.inspector-title = diff.path; root.inspector-detail = diff.kind + " · " + diff.state; root.inspector-evidence = diff.summary; root.view-diff(diff.id); } } } }
-                            if root.inspector-tab == 3 : VerticalBox { padding: 10px; spacing: 7px; if root.diff-view-open : TextEdit { text: root.diff-view-content; read-only: true; font-family: "monospace"; font-size: 10px; vertical-stretch: 1; } if !root.diff-view-open : EmptyState { title: "Evidence remains read-only"; detail: root.inspector-evidence; } if root.diff-view-open : ForgeButton { label: "Close Diff"; activated => { root.close-diff-view(); } } }
-                            if root.inspector-tab == 5 : VerticalBox {
-                                padding: 10px;
-                                spacing: 7px;
-                                HorizontalBox {
-                                    spacing: 6px;
-                                    Text { text: "WORKSPACE DOCTOR"; color: ForgeTheme.text; font-size: 12px; font-weight: 700; horizontal-stretch: 1; vertical-alignment: center; }
-                                    ForgeButton { label: "Refresh"; compact: true; enabled: root.selected-workspace-id != "" && !root.doctor-action-busy; activated => { root.refresh-doctor(); } }
-                                    ForgeButton { label: root.doctor-export-busy ? "Exporting…" : "Export"; compact: true; enabled: root.selected-workspace-id != "" && root.doctor-export-content != "" && !root.doctor-export-busy; activated => { root.export-doctor-diagnostics(); } }
-                                }
-                                SettingsRow { title: "Outcome"; detail: root.doctor-summary == "" ? "No bounded observation loaded." : root.doctor-summary; value: root.doctor-status; unavailable: root.selected-workspace-id == ""; }
-                                SettingsRow { title: "Diagnostics export"; detail: "Explicit bounded text export to product-owned Application Support diagnostics."; value: root.doctor-diagnostics-status; unavailable: root.doctor-export-content == ""; }
-                                if root.selected-workspace-id == "" : EmptyState { title: "No Workspace selected"; detail: "Doctor only observes the exact committed Workspace scope."; }
-                                if root.selected-workspace-id != "" && root.doctor-finding-rows.length == 0 : EmptyState { title: root.doctor-action-busy ? "Observing Workspace…" : "No actionable finding"; detail: root.doctor-action-busy ? "SQLite, Git, Diff, checkpoint, and DAG evidence are being observed through the bounded control worker." : root.doctor-summary; }
-                                if root.doctor-finding-rows.length > 0 : ListView {
-                                    vertical-stretch: 1;
-                                    for finding[index] in root.doctor-finding-rows : FlatRow { title: finding.area; detail: finding.detail; state: finding.status; }
-                                }
-                                Text { text: root.doctor-truncated ? "COPYABLE DIAGNOSTICS · UI/export bound reached" : "COPYABLE DIAGNOSTICS · bounded read-only projection"; color: root.doctor-truncated ? ForgeTheme.ember-hot : ForgeTheme.text-muted; font-size: 9px; font-weight: 700; }
-                                TextEdit { text: root.doctor-export-content; read-only: true; height: 160px; font-family: "monospace"; font-size: 9px; }
-                            }
-                            if root.inspector-tab == 4 : VerticalBox { padding: 10px; spacing: 7px; SettingsRow { title: "Harness / authority"; detail: root.harness-status; value: "READ ONLY · " + root.applied-harness-name; unavailable: root.harness-rows.length == 0; } SettingsRow { title: "Pending approvals"; detail: root.approval-status; value: root.approval-rows.length + ""; } HorizontalBox { spacing: 6px; ForgeButton { label: root.auto-approval-enabled ? "Auto on" : "Auto off"; active: root.auto-approval-enabled; enabled: !root.approval-action-busy; activated => { root.set-auto-approval(!root.auto-approval-enabled); } } ForgeButton { label: "Refresh"; compact: true; enabled: !root.approval-action-busy; activated => { root.refresh-approvals(); } } } if root.approval-rows.length == 0 : EmptyState { title: "No pending approval"; detail: "Direct and shell effects remain ASK by default."; } if root.approval-rows.length > 0 : ListView { for approval[index] in root.approval-rows : FlatRow { title: approval.action; detail: approval.scope + " · expires " + approval.expires-at; state: "PENDING"; activated => { root.inspector-title = approval.action; root.inspector-detail = approval.scope; root.inspector-evidence = "Pending until " + approval.expires-at; } } } HorizontalBox { spacing: 6px; ForgeButton { label: "Stop Workspace"; danger: true; enabled: root.selected-workspace-id != ""; activated => { root.stop-workspace-work(); } } ForgeButton { label: "Emergency Stop"; danger: true; enabled: root.runtime-status != "Stopped"; activated => { root.emergency-stop(); } } } }
-                        }
-                        Rectangle { height: 52px; background: ForgeTheme.chrome; border-color: ForgeTheme.separator; border-width: 1px; HorizontalBox { padding-left: 10px; padding-right: 8px; spacing: 8px; Text { text: "SAFETY"; color: ForgeTheme.text-secondary; font-size: 11px; font-weight: 700; vertical-alignment: center; } Text { text: root.approval-rows.length + " pending · effects ASK by default"; color: root.approval-rows.length > 0 ? ForgeTheme.ember-hot : ForgeTheme.text-muted; font-family: "monospace"; font-size: 10px; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; } ForgeButton { label: root.inspector-tab == 4 ? "Overview" : "Open"; accessible-name: root.inspector-tab == 4 ? "Return to Inspector overview" : "Open Execution and Safety"; compact: true; active: root.inspector-tab == 4; activated => { if root.inspector-tab == 4 { root.inspector-tab = 0; } else { root.inspector-tab = 4; } } } } }
-                    }
-                }
-            }
-        }
-
-        Rectangle { x: 0px; y: root.height - 28px; width: 100%; height: 28px; background: ForgeTheme.chrome; border-color: ForgeTheme.separator; border-width: 1px; accessible-role: content-info; accessible-label: "Workspace Harness Runtime and Approval status"; HorizontalBox { padding-left: 10px; padding-right: 10px; spacing: 10px; Text { text: root.selected-workspace-id == "" ? "NO WORKSPACE" : root.selected-workspace-root; color: ForgeTheme.text-muted; font-family: "monospace"; font-size: 10px; overflow: elide; horizontal-stretch: 1; vertical-alignment: center; } Text { text: "HARNESS " + root.applied-harness-name; color: root.harness-rows.length == 0 ? #d99a60 : ForgeTheme.text-secondary; font-size: 10px; vertical-alignment: center; } Text { text: "RUNTIME " + root.runtime-status + " · GEN " + root.runtime-generation; color: root.runtime-status == "Running" ? ForgeTheme.success : ForgeTheme.text-secondary; font-family: "monospace"; font-size: 10px; vertical-alignment: center; } Text { text: "APPROVALS " + root.approval-rows.length; color: root.approval-rows.length > 0 ? ForgeTheme.ember-hot : ForgeTheme.text-muted; font-family: "monospace"; font-size: 10px; vertical-alignment: center; } } }
     }
 }
 

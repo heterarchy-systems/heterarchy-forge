@@ -7,6 +7,7 @@
 
 #![deny(unsafe_code)]
 
+mod agent;
 mod approval;
 mod approval_coordinator;
 mod checkpoint;
@@ -18,13 +19,19 @@ mod execution;
 mod execution_coordinator;
 mod filesystem;
 mod goal;
+mod grant;
 mod harness;
 mod harness_verifier_coordinator;
+mod mcp_token;
 mod recovery;
 mod retention;
 mod service;
 mod worker;
 
+pub use agent::{
+    AgentAttachRequest, AgentContextRequest, AgentDetachRequest, AgentFocusRequest,
+    AgentListRequest, AgentWorkUpdateRequest, MAX_AGENT_PROJECTION_RESULTS,
+};
 pub use approval::{
     ApprovalActivityScope, ApprovalCancelActivityRequest, ApprovalCancelWorkspaceRequest,
     ApprovalCreateRequest, ApprovalDecisionRequest, ApprovalGrantConsumeRequest,
@@ -64,13 +71,27 @@ pub use filesystem::{
 pub use goal::{
     GoalCompletionRequest, GoalLifecycleAction, GoalLifecycleRequest, MAX_GOAL_EVIDENCE_RESULTS,
 };
+pub use grant::{
+    AgentDagGrantDiscoverRequest, AgentDagGrantGetRequest, AgentDagGrantIssueRequest,
+    AgentDagGrantRevokeRequest, AgentDagReplanCommitRequest,
+};
 pub use harness::{
-    HarnessApplyRequest, HarnessLibrary, HarnessLibraryError, HarnessPreviewRequest,
+    HarnessApplyRequest, HarnessCompositionRequest, HarnessCompositionRequestError,
+    HarnessCompositionSkillSelection, HarnessLibrary, HarnessLibraryError,
+    HarnessLifecycleApplyRequest, HarnessLifecyclePreviewProjection,
+    HarnessLifecyclePreviewRequest, HarnessLifecycleTarget, HarnessPreviewRequest,
     HarnessVerifyRequest,
 };
 pub use harness_verifier_coordinator::{
     ForgeHarnessVerifierCoordinator, ForgeHarnessVerifierCoordinatorClient,
     ForgeHarnessVerifierCoordinatorError, HarnessVerifierRunRequest, PendingHarnessVerifierRun,
+};
+pub use mcp_token::{
+    MAX_MCP_TOKEN_BEARER_BYTES, MAX_MCP_TOKEN_LIST_RESULTS, MCP_TOKEN_QUEUE_CAPACITY,
+    MCP_TOKEN_REVEAL_BYTES, MCP_TOKEN_REVEAL_CHARS, McpTokenAuthorization, McpTokenCatalog,
+    McpTokenClient, McpTokenClientError, McpTokenIssueRequest, McpTokenIssueRequestError,
+    McpTokenIssued, McpTokenMetadata, McpTokenRequest, McpTokenReveal, McpTokenRotation,
+    McpTokenService, McpTokenServiceError, McpTokenWorker, McpTokenWorkerError, PendingMcpToken,
 };
 pub use recovery::{
     RecoveryLeaseAcquisition, RecoveryLeaseClaimOperation, RecoveryMaintenanceOutcome,

@@ -2,6 +2,11 @@
 
 mod global_registry;
 mod harness_catalog;
+mod harness_skill_catalog;
+mod mcp_connection_settings_catalog;
+mod mcp_token_catalog;
+mod workspace_agent_dag;
+mod workspace_agents;
 mod workspace_approvals;
 mod workspace_changesets;
 mod workspace_checkpoints;
@@ -19,6 +24,14 @@ pub use harness_catalog::{
     HARNESS_CATALOG_APPLICATION_ID, HARNESS_CATALOG_SCHEMA_VERSION, HarnessCatalog,
     HarnessCatalogEntry, HarnessCatalogError, MAX_HARNESS_CATALOG_RESULTS,
 };
+pub use harness_skill_catalog::HarnessSkillCatalogEntry;
+pub use mcp_connection_settings_catalog::{
+    MCP_CONNECTION_SETTINGS_APPLICATION_ID, MCP_CONNECTION_SETTINGS_SCHEMA_VERSION,
+    McpConnectionSettingsCatalog, McpConnectionSettingsCatalogError,
+};
+pub use mcp_token_catalog::{MAX_MCP_TOKEN_CATALOG_RESULTS, McpTokenCatalog, McpTokenCatalogError};
+pub use workspace_agent_dag::{AgentDagReplanCommitResult, AgentDagStoreError};
+pub use workspace_agents::AgentStoreError;
 pub use workspace_approvals::{
     ApprovalAuthorityCleanupReport, ApprovalStoreError, AutoApprovalExecutionRecord,
 };

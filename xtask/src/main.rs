@@ -3,6 +3,8 @@
 //! This active Rust workspace uses `xtask` for rules, locked metadata,
 //! formatting, build/test/Clippy, dependency, and doctor gates.
 
+mod package;
+
 use std::env;
 use std::ffi::OsStr;
 use std::fmt;
@@ -110,9 +112,10 @@ fn run() -> Result<(), String> {
         "perf" => perf(),
         "msrv" => msrv(),
         "persistence" => persistence(),
+        "package" => package::run(&workspace_root()),
         "help" | "--help" | "-h" => {
             println!(
-                "usage: cargo xtask <rules|fmt|check|test|ci|doctor|deps|supply-chain|extended|perf|msrv|persistence>"
+                "usage: cargo xtask <rules|fmt|check|test|ci|doctor|deps|supply-chain|extended|perf|msrv|persistence|package>"
             );
             Ok(())
         }

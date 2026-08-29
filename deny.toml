@@ -68,15 +68,17 @@ skip = []
 skip-tree = []
 
 [[bans.features]]
+# Server-only RMCP policy. Streamable HTTP and its internal base64 support are
+# reviewed for the explicit loopback bearer-authenticated transport. Client,
+# OAuth-client credential storage, macros, and child-process transports remain
+# outside the product boundary.
 crate = "rmcp@3.1.4"
 deny = [
     "auth",
-    "base64",
     "client",
     "macros",
     "transport-child-process",
     "transport-streamable-http-client",
-    "transport-streamable-http-server",
 ]
 
 [[bans.features]]

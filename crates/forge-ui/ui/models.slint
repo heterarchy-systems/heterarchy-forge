@@ -11,6 +11,27 @@ export struct WorkspaceRow {
     kind: string,
     relative-display: string,
     signals: string,
+    readiness-status: string,
+    harness-status: string,
+}
+
+export struct McpTokenRow {
+    label: string,
+    detail: string,
+    state: string,
+}
+
+export struct AgentRow {
+    id: string,
+    display-name: string,
+    role: string,
+    state: string,
+    liveness: string,
+    current-goal: string,
+    current-node: string,
+    public-summary: string,
+    evidence: string,
+    last-observed: string,
 }
 
 export struct ActivityRow {
@@ -62,6 +83,7 @@ export struct DagNodeRow {
     id: string,
     label: string,
     state: string,
+    state-label: string,
     objective: string,
     acceptance: string,
     depends-on: string,
@@ -72,6 +94,16 @@ export struct DagNodeRow {
     terminal: bool,
     column: int,
     lane: int,
+    // Transition coordinates are supplied by the validated desktop
+    // projection. They are not durable DAG coordinates or authoring input.
+    old-column: float,
+    old-lane: float,
+    transition-kind: string,
+    transition-epoch: int,
+    transition-progress: float,
+    transition-delay-ms: int,
+    transition-entering: bool,
+    transition-exiting: bool,
 }
 
 // Exact validated edges from the current durable DAG revision. Coordinates
@@ -87,6 +119,13 @@ export struct DagEdgeRow {
     to-lane: int,
     blocked: bool,
     current-path: bool,
+    // Edges use opacity-only transitions. Their geometry always comes from
+    // the exact current or retained revision; no animated edge light exists.
+    transition-kind: string,
+    transition-epoch: int,
+    transition-progress: float,
+    transition-entering: bool,
+    transition-exiting: bool,
 }
 
 // Operator-safe narrative only; never private chain-of-thought.

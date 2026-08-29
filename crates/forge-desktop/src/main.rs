@@ -15,6 +15,7 @@ use forge_control::{
     PendingApprovalProjection, PendingControl, ResolvedWorkspaceScope, WorkspaceActivityProjection,
     WorkspaceActivityProjectionRequest, WorkspaceLocator,
 };
+use forge_control::{ForgeHarnessVerifierCoordinator, ForgeHarnessVerifierCoordinatorError};
 use forge_domain::{
     ActivityId, ActivityListLimit, ActivityState, ApprovalRequestId, DiffArtifactHealth,
     DiffChangeKind, DiffEvidenceState, DiffId, DiffListLimit, DiffRenderKind, LocationId,
@@ -47,6 +48,9 @@ use thiserror::Error;
 use tracing::{error, info};
 use uuid::Uuid;
 
+mod agent_ui;
+mod connection_ui;
+mod connection_worker;
 mod dag_ui;
 mod doctor_ui;
 mod goal_ui;
@@ -54,7 +58,10 @@ mod harness_ui;
 mod harness_worker;
 pub mod location_worker;
 
-use dag_ui::{UiDagIntent, bind_dag_actions, start_dag_pump};
+use agent_ui::{UiAgentIntent, bind_agent_actions, start_agent_pump};
+use connection_ui::{UiConnectionIntent, bind_connection_actions, start_connection_pump};
+use connection_worker::{ConnectionWorkerError, McpConnectionClient, McpConnectionWorker};
+use dag_ui::{DagPumpTimers, UiDagIntent, bind_dag_actions, start_dag_pump};
 use doctor_ui::{UiDoctorIntent, bind_doctor_actions, reset_doctor_projection, start_doctor_pump};
 use goal_ui::{UiGoalIntent, bind_goal_actions, start_goal_pump};
 use harness_ui::{UiHarnessIntent, bind_harness_actions, start_harness_pump};
@@ -252,6 +259,7 @@ struct DesktopPumpServices {
     activity: ForgeControlClient,
     approval: ForgeApprovalCoordinatorClient,
     harness: HarnessLibraryClient,
+    connection: McpConnectionClient,
     diagnostics_dir: PathBuf,
 }
 
@@ -264,12 +272,16 @@ struct UiChannelBundle {
     dag_intents: Receiver<UiDagIntent>,
     doctor_intents: Receiver<UiDoctorIntent>,
     harness_intents: Receiver<UiHarnessIntent>,
+    connection_intents: Receiver<UiConnectionIntent>,
+    agent_intents: Receiver<UiAgentIntent>,
     location_busy: Rc<Cell<bool>>,
     activity_busy: Rc<Cell<bool>>,
     approval_busy: Rc<Cell<bool>>,
     goal_busy: Rc<Cell<bool>>,
     dag_busy: Rc<Cell<bool>>,
     harness_busy: Rc<Cell<bool>>,
+    connection_busy: Rc<Cell<bool>>,
+    agent_busy: Rc<Cell<bool>>,
 }
 
 struct DesktopPumps {
@@ -277,14 +289,17 @@ struct DesktopPumps {
     location: Rc<Timer>,
     activity: Rc<Timer>,
     goal: Rc<Timer>,
-    dag: Rc<Timer>,
+    dag: DagPumpTimers,
     doctor: Rc<Timer>,
     approval: Rc<Timer>,
     harness: Rc<Timer>,
+    connection: Rc<Timer>,
+    agent: Rc<Timer>,
+    harness_verifier: ForgeHarnessVerifierCoordinator,
 }
 
 impl DesktopPumps {
-    fn stop(self) {
+    fn stop(self) -> Result<(), ForgeHarnessVerifierCoordinatorError> {
         let Self {
             projection,
             location,
@@ -294,16 +309,22 @@ impl DesktopPumps {
             doctor,
             approval,
             harness,
+            connection,
+            agent,
+            mut harness_verifier,
         } = self;
         drop((
-            projection, location, activity, goal, dag, doctor, approval, harness,
+            projection, location, activity, goal, dag, doctor, approval, harness, connection, agent,
         ));
+        harness_verifier.shutdown()?;
+        Ok(())
     }
 }
 
 #[derive(Debug)]
 enum UiLocationIntent {
     Register(LocationAction),
+    RegisterAndDiscover(LocationAction),
     Refresh,
     Discover {
         id: LocationId,
@@ -317,8 +338,17 @@ enum PendingLocationAction {
     StartupList,
     RefreshList,
     Register,
+    RegisterAndDiscover,
     PostRegisterList,
+    PostRegisterListAndDiscover {
+        id: LocationId,
+        expected_revision: LocationRevision,
+    },
     Discover {
+        id: LocationId,
+        expected_revision: LocationRevision,
+    },
+    DiscoverAndSelect {
         id: LocationId,
         expected_revision: LocationRevision,
     },
@@ -370,6 +400,8 @@ struct LocationUiSinks {
     dag: SyncSender<UiDagIntent>,
     doctor: SyncSender<UiDoctorIntent>,
     harness: SyncSender<UiHarnessIntent>,
+    connection: SyncSender<UiConnectionIntent>,
+    agent: SyncSender<UiAgentIntent>,
 }
 
 /// Immutable candidate identity captured from one Location discovery.
@@ -447,6 +479,8 @@ struct LocationUiController {
     dag_intents: SyncSender<UiDagIntent>,
     doctor_intents: SyncSender<UiDoctorIntent>,
     harness_intents: SyncSender<UiHarnessIntent>,
+    connection_intents: SyncSender<UiConnectionIntent>,
+    agent_intents: SyncSender<UiAgentIntent>,
     busy: Rc<Cell<bool>>,
     pending: Option<PendingRequest>,
     pending_action: Option<PendingLocationAction>,
@@ -468,6 +502,8 @@ impl LocationUiController {
             dag: dag_intents,
             doctor: doctor_intents,
             harness: harness_intents,
+            connection: connection_intents,
+            agent: agent_intents,
         } = sinks;
         Self {
             app,
@@ -479,6 +515,8 @@ impl LocationUiController {
             dag_intents,
             doctor_intents,
             harness_intents,
+            connection_intents,
+            agent_intents,
             busy,
             pending: None,
             pending_action: None,
@@ -525,6 +563,9 @@ impl LocationUiController {
             UiLocationIntent::Register(action) => {
                 self.begin(PendingLocationAction::Register, action);
             }
+            UiLocationIntent::RegisterAndDiscover(action) => {
+                self.begin(PendingLocationAction::RegisterAndDiscover, action);
+            }
             UiLocationIntent::Refresh => {
                 self.app.set_location_status("Refreshing locations…".into());
                 self.begin(
@@ -538,7 +579,7 @@ impl LocationUiController {
             } => {
                 self.clear_workspace("Discovering Workspace candidates…");
                 self.begin(
-                    PendingLocationAction::Discover {
+                    PendingLocationAction::DiscoverAndSelect {
                         id,
                         expected_revision,
                     },
@@ -573,6 +614,9 @@ impl LocationUiController {
         }
     }
 
+    // Location admission, durable commit confirmation, and direct-picker
+    // follow-up remain one exhaustive state transition reducer.
+    #[allow(clippy::too_many_lines)]
     fn handle_reply(
         &mut self,
         action: Option<PendingLocationAction>,
@@ -607,11 +651,44 @@ impl LocationUiController {
                     );
                 }
             }
+            (
+                PendingLocationAction::PostRegisterListAndDiscover {
+                    id,
+                    expected_revision,
+                },
+                Ok(LocationOutcome::Locations(locations)),
+            ) => {
+                self.apply_locations(&locations);
+                self.clear_workspace("선택한 폴더에서 Workspace를 찾는 중…");
+                self.app
+                    .set_location_status("폴더 등록됨 · Workspace 검색 중…".into());
+                self.begin(
+                    PendingLocationAction::Discover {
+                        id,
+                        expected_revision,
+                    },
+                    LocationAction::discover(id, expected_revision),
+                );
+            }
             (PendingLocationAction::Register, Ok(LocationOutcome::Registered(_))) => {
                 self.app
                     .set_location_status("Location registered; refreshing…".into());
                 self.begin(
                     PendingLocationAction::PostRegisterList,
+                    LocationAction::list_default(),
+                );
+            }
+            (
+                PendingLocationAction::RegisterAndDiscover,
+                Ok(LocationOutcome::Registered(location)),
+            ) => {
+                self.app
+                    .set_location_status("폴더 등록됨 · 목록을 갱신하는 중…".into());
+                self.begin(
+                    PendingLocationAction::PostRegisterListAndDiscover {
+                        id: location.id(),
+                        expected_revision: location.revision(),
+                    },
                     LocationAction::list_default(),
                 );
             }
@@ -636,6 +713,29 @@ impl LocationUiController {
                     )
                     .into(),
                 );
+            }
+            (
+                PendingLocationAction::DiscoverAndSelect {
+                    id,
+                    expected_revision,
+                },
+                Ok(LocationOutcome::Discovered(discovery)),
+            ) => {
+                self.apply_workspace_candidates(&discovery, id, expected_revision);
+                if discovery.candidates().len() == 1 {
+                    self.app
+                        .set_workspace_status("Workspace를 준비하는 중…".into());
+                    self.select_workspace(0);
+                } else {
+                    self.finish_busy();
+                    self.app.set_workspace_status(
+                        format!(
+                            "{}개의 Workspace 후보가 있습니다. 사용할 폴더를 선택하세요.",
+                            discovery.candidates().len()
+                        )
+                        .into(),
+                    );
+                }
             }
             (
                 PendingLocationAction::SelectWorkspace { index },
@@ -663,8 +763,11 @@ impl LocationUiController {
                 );
             }
             (_, Err(error)) => {
-                if matches!(action, PendingLocationAction::Discover { .. })
-                    && is_revision_conflict(&error)
+                if matches!(
+                    action,
+                    PendingLocationAction::Discover { .. }
+                        | PendingLocationAction::DiscoverAndSelect { .. }
+                ) && is_revision_conflict(&error)
                 {
                     self.set_location_error_for_worker(&error);
                     self.begin(
@@ -711,6 +814,9 @@ impl LocationUiController {
         self.app.set_workspace_status(status.into());
     }
 
+    // Every bounded projection owner must receive the same exact Workspace
+    // correlation snapshot or be cleared in this single fan-out boundary.
+    #[allow(clippy::too_many_lines)]
     fn notify_workspace_scope(&self, scope: Option<ActivityWorkspaceScope>) {
         let harness_scope = scope.as_ref().map(|scope| {
             ResolvedWorkspaceScope::from_observation(
@@ -719,6 +825,8 @@ impl LocationUiController {
                 scope.locator.clone(),
             )
         });
+        let connection_scope = scope.clone();
+        let agent_scope = scope.clone();
         let approval_scope = scope.clone();
         let goal_scope = scope.clone();
         let dag_scope = scope.clone();
@@ -777,6 +885,7 @@ impl LocationUiController {
             self.app.set_dag_column_count(0);
             self.app.set_dag_lane_count(0);
             self.app.set_dag_revision("".into());
+            self.app.set_dag_head_revision("".into());
             self.app.set_dag_status(
                 "ERROR [DAG_SCOPE_QUEUE] DAG scope update was not admitted.".into(),
             );
@@ -800,6 +909,26 @@ impl LocationUiController {
             error!("Harness projection scope queue is full or closed");
             self.app.set_harness_status(
                 "ERROR [HARNESS_SCOPE_QUEUE] Harness scope update was not admitted.".into(),
+            );
+        }
+        if self
+            .connection_intents
+            .try_send(UiConnectionIntent::WorkspaceSelected(connection_scope))
+            .is_err()
+        {
+            error!("MCP Connection scope queue is full or closed");
+            self.app.set_mcp_connection_status(
+                "오류 [MCP_SCOPE_QUEUE] Workspace 범위 갱신을 처리하지 못했습니다.".into(),
+            );
+        }
+        if self
+            .agent_intents
+            .try_send(UiAgentIntent::WorkspaceSelected(agent_scope))
+            .is_err()
+        {
+            error!("Agent projection scope queue is full or closed");
+            self.app.set_inspector_detail(
+                "오류 [AGENT_SCOPE_QUEUE] Agent 범위 갱신을 처리하지 못했습니다.".into(),
             );
         }
     }
@@ -1901,6 +2030,24 @@ fn location_rows(locations: &[forge_domain::RegisteredLocation]) -> Vec<Location
     locations.iter().take(100).map(location_row).collect()
 }
 
+fn workspace_harness_status(root: &Path) -> SharedString {
+    match forge_workspace::inspect_workspace_harness_directories(root) {
+        Ok(observation) if observation.is_empty() => "Harness 미감지".into(),
+        Ok(observation) => {
+            let first = observation.names()[0].to_string_lossy();
+            if observation.names().len() == 1 {
+                format!("{first} 감지").into()
+            } else {
+                format!("{first} +{} 감지", observation.names().len() - 1).into()
+            }
+        }
+        Err(error) => {
+            error!(?error, "Workspace Harness status inspection failed");
+            "Harness 확인 실패".into()
+        }
+    }
+}
+
 fn workspace_row(candidate: &forge_workspace::WorkspaceCandidate) -> WorkspaceRow {
     let signals = candidate.signals();
     WorkspaceRow {
@@ -1919,6 +2066,8 @@ fn workspace_row(candidate: &forge_workspace::WorkspaceCandidate) -> WorkspaceRo
             signal_label(signals.forge_state()),
         )
         .into(),
+        readiness_status: "연결 준비됨".into(),
+        harness_status: workspace_harness_status(candidate.absolute_root()),
     }
 }
 
@@ -2124,6 +2273,16 @@ where
     Ok(Some(LocationAction::register(id, name, root, observed_at)))
 }
 
+fn location_name_for_selected_root(
+    root: &Path,
+) -> Result<LocationName, forge_domain::LocationNameError> {
+    let display_name = root.file_name().map_or_else(
+        || "Workspace".to_owned(),
+        |value| value.to_string_lossy().into_owned(),
+    );
+    LocationName::new(display_name)
+}
+
 fn bootstrap_registry(path: impl Into<PathBuf>) -> Result<ApplicationServices, AppError> {
     let registry = GlobalRegistry::open(path)?;
     let registry_health = registry.health()?;
@@ -2140,13 +2299,18 @@ fn run_application(paths: &AppPaths, services: ApplicationServices) -> Result<()
     } = services;
     let mut location_worker = LocationServiceWorker::start(location_service)?;
     let harness_catalog = HarnessCatalog::open(paths.harness_catalog_path())?;
-    let mut harness_worker = HarnessLibraryWorker::start(HarnessLibrary::new(harness_catalog))?;
+    let harness_library = HarnessLibrary::with_saved_harness_bundles_root(
+        harness_catalog,
+        paths.saved_harness_bundles_dir(),
+    );
+    let mut harness_worker = HarnessLibraryWorker::start(harness_library)?;
     // Keep the control plane on its own GlobalRegistry connection and worker.
     // The Location worker remains the sole owner of its application service;
     // Activity projections use the control worker's bounded pending boundary.
     let control_registry = GlobalRegistry::open(registry_path(paths))?;
     let (activity_client, mut activity_worker) =
         ForgeControl::new(control_registry).start_worker()?;
+    let mut connection_worker = McpConnectionWorker::start(paths.clone(), activity_client.clone())?;
     info!("starting Heterarchy Forge desktop application");
 
     let mut execution_coordinator = ForgeExecutionCoordinator::start(activity_client.clone(), 16)?;
@@ -2179,17 +2343,19 @@ fn run_application(paths: &AppPaths, services: ApplicationServices) -> Result<()
             activity: activity_client,
             approval: approval_coordinator.client(),
             harness: harness_worker.client(),
+            connection: connection_worker.client(),
             diagnostics_dir: paths.diagnostics_dir(),
         },
         ui_channels,
-    );
+    )?;
     let run_result = slint::run_event_loop().map_err(AppError::Ui);
 
-    pumps.stop();
+    pumps.stop()?;
     shutdown_application(
         &mut runtime,
         &mut approval_coordinator,
         &mut execution_coordinator,
+        &mut connection_worker,
         &mut activity_worker,
         &mut harness_worker,
         &mut location_worker,
@@ -2209,6 +2375,8 @@ fn setup_ui_channels(
     let (dag_intent_tx, dag_intents) = mpsc::sync_channel(8);
     let (doctor_intent_tx, doctor_intents) = mpsc::sync_channel(4);
     let (harness_intent_tx, harness_intents) = mpsc::sync_channel(4);
+    let (connection_intent_tx, connection_intents) = mpsc::sync_channel(8);
+    let (agent_intent_tx, agent_intents) = mpsc::sync_channel(8);
     let folder_picker_open = Rc::new(Cell::new(false));
     let location_busy = Rc::new(Cell::new(false));
     let activity_busy = Rc::new(Cell::new(false));
@@ -2216,6 +2384,8 @@ fn setup_ui_channels(
     let goal_busy = Rc::new(Cell::new(false));
     let dag_busy = Rc::new(Cell::new(false));
     let harness_busy = Rc::new(Cell::new(false));
+    let connection_busy = Rc::new(Cell::new(false));
+    let agent_busy = Rc::new(Cell::new(false));
 
     bind_location_actions(
         app,
@@ -2228,6 +2398,8 @@ fn setup_ui_channels(
     bind_dag_actions(app, &dag_intent_tx);
     bind_doctor_actions(app, &doctor_intent_tx);
     bind_harness_actions(app, &harness_intent_tx, &harness_busy);
+    bind_connection_actions(app, &connection_intent_tx);
+    bind_agent_actions(app, &agent_intent_tx);
     bind_approval_actions(
         app,
         tray,
@@ -2245,6 +2417,8 @@ fn setup_ui_channels(
             dag: dag_intent_tx,
             doctor: doctor_intent_tx,
             harness: harness_intent_tx,
+            connection: connection_intent_tx,
+            agent: agent_intent_tx,
         },
         activity_intents,
         approval_intents,
@@ -2252,12 +2426,16 @@ fn setup_ui_channels(
         dag_intents,
         doctor_intents,
         harness_intents,
+        connection_intents,
+        agent_intents,
         location_busy,
         activity_busy,
         approval_busy,
         goal_busy,
         dag_busy,
         harness_busy,
+        connection_busy,
+        agent_busy,
     }
 }
 
@@ -2267,12 +2445,13 @@ fn start_desktop_pumps(
     events: RuntimeEventStream,
     services: DesktopPumpServices,
     channels: UiChannelBundle,
-) -> DesktopPumps {
+) -> Result<DesktopPumps, AppError> {
     let DesktopPumpServices {
         location: location_client,
         activity: activity_client,
         approval: approval_client,
         harness: harness_client,
+        connection: connection_client,
         diagnostics_dir,
     } = services;
     let UiChannelBundle {
@@ -2284,15 +2463,21 @@ fn start_desktop_pumps(
         dag_intents,
         doctor_intents,
         harness_intents,
+        connection_intents,
+        agent_intents,
         location_busy,
         activity_busy,
         approval_busy,
         goal_busy,
         dag_busy,
         harness_busy,
+        connection_busy,
+        agent_busy,
     } = channels;
     let dag_intents_for_goal = location_sinks.dag.clone();
-    DesktopPumps {
+    let (harness_verifier_client, harness_verifier) =
+        ForgeHarnessVerifierCoordinator::start(activity_client.clone(), approval_client.clone())?;
+    Ok(DesktopPumps {
         projection: start_projection_pump(app, tray, events),
         location: start_location_pump(
             app,
@@ -2325,23 +2510,35 @@ fn start_desktop_pumps(
         harness: start_harness_pump(
             app,
             harness_client,
-            activity_client,
+            activity_client.clone(),
+            harness_verifier_client,
             harness_intents,
             harness_busy,
         ),
-    }
+        connection: start_connection_pump(
+            app,
+            connection_client,
+            connection_intents,
+            connection_busy,
+        ),
+        agent: start_agent_pump(app, activity_client, agent_intents, agent_busy),
+        harness_verifier,
+    })
 }
 
 fn shutdown_application(
     runtime: &mut RuntimeService,
     approval_coordinator: &mut ForgeApprovalCoordinator,
     execution_coordinator: &mut ForgeExecutionCoordinator,
+    connection_worker: &mut McpConnectionWorker,
     activity_worker: &mut ForgeControlWorker,
     harness_worker: &mut HarnessLibraryWorker,
     location_worker: &mut LocationServiceWorker<GlobalRegistry>,
 ) -> Result<(), AppError> {
-    // Runtime stop drains every owned process group first. The execution owner
-    // then joins before the control worker, keeping terminal journaling viable.
+    // Stop remote MCP admission first. Runtime stop then drains owned process
+    // groups, and every effect owner joins before the shared control worker so
+    // lease cleanup and terminal journaling remain available.
+    connection_worker.shutdown()?;
     runtime.shutdown()?;
     let _approval_report = approval_coordinator.shutdown()?;
     let _execution_report = execution_coordinator.shutdown()?;
@@ -2358,9 +2555,68 @@ fn bind_location_actions(
     location_action_busy: &Rc<Cell<bool>>,
 ) {
     bind_add_location(app, intents, folder_picker_open, location_action_busy);
+    bind_open_workspace_folder(app, intents, folder_picker_open, location_action_busy);
     bind_refresh_locations(app, intents, folder_picker_open, location_action_busy);
     bind_discover_location(app, intents, folder_picker_open, location_action_busy);
     bind_select_workspace(app, intents);
+}
+
+fn bind_open_workspace_folder(
+    app: &AppWindow,
+    intents: &SyncSender<UiLocationIntent>,
+    folder_picker_open: &Rc<Cell<bool>>,
+    location_action_busy: &Rc<Cell<bool>>,
+) {
+    let intents = intents.clone();
+    let app_for_callback = app.clone_strong();
+    let picker_open = Rc::clone(folder_picker_open);
+    let busy = Rc::clone(location_action_busy);
+    app.on_open_workspace_folder(move || {
+        if picker_open.get() || busy.get() {
+            return;
+        }
+        picker_open.set(true);
+        app_for_callback.set_folder_picker_open(true);
+        let selection = pick_folder();
+        picker_open.set(false);
+        app_for_callback.set_folder_picker_open(false);
+        let selection = match selection {
+            Ok(FolderSelection::Selected(root)) => root,
+            Ok(FolderSelection::Cancelled) => return,
+            Err(error) => {
+                app_for_callback.set_location_status(folder_picker_error_status(&error).into());
+                return;
+            }
+        };
+        let name = match location_name_for_selected_root(&selection) {
+            Ok(value) => value,
+            Err(error) => {
+                app_for_callback
+                    .set_location_status(format!("오류 [LOCATION_NAME_INVALID] {error}").into());
+                return;
+            }
+        };
+        let action = match prepare_register_action(
+            name,
+            FolderSelection::Selected(selection),
+            observed_timestamp_now,
+            || LocationId::from_uuid(Uuid::now_v7()),
+        ) {
+            Ok(Some(action)) => action,
+            Ok(None) => return,
+            Err(error) => {
+                app_for_callback
+                    .set_location_status(format!("오류 [LOCATION_TIMESTAMP] {error}").into());
+                return;
+            }
+        };
+        enqueue_location_intent(
+            &intents,
+            &app_for_callback,
+            &busy,
+            UiLocationIntent::RegisterAndDiscover(action),
+        );
+    });
 }
 
 fn bind_add_location(
@@ -3066,6 +3322,8 @@ enum AppError {
     #[error(transparent)]
     HarnessWorker(#[from] HarnessWorkerError),
     #[error(transparent)]
+    ConnectionWorker(#[from] ConnectionWorkerError),
+    #[error(transparent)]
     ControlWorker(#[from] forge_control::ControlWorkerError),
     #[error(transparent)]
     Runtime(#[from] RuntimeServiceError),
@@ -3073,6 +3331,8 @@ enum AppError {
     ExecutionCoordinator(#[from] ForgeExecutionCoordinatorError),
     #[error(transparent)]
     ApprovalCoordinator(#[from] ForgeApprovalCoordinatorError),
+    #[error(transparent)]
+    HarnessVerifierCoordinator(#[from] ForgeHarnessVerifierCoordinatorError),
     #[error(transparent)]
     Ui(#[from] slint::PlatformError),
     #[error(transparent)]
@@ -3099,7 +3359,7 @@ enum AppError {
 mod tests {
     use std::cell::Cell;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use forge_control::ForgeControl;
@@ -3126,8 +3386,9 @@ mod tests {
         UiLocationIntent, UiLocationPreparationError, WorkspaceActivityProjectionRequest,
         WorkspaceCandidateSnapshot, activity_rows, activity_workspace_scope, bootstrap_registry,
         diff_row, diff_scope_matches, diff_unavailable_message, format_registry_health,
-        location_rows, parse_discover_target, prepare_register_action, recover_workspace_argument,
-        resolved_activity_scope, run_recovery_entry, try_admit_location_intent, workspace_rows,
+        location_name_for_selected_root, location_rows, parse_discover_target,
+        prepare_register_action, recover_workspace_argument, resolved_activity_scope,
+        run_recovery_entry, try_admit_location_intent, workspace_rows,
     };
 
     #[test]
@@ -3147,23 +3408,100 @@ mod tests {
     }
 
     #[test]
-    fn slint_diff_inspector_is_read_only_and_activity_scoped() {
-        let ui_source = include_str!("../../forge-ui/ui/app-window.slint");
+    fn slint_workspace_folder_add_opens_native_picker_directly() {
+        let app_ui_source = include_str!("../../forge-ui/ui/app-window.slint");
+        let workbench_source = include_str!("../../forge-ui/ui/reference-workbench.slint");
+        let desktop_source = include_str!("main.rs");
+
+        assert!(app_ui_source.contains("callback open-workspace-folder();"));
+        assert!(
+            app_ui_source.contains("open-workspace-folder => { root.open-workspace-folder(); }")
+        );
+        assert!(workbench_source.contains("Text { text: \"폴더 추가\";"));
+        assert!(workbench_source.contains("clicked => { root.open-workspace-folder(); }"));
+        assert!(!workbench_source.contains("clicked => { root.location-editor-open = true; }"));
+        assert!(desktop_source.contains("app.on_open_workspace_folder"));
+        assert!(desktop_source.contains("UiLocationIntent::RegisterAndDiscover(action)"));
+    }
+
+    #[test]
+    fn slint_workspace_card_enters_scoped_workbench_only_after_committed_selection() {
+        let app_ui_source = include_str!("../../forge-ui/ui/app-window.slint");
+        let workbench_source = include_str!("../../forge-ui/ui/reference-workbench.slint");
+        let desktop_source = include_str!("main.rs");
+
+        assert!(app_ui_source.contains("workspace-view-open <=> root.workspace-view-open;"));
+        assert!(workbench_source.contains("in-out property <bool> workspace-view-open: false;"));
+        assert!(workbench_source.contains("root.pending-workspace-index = index;"));
+        assert!(workbench_source.contains("root.select-workspace(index);"));
+        assert!(workbench_source.contains(
+            "index == root.selected-workspace-index && root.selected-workspace-id != \"\""
+        ));
+        assert!(
+            workbench_source
+                .contains("root.selected-workspace-index == root.pending-workspace-index")
+        );
+        assert!(workbench_source.contains("root.workspace-view-open = true;"));
+        assert!(workbench_source.contains("if !root.workspace-view-open : workspace-picker"));
+        assert!(
+            workbench_source.contains(
+                "if root.workspace-view-open && root.active-page == 0 : workspace-overview"
+            )
+        );
+        assert!(workbench_source.contains("label: \"목록\""));
+        assert!(workbench_source.contains("root.workspace-view-open = false;"));
+        assert!(desktop_source.contains("fn apply_workspace_selection"));
+        assert!(desktop_source.contains("set_selected_workspace_index(committed_index)"));
+    }
+
+    #[test]
+    fn slint_workspace_picker_projects_truthful_ready_harness_and_work_status() {
         let model_source = include_str!("../../forge-ui/ui/models.slint");
-        let component_source = include_str!("../../forge-ui/ui/components.slint");
+        let workbench_source = include_str!("../../forge-ui/ui/reference-workbench.slint");
+        let component_source = include_str!("../../forge-ui/ui/reference-components.slint");
+        let desktop_source = include_str!("main.rs");
+        let workspace_source = include_str!("../../forge-workspace/src/harness_presence.rs");
+
+        assert!(model_source.contains("readiness-status: string"));
+        assert!(model_source.contains("harness-status: string"));
+        assert!(component_source.contains("export component ReferenceWorkspacePickerRow"));
+        assert!(component_source.contains("text: root.readiness-status"));
+        assert!(workbench_source.contains("readiness-status: workspace.readiness-status;"));
+        assert!(workbench_source.contains("harness-status: workspace.harness-status;"));
+        assert!(workbench_source.contains("\"Harness 미감지\""));
+        assert!(workbench_source.contains("\"Harness 확인 실패\""));
+        assert!(workbench_source.contains("\"작업 미확인\""));
+        assert!(workbench_source.contains("\"현재 작업 없음\""));
+        assert!(workbench_source.contains("\"개 작업 중\""));
+        assert!(desktop_source.contains("inspect_workspace_harness_directories(root)"));
+        assert!(desktop_source.contains("readiness_status: \"연결 준비됨\".into()"));
+        assert!(desktop_source.contains("workspace_harness_status(candidate.absolute_root())"));
+        assert!(workspace_source.contains("workspace_root.join(\".agents\")"));
+        assert!(workspace_source.contains("MAX_AGENTS_STATUS_SCAN_ENTRIES"));
+        assert!(workspace_source.contains("MAX_WORKSPACE_HARNESS_DIRECTORIES"));
+    }
+
+    #[test]
+    fn slint_diff_inspector_is_read_only_and_activity_scoped() {
+        let app_ui_source = include_str!("../../forge-ui/ui/app-window.slint");
+        let workbench_source = include_str!("../../forge-ui/ui/reference-workbench.slint");
+        let interaction_source = include_str!("../../forge-ui/ui/reference-components.slint");
+        let model_source = include_str!("../../forge-ui/ui/models.slint");
         let desktop_source = include_str!("main.rs");
 
         assert!(model_source.contains("export struct DiffRow"));
-        assert!(ui_source.contains("callback select-activity(string);"));
-        assert!(ui_source.contains("callback view-diff(string);"));
-        assert!(ui_source.contains("read-only: true;"));
-        assert!(ui_source.contains("EVIDENCE / DIFF"));
-        assert!(component_source.contains("accessible-role: list-item;"));
-        assert!(component_source.contains("accessible-action-default"));
-        assert!(component_source.contains("FocusScope"));
-        assert!(ui_source.contains("accessible-label: \"Location name\";"));
-        assert!(ui_source.contains("min-width: 1120px;"));
-        assert!(ui_source.contains("min-height: 720px;"));
+        assert!(app_ui_source.contains("callback select-activity(string);"));
+        assert!(app_ui_source.contains("callback view-diff(string);"));
+        assert!(app_ui_source.contains("callback close-diff-view();"));
+        assert!(workbench_source.contains("read-only: true;"));
+        assert!(workbench_source.contains("EVIDENCE / DIFF"));
+        assert!(workbench_source.contains("root.select-activity(activity.id)"));
+        assert!(workbench_source.contains("root.view-diff(diff.id)"));
+        assert!(interaction_source.contains("accessible-role: list-item;"));
+        assert!(interaction_source.contains("accessible-action-default"));
+        assert!(interaction_source.contains("FocusScope"));
+        assert!(app_ui_source.contains("min-width: 1120px;"));
+        assert!(app_ui_source.contains("min-height: 720px;"));
         assert!(desktop_source.contains("submit_diff_list"));
         assert!(desktop_source.contains("submit_diff_read"));
         assert!(desktop_source.contains("DIFF_SCOPE_STALE"));
@@ -3171,17 +3509,18 @@ mod tests {
 
     #[test]
     fn slint_workspace_doctor_is_bounded_nonblocking_and_explicitly_exported() {
-        let ui_source = include_str!("../../forge-ui/ui/app-window.slint");
+        let app_ui_source = include_str!("../../forge-ui/ui/app-window.slint");
+        let workbench_source = include_str!("../../forge-ui/ui/reference-workbench.slint");
         let model_source = include_str!("../../forge-ui/ui/models.slint");
         let doctor_source = include_str!("doctor_ui.rs");
 
         assert!(model_source.contains("export struct DoctorFindingRow"));
-        assert!(ui_source.contains("callback refresh-doctor();"));
-        assert!(ui_source.contains("callback export-doctor-diagnostics();"));
-        assert!(ui_source.contains("WORKSPACE DOCTOR"));
-        assert!(ui_source.contains("doctor-export-content"));
-        assert!(ui_source.contains("read-only: true;"));
-        assert!(ui_source.contains("Explicit bounded text export"));
+        assert!(app_ui_source.contains("callback refresh-doctor();"));
+        assert!(app_ui_source.contains("callback export-doctor-diagnostics();"));
+        assert!(workbench_source.contains("title: \"Workspace Doctor\""));
+        assert!(workbench_source.contains("doctor-export-content"));
+        assert!(workbench_source.contains("read-only: true;"));
+        assert!(workbench_source.contains("COPYABLE DIAGNOSTICS · bounded read-only projection"));
         assert!(doctor_source.contains("submit_workspace_doctor"));
         assert!(doctor_source.contains("PendingControl<WorkspaceDoctorResult>"));
         assert!(doctor_source.contains("MAX_DOCTOR_UI_FINDINGS: usize = 64"));
@@ -3221,31 +3560,25 @@ mod tests {
         assert!(model_source.contains("from-column: int"));
         assert!(model_source.contains("current-path: bool"));
         assert!(model_source.contains("export struct WorkNarrativeRow"));
-        assert!(ui_source.contains("DEPENDENCY GRAPH"));
-        assert!(ui_source.contains("No published work step"));
+        assert!(ui_source.contains("DAG 계획"));
+        assert!(ui_source.contains("공개된 작업 내역이 없습니다"));
         assert!(ui_source.contains("Private model reasoning is never displayed."));
-        assert!(ui_source.contains("No durable Goal"));
+        assert!(ui_source.contains("Goal이 없습니다"));
         assert!(ui_source.contains("callback create-goal(string, string);"));
         assert!(ui_source.contains("callback complete-goal(string, string);"));
-        assert!(ui_source.contains("No Chat-authored DAG"));
+        assert!(ui_source.contains("게시된 DAG가 없습니다"));
         assert!(ui_source.contains("callback select-dag-node(string);"));
-        assert!(ui_source.contains("Read-only dependency graph revision"));
+        assert!(ui_source.contains("읽기 전용 · Revision"));
         assert!(ui_source.contains("goal-rows: [];"));
         assert!(ui_source.contains("dag-node-rows: [];"));
         assert!(ui_source.contains("work-narrative-rows: [];"));
-        assert!(component_source.contains("component PaneSplitter inherits TouchArea"));
-        assert!(component_source.contains("mouse-cursor: ew-resize;"));
-        assert!(component_source.contains("drag-start-width"));
         assert!(component_source.contains("component DagEdgeConnector"));
-        assert!(component_source.contains("component PaneChevron"));
-        assert!(component_source.contains("Key.LeftArrow"));
-        assert!(ui_source.contains("label: \"UPTIME\""));
-        assert!(ui_source.contains("CONTEXT INSPECTOR"));
-        assert!(ui_source.contains("label: \"SETTINGS\""));
-        assert!(ui_source.contains("Locations / Workspaces"));
-        assert!(ui_source.contains("session-local"));
-        assert!(ui_source.contains("root.width >= 1600px"));
-        assert!(ui_source.contains("No Workspace selected"));
+        assert!(ui_source.contains("ReferenceNavItem"));
+        assert!(ui_source.contains("label: \"워크스페이스\""));
+        assert!(ui_source.contains("label: \"에이전트\""));
+        assert!(ui_source.contains("label: \"하네스\""));
+        assert!(ui_source.contains("label: \"설정\""));
+        assert!(ui_source.contains("Workspace를 선택하세요"));
     }
 
     fn assert_slint_responsive_accessibility_contract(ui_source: &str, theme_source: &str) {
@@ -3259,29 +3592,17 @@ mod tests {
         ] {
             assert!(ui_source.contains(direction_block));
         }
-        assert!(ui_source.contains(
-            "center-minimum: root.wide-layout ? 720px : root.minimum-layout ? 570px : 620px"
-        ));
-        assert!(ui_source.contains(
-            "left-minimum: root.wide-layout ? 300px : root.minimum-layout ? 236px : 260px"
-        ));
-        assert!(ui_source.contains(
-            "right-minimum: root.wide-layout ? 380px : root.minimum-layout ? 300px : 320px"
-        ));
-        assert!(ui_source.contains("root.left-rail-collapsed ? 48px"));
-        assert!(ui_source.contains("root.right-rail-collapsed ? 48px"));
-        assert!(ui_source.contains("if root.settings-open : HorizontalBox"));
-        assert!(ui_source.contains("if !root.settings-open : HorizontalBox"));
-        assert!(ui_source.contains("if root.wide-layout : HorizontalBox"));
-        assert!(ui_source.contains("if !root.wide-layout : VerticalBox"));
-        assert!(!ui_source.contains("safety-open"));
-        assert!(!ui_source.contains("auto-collapse"));
-        assert!(ui_source.contains("accessible-role: navigation"));
-        assert!(ui_source.contains("accessible-role: main"));
-        assert!(ui_source.contains("accessible-role: complementary"));
-        assert!(ui_source.contains("accessible-role: content-info"));
-        assert!(ui_source.contains("current-width: root.effective-left-width"));
-        assert!(ui_source.contains("current-width: root.effective-right-width"));
+        assert!(ui_source.contains("private property <length> nav-width: 86px"));
+        assert!(ui_source.contains("root.width < 1320px ? 184px : 210px"));
+        assert!(ui_source.contains("active-page == 0"));
+        assert!(ui_source.contains("active-page == 1"));
+        assert!(ui_source.contains("active-page == 2"));
+        assert!(ui_source.contains("active-page == 3"));
+        assert!(ui_source.contains("active-page == 4"));
+        assert!(ui_source.contains("accessible-role: button"));
+        assert!(ui_source.contains("accessible-role: list-item"));
+        assert!(ui_source.contains("accessible-action-default"));
+        assert!(ui_source.contains("FocusScope"));
         assert!(ui_source.contains("dag-edge-rows: []"));
         assert!(ui_source.contains("dag-column-count: 0"));
         assert!(ui_source.contains("root.dag-column-count * root.dag-node-width"));
@@ -3295,17 +3616,132 @@ mod tests {
         assert!(ui_source.contains("harness-preview-applyable: false"));
         assert!(ui_source.contains("callback preview-harness(string, string);"));
         assert!(ui_source.contains("callback apply-harness-preview();"));
-        assert!(
-            ui_source
-                .contains("label: root.harness-action-busy ? \"Applying…\" : \"Apply Preview\"")
-        );
-        assert!(ui_source.contains("!root.harness-action-busy && root.harness-preview-applyable"));
+        assert!(ui_source.contains("label: \"Preview 적용\""));
+        assert!(ui_source.contains("if root.harness-preview-applyable"));
         assert!(harness_ui_source.contains("HarnessApplyRequest"));
         assert!(harness_ui_source.contains("expected_preview: preview"));
         assert!(harness_ui_source.contains("preview.can_apply_with_agents_merge()"));
         assert!(harness_ui_source.contains("current.preview = None;"));
         assert!(harness_ui_source.contains("HarnessPreviewDisposition::Merge => \"MERGE\""));
         assert!(harness_ui_source.contains("HarnessPreviewKind::ManagedManifest"));
+        assert!(ui_source.contains("callback preview-harness-lifecycle(string, string);"));
+        assert!(ui_source.contains("callback preview-harness-remove();"));
+        assert!(ui_source.contains("callback apply-harness-lifecycle();"));
+        assert!(ui_source.contains("label: \"제거 미리보기\""));
+        assert!(ui_source.contains("danger: root.harness-lifecycle-mode == \"REMOVE\""));
+        assert!(
+            ui_source.contains(
+                "root.harness-lifecycle-mode == \"REMOVE\" ? \"제거 적용\" : \"변경 적용\""
+            )
+        );
+        assert!(harness_ui_source.contains("HarnessLifecycleTarget::Remove"));
+        assert!(
+            harness_ui_source.contains("HarnessLifecycleDisposition::Preserve => \"PRESERVE\"")
+        );
+        assert!(harness_ui_source.contains("HarnessLifecycleDisposition::Replace => \"UPDATE\""));
+        assert!(harness_ui_source.contains("submit_harness_lifecycle_preview"));
+        assert!(harness_ui_source.contains("submit_harness_lifecycle_apply"));
+    }
+
+    fn assert_slint_harness_composition_contract(ui_source: &str, harness_ui_source: &str) {
+        assert!(ui_source.contains("callback register-harness-skill();"));
+        assert!(ui_source.contains("callback toggle-harness-composition-skill(int);"));
+        assert!(ui_source.contains("callback select-harness-composition-base(int);"));
+        assert!(ui_source.contains("callback save-harness-composition(string, string);"));
+        assert!(ui_source.contains("label: \"+ 스킬\""));
+        assert!(ui_source.contains("label: \"Bundle 저장\""));
+        assert!(ui_source.contains("구성 (Composition)"));
+        assert!(ui_source.contains("harness-composition-base-index"));
+        assert!(harness_ui_source.contains("composition_base: Option<HarnessCatalogEntry>"));
+        assert!(harness_ui_source.contains("composition_skills: Vec<HarnessSkillCatalogEntry>"));
+        assert!(harness_ui_source.contains("UiHarnessIntent::SelectCompositionBase(index)"));
+        assert!(harness_ui_source.contains("UiHarnessIntent::ToggleCompositionSkill(index)"));
+        assert!(harness_ui_source.contains("HarnessWorkerAction::ListSkills"));
+        assert!(!harness_ui_source.contains("auto_select"));
+    }
+
+    fn assert_slint_connection_contract(
+        ui_source: &str,
+        connection_worker_source: &str,
+        connection_ui_source: &str,
+    ) {
+        assert!(ui_source.contains("title: \"MCP 연결\""));
+        assert!(ui_source.contains("callback save-mcp-connection(string, string);"));
+        assert!(ui_source.contains("callback issue-mcp-token(string);"));
+        assert!(ui_source.contains("callback start-mcp-server();"));
+        assert!(ui_source.contains("callback stop-mcp-server();"));
+        assert!(ui_source.contains("Cloudflare Quick Tunnel"));
+        assert!(ui_source.contains(
+            "Custom domain이 있으면 우선 사용하고, 비워두면 Cloudflare Quick Tunnel을 사용합니다."
+        ));
+        assert!(ui_source.contains("mcp-local-port-input: \"7979\""));
+        assert!(ui_source.contains("외부 Endpoint"));
+        assert!(ui_source.contains("Workspace 접근 토큰"));
+        assert!(ui_source.contains("새 접근 토큰 · 지금 한 번만 표시"));
+        assert!(ui_source.contains("root.mcp-server-running ? \"브리지 중지\" : \"브리지 시작\""));
+        assert!(connection_worker_source.contains("McpTokenBootstrapMode::InitializeAuthority"));
+        assert!(connection_worker_source.contains("CloudflarePublicTunnel::start("));
+        assert!(
+            connection_worker_source.contains("with_public_origin(tunnel.public_base().clone())")
+        );
+        assert!(!connection_worker_source.contains("allow_first_issue: bool"));
+        assert!(connection_ui_source.contains("Cloudflare Quick Tunnel을 사용합니다."));
+    }
+
+    fn assert_slint_agent_observation_contract(
+        ui_source: &str,
+        model_source: &str,
+        agent_ui_source: &str,
+    ) {
+        assert!(model_source.contains("export struct AgentRow"));
+        assert!(ui_source.contains("callback select-agent(string);"));
+        assert!(ui_source.contains("callback select-agent-work-for-node(string);"));
+        assert!(
+            ui_source.contains(
+                "callback issue-agent-dag-grant(string, string, string, string, string);"
+            )
+        );
+        assert!(ui_source.contains("callback revoke-agent-dag-grant();"));
+        assert!(ui_source.contains("5분간 1회 허용"));
+        assert!(ui_source.contains("root.selected-agent-liveness == \"실시간\""));
+        assert!(ui_source.contains("root.dag-head-revision != \"\""));
+        assert!(agent_ui_source.contains("submit_agent_dag_grant_issue"));
+        assert!(agent_ui_source.contains("submit_agent_dag_grant_discover"));
+        assert!(agent_ui_source.contains("submit_agent_dag_grant_revoke"));
+        assert!(ui_source.contains("agent-list-pane := Rectangle"));
+        assert!(ui_source.contains("내부 추론은 표시하지 않습니다."));
+        assert!(!ui_source.contains("Harness compliance"));
+    }
+
+    fn assert_slint_agent_goal_responsive_layout_contract(
+        ui_source: &str,
+        reference_component_source: &str,
+    ) {
+        assert!(ui_source.contains(
+            "page-padding: root.width < 1260px ? 12px : root.width < 1660px ? 16px : 20px"
+        ));
+        assert!(ui_source.contains("page-gap: root.width < 1260px ? 8px : 12px"));
+        assert!(ui_source.contains("agent-list-pane := Rectangle"));
+        assert!(ui_source.contains("horizontal-stretch: 3; min-width: 220px"));
+        assert!(ui_source.contains("horizontal-stretch: 6; min-width: 450px"));
+        assert!(ui_source.contains("horizontal-stretch: 4; min-width: 260px"));
+        assert!(ui_source.contains("ReferenceSummaryMetric"));
+        assert!(ui_source.contains("flat: true; icon: \"◉\""));
+        assert!(!ui_source.contains("horizontal-stretch: 3; min-width: 220px; max-width:"));
+
+        assert!(ui_source.contains("goal-list-pane := Rectangle"));
+        assert!(ui_source.contains("horizontal-stretch: 3; min-width: 220px"));
+        assert!(ui_source.contains("horizontal-stretch: 7; min-width: 430px"));
+        assert!(ui_source.contains("horizontal-stretch: 4; min-width: 250px"));
+        assert!(ui_source.contains("flat: true; icon: \"◎\""));
+        assert!(ui_source.contains("goal-support-strip := HorizontalBox"));
+        assert!(!ui_source.contains("Goal 타임라인"));
+        assert!(!ui_source.contains("horizontal-stretch: 7; min-width: 430px; max-width:"));
+
+        assert!(reference_component_source.contains("export component ReferenceSummaryMetric"));
+        assert!(reference_component_source.contains("in property <bool> flat: false;"));
+        assert!(reference_component_source.contains("height: root.flat ? 64px : 72px;"));
+        assert!(reference_component_source.contains("in property <length> label-width: 118px;"));
     }
 
     fn assert_slint_dag_remains_read_only(ui_source: &str, dag_ui_source: &str) {
@@ -3318,6 +3754,9 @@ mod tests {
         assert!(dag_ui_source.contains("submit_dag_get_current"));
         assert!(dag_ui_source.contains("DAG_SCOPE_MISMATCH"));
         assert!(dag_ui_source.contains("project_stored_dag"));
+        assert!(dag_ui_source.contains("DAG_CONTROL_PUMP_INTERVAL"));
+        assert!(dag_ui_source.contains("DAG_MOTION_PUMP_INTERVAL"));
+        assert!(dag_ui_source.contains("timer.stop()"));
         for forbidden in [
             "DagRevisionCreateRequest",
             "DagNodeStartRequest",
@@ -3341,17 +3780,33 @@ mod tests {
 
     #[test]
     fn slint_workbench_reserves_truthful_goal_dag_and_work_narrative_projections() {
-        let ui_source = include_str!("../../forge-ui/ui/app-window.slint");
+        let app_ui_source = include_str!("../../forge-ui/ui/app-window.slint");
+        let workbench_source = include_str!("../../forge-ui/ui/reference-workbench.slint");
+        let reference_component_source =
+            include_str!("../../forge-ui/ui/reference-components.slint");
+        let ui_source =
+            format!("{app_ui_source}\n{workbench_source}\n{reference_component_source}");
         let model_source = include_str!("../../forge-ui/ui/models.slint");
         let component_source = include_str!("../../forge-ui/ui/components.slint");
         let theme_source = include_str!("../../forge-ui/ui/theme.slint");
         let dag_ui_source = include_str!("dag_ui.rs");
+        let agent_ui_source = include_str!("agent_ui.rs");
         let harness_ui_source = include_str!("harness_ui.rs");
+        let connection_worker_source = include_str!("connection_worker.rs");
+        let connection_ui_source = include_str!("connection_ui.rs");
 
-        assert_slint_workbench_models(ui_source, model_source, component_source);
-        assert_slint_responsive_accessibility_contract(ui_source, theme_source);
-        assert_slint_dag_remains_read_only(ui_source, dag_ui_source);
-        assert_slint_harness_apply_contract(ui_source, harness_ui_source);
+        assert_slint_workbench_models(&ui_source, model_source, component_source);
+        assert_slint_responsive_accessibility_contract(&ui_source, theme_source);
+        assert_slint_dag_remains_read_only(&ui_source, dag_ui_source);
+        assert_slint_harness_apply_contract(&ui_source, harness_ui_source);
+        assert_slint_harness_composition_contract(&ui_source, harness_ui_source);
+        assert_slint_connection_contract(
+            &ui_source,
+            connection_worker_source,
+            connection_ui_source,
+        );
+        assert_slint_agent_observation_contract(&ui_source, model_source, agent_ui_source);
+        assert_slint_agent_goal_responsive_layout_contract(&ui_source, reference_component_source);
     }
 
     #[test]
@@ -3875,6 +4330,16 @@ mod tests {
         assert_eq!(root, selected_path);
         assert_eq!(observed_at.get(), 42);
         assert_eq!(id.into_uuid().get_version_num(), 7);
+        Ok(())
+    }
+
+    #[test]
+    fn direct_workspace_picker_uses_the_selected_korean_folder_name()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let name = location_name_for_selected_root(Path::new("/tmp/한글 프로젝트"))?;
+        assert_eq!(name.as_str(), "한글 프로젝트");
+        let root_name = location_name_for_selected_root(Path::new("/"))?;
+        assert_eq!(root_name.as_str(), "Workspace");
         Ok(())
     }
 

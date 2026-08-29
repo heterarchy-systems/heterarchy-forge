@@ -243,11 +243,11 @@ pub enum McpServerProcessError {
 /// bounded lease tracker, and all tracker task joins.
 #[derive(Debug)]
 pub struct McpServerProcess {
-    service: McpServerService,
-    cancellation: CancellationToken,
-    tracker_rx: Option<tokio::sync::mpsc::Receiver<LeaseTrackerMessage>>,
-    lease_policy: McpLeasePolicy,
-    tasks: JoinSet<McpShutdownReport>,
+    pub(crate) service: McpServerService,
+    pub(crate) cancellation: CancellationToken,
+    pub(crate) tracker_rx: Option<tokio::sync::mpsc::Receiver<LeaseTrackerMessage>>,
+    pub(crate) lease_policy: McpLeasePolicy,
+    pub(crate) tasks: JoinSet<McpShutdownReport>,
 }
 
 impl McpServerProcess {
@@ -261,6 +261,27 @@ impl McpServerProcess {
     pub fn with_policy(control: ForgeControlClient, lease_policy: McpLeasePolicy) -> Self {
         let runtime_instance_id = RuntimeInstanceId::from_uuid(Uuid::now_v7());
         Self::with_runtime_id(control, runtime_instance_id, lease_policy)
+    }
+
+    pub(crate) fn scoped_http(control: ForgeControlClient, lease_policy: McpLeasePolicy) -> Self {
+        let runtime_instance_id = RuntimeInstanceId::from_uuid(Uuid::now_v7());
+        let cancellation = CancellationToken::new();
+        let (owned_sender, tracker_rx) =
+            tokio::sync::mpsc::channel::<LeaseTrackerMessage>(OWNED_CHANNEL_CAPACITY);
+        let service = McpServerService::new_scoped_http(
+            control,
+            runtime_instance_id,
+            lease_policy,
+            cancellation.clone(),
+            owned_sender,
+        );
+        Self {
+            service,
+            cancellation,
+            tracker_rx: Some(tracker_rx),
+            lease_policy,
+            tasks: JoinSet::new(),
+        }
     }
 
     pub(crate) fn with_runtime_id(
@@ -387,7 +408,7 @@ impl McpServerProcess {
     }
 }
 
-async fn finish_tasks(
+pub(crate) async fn finish_tasks(
     mut tasks: JoinSet<McpShutdownReport>,
 ) -> Result<McpShutdownReport, McpServerProcessError> {
     let mut report = None;
@@ -405,7 +426,7 @@ async fn finish_tasks(
 /// Single-owner lease tracker. It receives observations, groups them by exact
 /// Workspace scope, renews each group in one control batch, and closes owned
 /// Activities in one batch per scope during graceful shutdown.
-async fn track_owned_leases(
+pub(crate) async fn track_owned_leases(
     receiver: tokio::sync::mpsc::Receiver<LeaseTrackerMessage>,
     cancellation: CancellationToken,
     control: ForgeControlClient,

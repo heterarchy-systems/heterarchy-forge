@@ -238,38 +238,24 @@ impl HarnessVerifierRunState {
 
 #[must_use]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HarnessVerifierItem {
+pub struct HarnessVerifierItemIdentity {
     ordinal: u16,
     name: HarnessVerifierName,
     approval_id: ApprovalRequestId,
     execution_id: ExecutionId,
     request_digest: ExecutionRequestDigest,
-    state: HarnessVerifierItemState,
-    exit_code: Option<i32>,
-    duration_millis: Option<u64>,
 }
 
-impl HarnessVerifierItem {
+impl HarnessVerifierItemIdentity {
     pub fn new(
         ordinal: u16,
         name: HarnessVerifierName,
         approval_id: ApprovalRequestId,
         execution_id: ExecutionId,
         request_digest: ExecutionRequestDigest,
-        state: HarnessVerifierItemState,
-        exit_code: Option<i32>,
-        duration_millis: Option<u64>,
     ) -> Result<Self, HarnessVerifierDomainError> {
         if usize::from(ordinal) >= usize::from(MAX_HARNESS_VERIFIERS) {
             return Err(HarnessVerifierDomainError::OrdinalOutOfRange(ordinal));
-        }
-        let terminal = state.is_terminal();
-        if (!terminal && (exit_code.is_some() || duration_millis.is_some()))
-            || (state == HarnessVerifierItemState::Passed && exit_code != Some(0))
-            || (state == HarnessVerifierItemState::Rejected
-                && (exit_code.is_some() || duration_millis.is_some()))
-        {
-            return Err(HarnessVerifierDomainError::InvalidItemEvidence);
         }
         Ok(Self {
             ordinal,
@@ -277,9 +263,6 @@ impl HarnessVerifierItem {
             approval_id,
             execution_id,
             request_digest,
-            state,
-            exit_code,
-            duration_millis,
         })
     }
 
@@ -301,6 +284,63 @@ impl HarnessVerifierItem {
 
     pub const fn request_digest(&self) -> ExecutionRequestDigest {
         self.request_digest
+    }
+}
+
+#[must_use]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HarnessVerifierItem {
+    identity: HarnessVerifierItemIdentity,
+    state: HarnessVerifierItemState,
+    exit_code: Option<i32>,
+    duration_millis: Option<u64>,
+}
+
+impl HarnessVerifierItem {
+    pub fn new(
+        identity: HarnessVerifierItemIdentity,
+        state: HarnessVerifierItemState,
+        exit_code: Option<i32>,
+        duration_millis: Option<u64>,
+    ) -> Result<Self, HarnessVerifierDomainError> {
+        let terminal = state.is_terminal();
+        if (!terminal && (exit_code.is_some() || duration_millis.is_some()))
+            || (state == HarnessVerifierItemState::Passed && exit_code != Some(0))
+            || (state == HarnessVerifierItemState::Rejected
+                && (exit_code.is_some() || duration_millis.is_some()))
+        {
+            return Err(HarnessVerifierDomainError::InvalidItemEvidence);
+        }
+        Ok(Self {
+            identity,
+            state,
+            exit_code,
+            duration_millis,
+        })
+    }
+
+    pub const fn identity(&self) -> &HarnessVerifierItemIdentity {
+        &self.identity
+    }
+
+    pub const fn ordinal(&self) -> u16 {
+        self.identity.ordinal()
+    }
+
+    pub const fn name(&self) -> &HarnessVerifierName {
+        self.identity.name()
+    }
+
+    pub const fn approval_id(&self) -> ApprovalRequestId {
+        self.identity.approval_id()
+    }
+
+    pub const fn execution_id(&self) -> ExecutionId {
+        self.identity.execution_id()
+    }
+
+    pub const fn request_digest(&self) -> ExecutionRequestDigest {
+        self.identity.request_digest()
     }
 
     pub const fn state(&self) -> HarnessVerifierItemState {
@@ -378,13 +418,10 @@ impl HarnessVerifierRun {
         }
         validate_items(&items)?;
         if items.len() != self.items.len()
-            || items.iter().zip(&self.items).any(|(next, current)| {
-                next.ordinal != current.ordinal
-                    || next.name != current.name
-                    || next.approval_id != current.approval_id
-                    || next.execution_id != current.execution_id
-                    || next.request_digest != current.request_digest
-            })
+            || items
+                .iter()
+                .zip(&self.items)
+                .any(|(next, current)| next.identity() != current.identity())
         {
             return Err(HarnessVerifierDomainError::ItemIdentityChanged);
         }
@@ -485,7 +522,7 @@ fn validate_items(items: &[HarnessVerifierItem]) -> Result<(), HarnessVerifierDo
     if items
         .iter()
         .enumerate()
-        .any(|(index, item)| usize::from(item.ordinal) != index)
+        .any(|(index, item)| usize::from(item.ordinal()) != index)
     {
         return Err(HarnessVerifierDomainError::NonCanonicalOrdinal);
     }
@@ -544,11 +581,13 @@ mod tests {
         exit_code: Option<i32>,
     ) -> Result<HarnessVerifierItem, Box<dyn std::error::Error>> {
         Ok(HarnessVerifierItem::new(
-            ordinal,
-            HarnessVerifierName::new(format!("verifier-{ordinal}"))?,
-            ApprovalRequestId::from_uuid(Uuid::from_u128(100 + u128::from(ordinal))),
-            ExecutionId::from_uuid(Uuid::from_u128(200 + u128::from(ordinal))),
-            ExecutionRequestDigest::from_bytes([u8::try_from(ordinal).unwrap_or(u8::MAX); 32]),
+            HarnessVerifierItemIdentity::new(
+                ordinal,
+                HarnessVerifierName::new(format!("verifier-{ordinal}"))?,
+                ApprovalRequestId::from_uuid(Uuid::from_u128(100 + u128::from(ordinal))),
+                ExecutionId::from_uuid(Uuid::from_u128(200 + u128::from(ordinal))),
+                ExecutionRequestDigest::from_bytes([u8::try_from(ordinal).unwrap_or(u8::MAX); 32]),
+            )?,
             state,
             exit_code,
             state.is_terminal().then_some(10),

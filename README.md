@@ -4,6 +4,9 @@
 
 # Heterarchy Forge
 
+[![CI](https://github.com/heterarchy-systems/heterarchy-forge/actions/workflows/ci.yml/badge.svg)](https://github.com/heterarchy-systems/heterarchy-forge/actions/workflows/ci.yml)
+[![Releases](https://img.shields.io/github/v/release/heterarchy-systems/heterarchy-forge?include_prereleases)](https://github.com/heterarchy-systems/heterarchy-forge/releases)
+
 Heterarchy Forge is a Rust-only macOS desktop application and local runtime for preparing, operating, and observing AI-driven local workspaces.
 
 The product is being built from the accepted V1 architecture in Alexandria. The
@@ -58,15 +61,25 @@ The implemented foundation is Rust-only and keeps authority explicit:
 - Workspace-local state initialization serializes concurrent writers and writes
   exact nested-worktree rules to `.git/info/exclude` without modifying tracked
   `.gitignore` files.
-- The official `rmcp 3.1.4` stdio server exposes exactly `workspace_list`,
+- The official `rmcp 3.1.4` server exposes exactly 22 tools: `workspace_list`,
   `workspace_resolve`, `activity_bootstrap`, `file_read`, `file_create`,
   `file_replace`, `file_delete`, `diff_list`, `diff_read`, `diff_doctor`,
-  `diff_retention_plan`, and `diff_artifact_doctor`. The last two are read-only
-  storage planning and owned/orphan/conflicting inventory surfaces; they do not
-  grant MCP deletion authority.
+  `diff_retention_plan`, `diff_artifact_doctor`, `agent_attach`,
+  `agent_set_focus`, `agent_publish_work`, `agent_get_context`, `agent_detach`,
+  `goal_list`, `goal_get`, `dag_get_current`,
+  `dag_authoring_grant_discover`, and `dag_replan_commit`. DAG mutation is
+  limited to one immutable successor revision under an operator-issued,
+  credential-bound, exact-head, five-minute one-shot grant; it grants no node
+  lifecycle, execution, command, shell, or deletion authority.
   Every request carries an exact Location revision and Workspace
   locator/identity. File effects additionally require a tracked live Activity;
   bounded history reads do not silently promote process ownership.
+- Stdio remains the default trusted-local process transport. An explicit
+  loopback-only Streamable HTTP mode uses the same 22-tool surface, validates
+  Host/Origin/body bounds, and requires a durable Workspace-scoped bearer
+  token on every request. Raw bearer text is revealed once; SQLite stores only
+  a keyed digest and metadata, while the pepper remains in macOS Keychain.
+  This local credential is not OAuth and grants no remote/public listener.
 - Activity schema v2 separates durable Open/Closed/Interrupted state from a
   process-owned runtime lease. Heartbeats and graceful close are grouped into
   one bounded transaction per Workspace; expired leases reconcile to
@@ -93,7 +106,10 @@ The implemented foundation is Rust-only and keeps authority explicit:
   lanes; blocked incoming dependencies and exact edges into the active node are
   visible without inventing a critical path. Nodes retain derived readiness,
   waiting state, evidence counts, and selection-aware Inspector details. The UI
-  exposes no DAG authoring or lifecycle mutation callback.
+  exposes no direct graph editing or node lifecycle mutation callback. The
+  Agent Inspector may issue/revoke one exact one-shot DAG authoring grant; the
+  authenticated Agent discovers it and submits the fully typed successor DAG
+  through MCP, while the graph remains a read-only projection.
 - Plan 09 durable Goal contracts are active in trusted local control and the
   Rust/Slint desktop. Goals are optional, immutable after creation, revision-CAS
   guarded, restart durable, and explicitly lifecycle controlled. Hard completion
@@ -103,7 +119,7 @@ The implemented foundation is Rust-only and keeps authority explicit:
   admission associates Goal evidence atomically; Goal-linked Diff artifacts are
   excluded from retention and tombstone races. A Goal creates no background
   task, scheduler, implicit continuation, or execution authority. DAG remains a
-  separate optional contract, and MCP remains the exact 12-tool surface.
+  separate optional contract, and MCP remains the exact 22-tool surface above.
 - Plan 11A Doctor-01 adds a typed, exact-scope, read-only Workspace integrity
   report without a schema bump. It validates the current schema/application/
   Workspace binding, runs bounded `quick_check(1)` plus first-row foreign-key
@@ -214,20 +230,21 @@ The implemented foundation is Rust-only and keeps authority explicit:
   width classes change pane budgets and the lower-deck topology rather than
   stretching one fixed layout. Both rails resize from a drag-origin snapshot,
   collapse independently to 48px, and restore their session widths. Settings
-  replaces the whole workbench body with a flat domain surface; unavailable
-  Harness Library registration and selected-Workspace source/version/hash/
-  source-integrity projection now use bounded workers rather than fabricated
-  state. Plan 08A Preview reports CREATE / MERGE / UNCHANGED / CONFLICT without
-  writing Workspace files. A conflict-free Preview can be explicitly Applied:
-  descriptor-confined materialization creates the managed `.agents/` tree,
-  preserves user-authored `AGENTS.md` outside the bundle-owned marker block,
-  writes `.agents/.heterarchy.toml` last as the materialization/provenance marker,
-  and commits durable applied-Harness state only after materialization succeeds.
-  The v1 marker explicitly has no deletion authority, so a pre-existing
-  byte-identical file is never silently converted into future Remove authority.
-  Regular Apply cannot silently switch to a different durable Harness; Update /
-  Switch / Remove and sandboxed declared-verifier execution remain separate
-  follow-up flows. Still-unmodeled preferences remain explicitly labelled. A selected Goal's current DAG is loaded through the same bounded
+  replaces the whole workbench body with a flat domain surface. Harness Library
+  registration, selected-Workspace source integrity, declared verifiers, initial
+  Preview/Apply, and explicit Update / Switch / Remove all use bounded workers
+  rather than fabricated state. Initial Preview reports CREATE / MERGE /
+  UNCHANGED / CONFLICT without writing Workspace files. Lifecycle Preview reports
+  CREATE / UPDATE / REMOVE / PRESERVE / UNCHANGED / CONFLICT and must be reviewed
+  before Update, Switch, or Remove can run. Remove is deliberately two-step: an
+  ownership-safe Preview is required before the danger action is enabled.
+  Descriptor-confined materialization preserves user-authored `AGENTS.md` outside
+  the exact bundle marker block and writes `.agents/.heterarchy.toml` as durable
+  ownership provenance. Manifest schema v2 grants deletion authority only to
+  files FORGE can prove it created; legacy v1 and pre-existing byte-identical
+  files remain external. Update/Switch replace durable `AppliedHarness` state and
+  Remove deletes it only through exact revision CAS after filesystem success.
+  Still-unmodeled preferences remain explicitly labelled. A selected Goal's current DAG is loaded through the same bounded
   nonblocking worker boundary; a missing DAG remains a truthful empty state.
   The Goal rail now loads real bounded Workspace-local contracts through the
   nonblocking worker and supports inline create, fresh hard review,
@@ -256,10 +273,19 @@ cargo xtask msrv
 cargo xtask doctor
 cargo xtask supply-chain
 cargo xtask extended
+cargo xtask package
 cargo run -p forge-desktop
 cargo run -p forge-mcp -- --doctor
 cargo run -p forge-mcp
+cargo run -p forge-mcp -- token issue "Local Codex" <location-id> <location-revision> <workspace-id> <workspace-revision> <locator>
+cargo run -p forge-mcp -- http serve 8765
 ```
+
+`token issue` validates the exact current Workspace and prints the bearer value
+once. Put it in a private environment variable, then configure a local Codex
+host with the loopback URL and bearer-token environment-variable setting. Use
+`token rotate`, `token revoke`, and `token list` for explicit credential
+lifecycle. Never place the bearer value in repository files or shell history.
 
 `cargo xtask doctor` performs both desktop runtime and MCP stdio lifecycle smoke
 tests. The reviewed `deny.toml` policy requires current `cargo-deny` and
@@ -267,15 +293,58 @@ tests. The reviewed `deny.toml` policy requires current `cargo-deny` and
 `cargo xtask perf` deliberately reports `unconfigured` until a reviewed
 benchmark target and workload exist; that result is not a performance PASS.
 
+### Local macOS installer
+
+On macOS, `cargo xtask package` builds the optimized desktop binary, assembles
+and verifies `Heterarchy Forge.app`, then creates these local installer
+artifacts:
+
+```text
+target/dist/Heterarchy-Forge-<version>-<architecture>.pkg
+target/dist/Heterarchy-Forge.pkg
+```
+
+Open either `.pkg` in Finder to install the application into `/Applications`.
+The default artifact is local-development scoped: the application has an
+ad-hoc signature and the Installer package is unsigned. Developer ID identities
+can be supplied through environment variables as documented in
+`packaging/macos/README.md`; Apple notarization is a separate release step.
+
+### GitHub Releases
+
+Public macOS arm64 builds are published from Git tags by
+`.github/workflows/release.yml`. Download the versioned Installer package and
+`SHA256SUMS.txt` from:
+
+https://github.com/heterarchy-systems/heterarchy-forge/releases
+
+The release workflow is fail-closed: a tag must exactly match the workspace
+Cargo version (`v<version>`), the pinned `cloudflared` arm64 archive is verified
+against its SHA-256 before bundling, `make ci` must pass, and only then is the
+versioned `.pkg` attached to the GitHub Release. To publish a version, update the
+workspace version, land it on `main`, then create and push the matching tag, for
+example `v0.2.0`.
+
+The current automated public artifact is still development-distribution scoped:
+the app uses an ad-hoc code signature and the Installer package is unsigned. It
+is downloadable from GitHub Releases, but macOS Gatekeeper may require explicit
+user approval. Developer ID Application/Installer signing plus Apple notarization
+should be configured before treating Releases as frictionless end-user
+distribution.
+
 The native folder picker adapter is implemented, but interactive modal E2E
 (accessibility/screen capture) remains unverified. The following product slices
-are not yet complete: packaged app/App Sandbox and security-scoped bookmark
-persistence, path list/stat/search/patch/move, automatic Diff retention policy,
-remote MCP Streamable HTTP/OAuth/authentication, production App Sandbox replacement,
+are not yet complete: production App Sandbox and security-scoped bookmark
+persistence, universal macOS packaging plus Developer ID signing/notarization,
+path list/stat/search/patch/move, automatic Diff retention policy,
+remote/public MCP TLS and OAuth authorization, production App Sandbox replacement,
 approval/grant-backed command UI/MCP exposure, descriptor-capable macOS Git
 checkpoint writes, production CAS restore authority, and full GUI/browser E2E
-evidence. The local stdio MCP server, durable Activity lifecycle, and bounded
-file read/create/replace/delete boundary are active. The low-level local command
+evidence. The local stdio plus opt-in bearer-authenticated loopback HTTP MCP
+server, interactive desktop Connection/token lifecycle, durable Agent
+attachment/public work, explicit Goal/current-DAG reads, one-shot exact-head DAG
+replanning, durable Activity lifecycle, and bounded file read/create/replace/delete
+boundary are active. The low-level local command
 engine and Plan 07 grant path are active, but no command/shell mutation tool is
 MCP-exposed. Exact verification evidence is recorded in the dated development
 log rather than copied here as a count that immediately becomes stale. The

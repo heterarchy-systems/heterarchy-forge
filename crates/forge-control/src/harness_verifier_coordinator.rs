@@ -13,14 +13,15 @@ use std::thread::{self, JoinHandle};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use forge_domain::{
-    ActivityLeaseRevision, ApprovalRequestState, ExecutionArgument, ExecutionArgumentError,
+    ActivityListLimit, ApprovalRequestState, ExecutionArgument, ExecutionArgumentError,
     ExecutionAttribution, ExecutionKind, ExecutionLimits, ExecutionOutputLimit,
     ExecutionPermissions, ExecutionProgram, ExecutionProgramError, ExecutionRequest,
     ExecutionRequestDigest, ExecutionRequestError, ExecutionState, ExecutionTimeoutError,
     ExecutionTimeoutMillis, HarnessVerificationState, HarnessVerifierDomainError,
-    HarnessVerifierItem, HarnessVerifierItemState, HarnessVerifierName, HarnessVerifierNameError,
-    HarnessVerifierRun, HarnessVerifierRunAttribution, HarnessVerifierRunId, RuntimeInstanceId,
-    TimestampMillis, TimestampMillisError,
+    HarnessVerifierItem, HarnessVerifierItemIdentity, HarnessVerifierItemState,
+    HarnessVerifierName, HarnessVerifierNameError, HarnessVerifierRun,
+    HarnessVerifierRunAttribution, HarnessVerifierRunId, RuntimeInstanceId, TimestampMillis,
+    TimestampMillisError,
 };
 use forge_workspace::{
     HarnessBundleInspectionError, HarnessVerifierProgramError, HarnessVerifierSpec,
@@ -160,8 +161,10 @@ impl ForgeHarnessVerifierCoordinatorClient {
     pub fn submit_latest(
         &self,
         scope: ResolvedWorkspaceScope,
-    ) -> Result<PendingHarnessVerifierRun<Option<HarnessVerifierRun>>, ForgeHarnessVerifierCoordinatorError>
-    {
+    ) -> Result<
+        PendingHarnessVerifierRun<Option<HarnessVerifierRun>>,
+        ForgeHarnessVerifierCoordinatorError,
+    > {
         self.submit_pending(|response| CoordinatorRequest::Latest { scope, response })
     }
 
@@ -172,7 +175,11 @@ impl ForgeHarnessVerifierCoordinatorClient {
         if !self.accepting.load(Ordering::Acquire) {
             return Err(ForgeHarnessVerifierCoordinatorError::Closed);
         }
-        let (response_sender, response_receiver) = mpsc::sync_channel(0);
+        // A pending response is one bounded result owned by its caller.  A
+        // one-slot buffer lets the coordinator finish a queued request even
+        // when the caller intentionally defers receiving it, which is
+        // required for a drain-aware shutdown to make progress.
+        let (response_sender, response_receiver) = mpsc::sync_channel(1);
         match self.sender.try_send(build(response_sender)) {
             Ok(()) => Ok(PendingHarnessVerifierRun {
                 receiver: response_receiver,
@@ -222,23 +229,26 @@ impl ForgeHarnessVerifierCoordinator {
             return Ok(());
         }
         self.accepting.store(false, Ordering::Release);
-        let (response_sender, response_receiver) = mpsc::sync_channel(0);
-        match self.sender.try_send(CoordinatorRequest::Shutdown {
+        let (response_sender, response_receiver) = mpsc::sync_channel(1);
+        let shutdown_result = match self.sender.send(CoordinatorRequest::Shutdown {
             response: response_sender,
         }) {
             Ok(()) => response_receiver
                 .recv()
-                .map_err(|_| ForgeHarnessVerifierCoordinatorError::Closed)??,
-            Err(TrySendError::Full(_)) => {
-                return Err(ForgeHarnessVerifierCoordinatorError::QueueFull);
-            }
-            Err(TrySendError::Disconnected(_)) => {}
+                .map_err(|_| ForgeHarnessVerifierCoordinatorError::Closed)
+                .and_then(|result| result),
+            Err(_) => Ok(()),
+        };
+        let join_result = match self.join.take() {
+            Some(join) => join
+                .join()
+                .map_err(|_| ForgeHarnessVerifierCoordinatorError::ThreadPanicked),
+            None => Ok(()),
+        };
+        match join_result {
+            Ok(()) => shutdown_result,
+            Err(error) => Err(error),
         }
-        if let Some(join) = self.join.take() {
-            join.join()
-                .map_err(|_| ForgeHarnessVerifierCoordinatorError::ThreadPanicked)?;
-        }
-        Ok(())
     }
 }
 
@@ -254,11 +264,7 @@ fn run_loop(
     approval: ForgeApprovalCoordinatorClient,
     accepting: &Arc<AtomicBool>,
 ) {
-    let mut coordinator = CoordinatorState {
-        control,
-        approval,
-        lease_revisions: std::collections::HashMap::new(),
-    };
+    let mut coordinator = CoordinatorState { control, approval };
     while let Ok(request) = receiver.recv() {
         match request {
             CoordinatorRequest::Start { request, response } => {
@@ -278,6 +284,7 @@ fn run_loop(
             CoordinatorRequest::Shutdown { response } => {
                 accepting.store(false, Ordering::Release);
                 let _ignored = response.send(Ok(()));
+                drain_queued_requests(receiver);
                 break;
             }
         }
@@ -285,10 +292,28 @@ fn run_loop(
     accepting.store(false, Ordering::Release);
 }
 
+fn drain_queued_requests(receiver: &Receiver<CoordinatorRequest>) {
+    while let Ok(request) = receiver.try_recv() {
+        reject_queued_request(request);
+    }
+}
+
+fn reject_queued_request(request: CoordinatorRequest) {
+    match request {
+        CoordinatorRequest::Start { response, .. } => reject_response(&response),
+        CoordinatorRequest::Refresh { response, .. }
+        | CoordinatorRequest::Latest { response, .. } => reject_response(&response),
+        CoordinatorRequest::Shutdown { response } => reject_response(&response),
+    }
+}
+
+fn reject_response<T>(response: &Response<T>) {
+    let _ignored = response.send(Err(ForgeHarnessVerifierCoordinatorError::Closed));
+}
+
 struct CoordinatorState {
     control: ForgeControlClient,
     approval: ForgeApprovalCoordinatorClient,
-    lease_revisions: std::collections::HashMap<HarnessVerifierRunId, ActivityLeaseRevision>,
 }
 
 impl CoordinatorState {
@@ -331,11 +356,9 @@ impl CoordinatorState {
             now,
             lease_until,
         )?;
-        let lease_revision = bootstrap
+        bootstrap
             .lease()
-            .ok_or(ForgeHarnessVerifierCoordinatorError::ActivityLeaseMissing)?
-            .revision();
-        self.lease_revisions.insert(run_id, lease_revision);
+            .ok_or(ForgeHarnessVerifierCoordinatorError::ActivityLeaseMissing)?;
 
         let prepared = prepare_verifiers(
             request.scope.workspace_id(),
@@ -468,22 +491,65 @@ impl CoordinatorState {
     }
 
     fn close_terminal_activity(
-        &mut self,
+        &self,
         scope: &ResolvedWorkspaceScope,
         run: &HarnessVerifierRun,
     ) -> Result<(), ForgeHarnessVerifierCoordinatorError> {
-        let Some(revision) = self.lease_revisions.remove(&run.id()) else {
+        let observed_at = current_timestamp_millis()?;
+        let limit = activity_lookup_limit()?;
+        // The durable Activity row is the lease authority.  Re-read its
+        // owner and revision here so a fresh coordinator can close a run
+        // after restart without trusting a stale/in-memory fence.
+        let activity = self
+            .control
+            .list_activity_projections(scope.clone(), observed_at, limit)?
+            .into_iter()
+            .find(|projection| projection.id() == run.activity_id())
+            .map(forge_domain::ActivityProjection::into_activity)
+            .ok_or(ForgeHarnessVerifierCoordinatorError::ActivityLeaseMissing)?;
+        if activity.workspace_id() != scope.workspace_id() {
+            return Err(ForgeHarnessVerifierCoordinatorError::ActivityLeaseConflict);
+        }
+        if activity.state() == forge_domain::ActivityState::Closed && activity.lease().is_unleased()
+        {
             return Ok(());
-        };
-        let _closed = self.control.close_activity(
+        }
+        if activity.state() != forge_domain::ActivityState::Open
+            || activity.lease_owner_id() != Some(run.runtime_instance_id())
+        {
+            return Err(ForgeHarnessVerifierCoordinatorError::ActivityLeaseConflict);
+        }
+        if activity.lease().is_unleased() {
+            return Err(ForgeHarnessVerifierCoordinatorError::ActivityLeaseConflict);
+        }
+        if !activity.lease().is_live_at(observed_at) {
+            return Err(ForgeHarnessVerifierCoordinatorError::ActivityLeaseExpired);
+        }
+        let closed = self.control.close_activity(
             scope.clone(),
             run.activity_id(),
             run.runtime_instance_id(),
-            revision,
-            current_timestamp_millis()?,
+            activity.lease_revision(),
+            observed_at,
         )?;
+        let closed_activity = closed
+            .activity()
+            .ok_or(ForgeHarnessVerifierCoordinatorError::ActivityLeaseMissing)?;
+        if closed_activity.id() != run.activity_id()
+            || closed_activity.state() != forge_domain::ActivityState::Closed
+            || !closed_activity.lease().is_unleased()
+        {
+            return Err(ForgeHarnessVerifierCoordinatorError::ActivityLeaseConflict);
+        }
         Ok(())
     }
+}
+
+fn activity_lookup_limit() -> Result<ActivityListLimit, ForgeHarnessVerifierCoordinatorError> {
+    let maximum = u32::try_from(crate::MAX_ACTIVITY_PROJECTION_RESULTS)
+        .map_err(|_| ForgeHarnessVerifierCoordinatorError::ActivityLeaseMissing)?;
+    ActivityListLimit::new(maximum)
+        .map_err(|_| ForgeHarnessVerifierCoordinatorError::ActivityLeaseMissing)
 }
 
 #[derive(Debug, Clone)]
@@ -499,11 +565,13 @@ struct PreparedVerifier {
 impl PreparedVerifier {
     fn pending_item(&self) -> Result<HarnessVerifierItem, HarnessVerifierDomainError> {
         HarnessVerifierItem::new(
-            self.ordinal,
-            self.name.clone(),
-            self.approval_id,
-            self.execution_id,
-            self.request_digest,
+            HarnessVerifierItemIdentity::new(
+                self.ordinal,
+                self.name.clone(),
+                self.approval_id,
+                self.execution_id,
+                self.request_digest,
+            )?,
             HarnessVerifierItemState::PendingApproval,
             None,
             None,
@@ -639,11 +707,13 @@ fn item_from_submission(
         ApprovalSubmissionStatus::Denied => HarnessVerifierItemState::Rejected,
     };
     HarnessVerifierItem::new(
-        prepared.ordinal,
-        prepared.name.clone(),
-        prepared.approval_id,
-        prepared.execution_id,
-        prepared.request_digest,
+        HarnessVerifierItemIdentity::new(
+            prepared.ordinal,
+            prepared.name.clone(),
+            prepared.approval_id,
+            prepared.execution_id,
+            prepared.request_digest,
+        )?,
         state,
         None,
         None,
@@ -667,11 +737,13 @@ fn item_from_approval(
         | ApprovalRequestState::Superseded => HarnessVerifierItemState::Rejected,
     };
     HarnessVerifierItem::new(
-        prepared.ordinal,
-        prepared.name.clone(),
-        prepared.approval_id,
-        prepared.execution_id,
-        prepared.request_digest,
+        HarnessVerifierItemIdentity::new(
+            prepared.ordinal,
+            prepared.name.clone(),
+            prepared.approval_id,
+            prepared.execution_id,
+            prepared.request_digest,
+        )?,
         state,
         None,
         None,
@@ -707,11 +779,13 @@ fn item_from_execution(
         }
     };
     HarnessVerifierItem::new(
-        prepared.ordinal,
-        prepared.name.clone(),
-        prepared.approval_id,
-        prepared.execution_id,
-        prepared.request_digest,
+        HarnessVerifierItemIdentity::new(
+            prepared.ordinal,
+            prepared.name.clone(),
+            prepared.approval_id,
+            prepared.execution_id,
+            prepared.request_digest,
+        )?,
         state,
         exit_code,
         duration_millis,
@@ -759,6 +833,10 @@ pub enum ForgeHarnessVerifierCoordinatorError {
     NoVerifiers,
     #[error("Harness verifier Activity bootstrap did not return an owned lease")]
     ActivityLeaseMissing,
+    #[error("Harness verifier Activity lease owner or fence no longer matches the durable run")]
+    ActivityLeaseConflict,
+    #[error("Harness verifier Activity lease expired before terminal reconciliation")]
+    ActivityLeaseExpired,
     #[error("Harness verifier count exceeds the bounded domain")]
     VerifierCount,
     #[error("Harness verifier approval/execution identities changed during submission")]
@@ -926,7 +1004,7 @@ mod tests {
             if Instant::now() >= deadline {
                 return Err("verifier run did not become terminal".into());
             }
-            thread::sleep(Duration::from_millis(10));
+            thread::yield_now();
         }
     }
 
@@ -1007,6 +1085,122 @@ mod tests {
             restarted.harness_verifier_get_latest(&fixture.scope)?,
             Some(terminal)
         );
+        fs::remove_dir_all(fixture.root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn restart_reconciles_terminal_run_and_closes_durable_activity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = fixture("restart-close", "/usr/bin/true")?;
+        let control = ForgeControl::new(GlobalRegistry::open(&fixture.registry_path)?);
+        let (control_client, mut control_worker) = control.start_worker()?;
+        prepare_applied_source(&control_client, &fixture)?;
+
+        let mut execution = ForgeExecutionCoordinator::start(control_client.clone(), 2)?;
+        let mut approval =
+            ForgeApprovalCoordinator::start(control_client.clone(), execution.client())?;
+        let approval_client = approval.client();
+        let (verifier_client, mut verifier) = ForgeHarnessVerifierCoordinator::start(
+            control_client.clone(),
+            approval_client.clone(),
+        )?;
+        let request =
+            HarnessVerifierRunRequest::new(fixture.scope.clone(), fixture.source_root.clone());
+        let started = verifier_client.start_run(request.clone())?;
+        let item = &started.items()[0];
+
+        // The durable run and Activity survive replacement of the verifier
+        // coordinator.  The replacement must recover the lease fence from
+        // durable Activity authority instead of relying on its empty cache.
+        verifier.shutdown()?;
+        let (restarted_client, mut restarted_verifier) =
+            ForgeHarnessVerifierCoordinator::start(control_client.clone(), approval_client)?;
+        let execution_id = restarted_client
+            .latest(fixture.scope.clone())?
+            .ok_or("durable verifier run missing after restart")?
+            .items()[0]
+            .execution_id();
+        assert_eq!(execution_id, item.execution_id());
+        let approved_execution = approval.client().approve_once(item.approval_id())?;
+        assert_eq!(approved_execution, execution_id);
+
+        let terminal = wait_for_terminal(&restarted_client, &request)?;
+        assert!(terminal.state().is_terminal());
+        let activity = control_client
+            .list_activity_projections(
+                fixture.scope.clone(),
+                current_timestamp_millis()?,
+                ActivityListLimit::DEFAULT,
+            )?
+            .into_iter()
+            .find(|projection| projection.id() == started.activity_id())
+            .ok_or("durable verifier Activity missing after restart")?
+            .into_activity();
+        assert_eq!(activity.state(), forge_domain::ActivityState::Closed);
+        assert!(activity.lease().is_unleased());
+
+        restarted_verifier.shutdown()?;
+        let _approval_report = approval.shutdown()?;
+        let _execution_report = execution.shutdown()?;
+        control_worker.shutdown()?;
+        fs::remove_dir_all(fixture.root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn shutdown_drains_saturated_queue_and_joins_owned_thread()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = fixture("shutdown-saturation", "/usr/bin/true")?;
+        let control = ForgeControl::new(GlobalRegistry::open(&fixture.registry_path)?);
+        let (control_client, mut control_worker) = control.start_worker()?;
+        let mut execution = ForgeExecutionCoordinator::start(control_client.clone(), 1)?;
+        let mut approval =
+            ForgeApprovalCoordinator::start(control_client.clone(), execution.client())?;
+        let approval_client = approval.client();
+
+        // Fill the bounded queue before starting its consumer so saturation
+        // is deterministic.  Each response is one bounded slot, allowing
+        // the worker to drain without requiring callers to rendezvous first.
+        let (sender, receiver) = mpsc::sync_channel(COORDINATOR_QUEUE_CAPACITY);
+        let accepting = Arc::new(AtomicBool::new(true));
+        let mut responses = Vec::with_capacity(COORDINATOR_QUEUE_CAPACITY);
+        for _ in 0..COORDINATOR_QUEUE_CAPACITY {
+            let (response_sender, response_receiver) = mpsc::sync_channel(1);
+            sender.try_send(CoordinatorRequest::Latest {
+                scope: fixture.scope.clone(),
+                response: response_sender,
+            })?;
+            responses.push(response_receiver);
+        }
+        let (extra_response_sender, _extra_response_receiver) = mpsc::sync_channel(1);
+        let extra = CoordinatorRequest::Latest {
+            scope: fixture.scope.clone(),
+            response: extra_response_sender,
+        };
+        assert!(matches!(sender.try_send(extra), Err(TrySendError::Full(_))));
+
+        let thread_accepting = Arc::clone(&accepting);
+        let run_control = control_client.clone();
+        let run_approval = approval_client.clone();
+        let join = thread::Builder::new()
+            .name(THREAD_NAME.to_owned())
+            .spawn(move || run_loop(&receiver, run_control, run_approval, &thread_accepting))?;
+        let mut coordinator = ForgeHarnessVerifierCoordinator {
+            sender,
+            accepting,
+            join: Some(join),
+        };
+
+        coordinator.shutdown()?;
+        assert!(coordinator.join.is_none());
+        for response in responses {
+            assert!(response.recv()??.is_none());
+        }
+
+        let _approval_report = approval.shutdown()?;
+        let _execution_report = execution.shutdown()?;
+        control_worker.shutdown()?;
         fs::remove_dir_all(fixture.root)?;
         Ok(())
     }

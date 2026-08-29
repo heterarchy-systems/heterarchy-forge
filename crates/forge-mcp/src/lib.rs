@@ -9,11 +9,19 @@
 #![deny(unsafe_code)]
 
 mod frame;
+mod http;
 mod process;
 mod protocol;
 mod service;
+mod token;
 
 pub use frame::{BoundedMcpFrameReader, MAX_MCP_FRAME_BYTES};
+pub use http::{
+    MCP_HTTP_AUTH_BLOCKING_CAPACITY, MCP_HTTP_DEFAULT_PORT, MCP_HTTP_MAX_REQUEST_BODY_BYTES,
+    MCP_HTTP_STARTUP_TIMEOUT, McpHttpPort, McpHttpServerConfig, McpHttpServerError,
+    McpHttpServerHandle, McpHttpServerRuntime, McpHttpServerRuntimeError, McpHttpServerService,
+    McpPublicOrigin, McpPublicOriginError,
+};
 pub use process::{
     DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_LEASE_DURATION_MS, MAX_OWNED_ACTIVITIES,
     MAX_OWNED_WORKSPACE_GROUPS, McpConfigError, McpLeasePolicy, McpServerProcess,
@@ -29,6 +37,7 @@ pub use protocol::{
     WorkspaceScopeOutput, WorkspaceSignalWire,
 };
 pub use service::{MCP_TOOL_NAMES, McpServerService};
+pub use token::{McpTokenBootstrapMode, McpTokenRuntime, McpTokenRuntimeError};
 
 #[cfg(test)]
 mod integration_tests {
@@ -179,6 +188,16 @@ mod integration_tests {
                 "diff_doctor",
                 "diff_retention_plan",
                 "diff_artifact_doctor",
+                "agent_attach",
+                "agent_set_focus",
+                "agent_publish_work",
+                "agent_get_context",
+                "agent_detach",
+                "goal_list",
+                "goal_get",
+                "dag_get_current",
+                "dag_authoring_grant_discover",
+                "dag_replan_commit",
             ]
         );
         assert!(names.iter().all(|name| {

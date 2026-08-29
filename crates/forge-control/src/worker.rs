@@ -15,6 +15,10 @@ use forge_domain::{
 use forge_persistence::{ApprovalAuthorityCleanupReport, StoredDagRevision};
 use forge_workspace::WorkspaceLocator;
 
+use crate::agent::{
+    AgentAttachRequest, AgentContextRequest, AgentDetachRequest, AgentFocusRequest,
+    AgentListRequest, AgentWorkUpdateRequest,
+};
 use crate::approval::{
     ApprovalCancelActivityRequest, ApprovalCancelWorkspaceRequest, ApprovalCreateRequest,
     ApprovalDecisionRequest, ApprovalGrantConsumeRequest, ApprovalGrantConsumeResult,
@@ -33,7 +37,14 @@ use crate::doctor::{WorkspaceDoctorRequest, WorkspaceDoctorResult, WorkspaceIden
 use crate::error::{ControlError, ControlErrorCode};
 use crate::filesystem::{FileMutationRequest, FileMutationResult, FileReadRequest, FileReadResult};
 use crate::goal::{GoalCompletionRequest, GoalLifecycleRequest};
-use crate::harness::{HarnessApplyRequest, HarnessPreviewRequest, HarnessVerifyRequest};
+use crate::grant::{
+    AgentDagGrantDiscoverRequest, AgentDagGrantGetRequest, AgentDagGrantIssueRequest,
+    AgentDagGrantRevokeRequest, AgentDagReplanCommitRequest,
+};
+use crate::harness::{
+    HarnessApplyRequest, HarnessLifecycleApplyRequest, HarnessLifecyclePreviewProjection,
+    HarnessLifecyclePreviewRequest, HarnessPreviewRequest, HarnessVerifyRequest,
+};
 use crate::recovery::{
     RecoveryLeaseClaimOperation, RecoveryMaintenanceReport, RecoveryMaintenanceRequest,
 };
@@ -107,6 +118,14 @@ pub enum ForgeControlRequest {
         request: HarnessApplyRequest,
         response: Response<AppliedHarness>,
     },
+    HarnessLifecyclePreview {
+        request: HarnessLifecyclePreviewRequest,
+        response: Response<HarnessLifecyclePreviewProjection>,
+    },
+    HarnessLifecycleApply {
+        request: HarnessLifecycleApplyRequest,
+        response: Response<Option<AppliedHarness>>,
+    },
     HarnessVerifySource {
         request: HarnessVerifyRequest,
         response: Response<AppliedHarness>,
@@ -169,6 +188,50 @@ pub enum ForgeControlRequest {
     ListWorkspaceActivityProjections {
         request: WorkspaceActivityProjectionRequest,
         response: Response<WorkspaceActivityProjection>,
+    },
+    AgentAttach {
+        request: AgentAttachRequest,
+        response: Response<forge_domain::RegisteredAgentInstance>,
+    },
+    AgentSetFocus {
+        request: AgentFocusRequest,
+        response: Response<forge_domain::RegisteredAgentInstance>,
+    },
+    AgentPublishWorkUpdate {
+        request: AgentWorkUpdateRequest,
+        response: Response<forge_domain::AgentWorkUpdate>,
+    },
+    AgentDetach {
+        request: AgentDetachRequest,
+        response: Response<forge_domain::RegisteredAgentInstance>,
+    },
+    AgentList {
+        request: AgentListRequest,
+        response: Response<Vec<forge_domain::AgentAttachmentProjection>>,
+    },
+    AgentGetContext {
+        request: AgentContextRequest,
+        response: Response<Option<forge_domain::AgentContextProjection>>,
+    },
+    AgentDagGrantIssue {
+        request: AgentDagGrantIssueRequest,
+        response: Response<forge_domain::AgentDagAuthoringGrant>,
+    },
+    AgentDagGrantRevoke {
+        request: AgentDagGrantRevokeRequest,
+        response: Response<forge_domain::AgentDagAuthoringGrant>,
+    },
+    AgentDagGrantGet {
+        request: AgentDagGrantGetRequest,
+        response: Response<Option<forge_domain::AgentDagAuthoringGrant>>,
+    },
+    AgentDagGrantDiscover {
+        request: AgentDagGrantDiscoverRequest,
+        response: Response<Option<forge_domain::AgentDagAuthoringGrant>>,
+    },
+    AgentDagReplanCommit {
+        request: AgentDagReplanCommitRequest,
+        response: Response<forge_persistence::AgentDagReplanCommitResult>,
     },
     FileRead {
         request: FileReadRequest,
@@ -641,6 +704,40 @@ impl ForgeControlClient {
         self.submit_pending(|response| ForgeControlRequest::HarnessApply { request, response })
     }
 
+    pub fn harness_lifecycle_preview(
+        &self,
+        request: HarnessLifecyclePreviewRequest,
+    ) -> Result<HarnessLifecyclePreviewProjection, ControlClientError> {
+        self.submit_harness_lifecycle_preview(request)?.recv()
+    }
+
+    pub fn submit_harness_lifecycle_preview(
+        &self,
+        request: HarnessLifecyclePreviewRequest,
+    ) -> Result<PendingControl<HarnessLifecyclePreviewProjection>, ControlClientError> {
+        self.submit_pending(|response| ForgeControlRequest::HarnessLifecyclePreview {
+            request,
+            response,
+        })
+    }
+
+    pub fn harness_lifecycle_apply(
+        &self,
+        request: HarnessLifecycleApplyRequest,
+    ) -> Result<Option<AppliedHarness>, ControlClientError> {
+        self.submit_harness_lifecycle_apply(request)?.recv()
+    }
+
+    pub fn submit_harness_lifecycle_apply(
+        &self,
+        request: HarnessLifecycleApplyRequest,
+    ) -> Result<PendingControl<Option<AppliedHarness>>, ControlClientError> {
+        self.submit_pending(|response| ForgeControlRequest::HarnessLifecycleApply {
+            request,
+            response,
+        })
+    }
+
     pub fn harness_verify_source(
         &self,
         request: HarnessVerifyRequest,
@@ -843,6 +940,180 @@ impl ForgeControlClient {
         self.submit_pending(
             |response| ForgeControlRequest::ListWorkspaceActivityProjections { request, response },
         )
+    }
+
+    pub fn agent_attach(
+        &self,
+        request: AgentAttachRequest,
+    ) -> Result<forge_domain::RegisteredAgentInstance, ControlClientError> {
+        self.submit(|response| ForgeControlRequest::AgentAttach { request, response })
+    }
+
+    pub fn submit_agent_attach(
+        &self,
+        request: AgentAttachRequest,
+    ) -> Result<PendingControl<forge_domain::RegisteredAgentInstance>, ControlClientError> {
+        self.submit_pending(|response| ForgeControlRequest::AgentAttach { request, response })
+    }
+
+    pub fn agent_set_focus(
+        &self,
+        request: AgentFocusRequest,
+    ) -> Result<forge_domain::RegisteredAgentInstance, ControlClientError> {
+        self.submit(|response| ForgeControlRequest::AgentSetFocus { request, response })
+    }
+
+    pub fn submit_agent_set_focus(
+        &self,
+        request: AgentFocusRequest,
+    ) -> Result<PendingControl<forge_domain::RegisteredAgentInstance>, ControlClientError> {
+        self.submit_pending(|response| ForgeControlRequest::AgentSetFocus { request, response })
+    }
+
+    pub fn agent_publish_work_update(
+        &self,
+        request: AgentWorkUpdateRequest,
+    ) -> Result<forge_domain::AgentWorkUpdate, ControlClientError> {
+        self.submit(|response| ForgeControlRequest::AgentPublishWorkUpdate { request, response })
+    }
+
+    pub fn submit_agent_publish_work_update(
+        &self,
+        request: AgentWorkUpdateRequest,
+    ) -> Result<PendingControl<forge_domain::AgentWorkUpdate>, ControlClientError> {
+        self.submit_pending(|response| ForgeControlRequest::AgentPublishWorkUpdate {
+            request,
+            response,
+        })
+    }
+
+    pub fn agent_detach(
+        &self,
+        request: AgentDetachRequest,
+    ) -> Result<forge_domain::RegisteredAgentInstance, ControlClientError> {
+        self.submit(|response| ForgeControlRequest::AgentDetach { request, response })
+    }
+
+    pub fn submit_agent_detach(
+        &self,
+        request: AgentDetachRequest,
+    ) -> Result<PendingControl<forge_domain::RegisteredAgentInstance>, ControlClientError> {
+        self.submit_pending(|response| ForgeControlRequest::AgentDetach { request, response })
+    }
+
+    pub fn agent_list(
+        &self,
+        request: AgentListRequest,
+    ) -> Result<Vec<forge_domain::AgentAttachmentProjection>, ControlClientError> {
+        self.submit(|response| ForgeControlRequest::AgentList { request, response })
+    }
+
+    pub fn submit_agent_list(
+        &self,
+        request: AgentListRequest,
+    ) -> Result<PendingControl<Vec<forge_domain::AgentAttachmentProjection>>, ControlClientError>
+    {
+        self.submit_pending(|response| ForgeControlRequest::AgentList { request, response })
+    }
+
+    pub fn agent_get_context(
+        &self,
+        request: AgentContextRequest,
+    ) -> Result<Option<forge_domain::AgentContextProjection>, ControlClientError> {
+        self.submit(|response| ForgeControlRequest::AgentGetContext { request, response })
+    }
+
+    pub fn submit_agent_get_context(
+        &self,
+        request: AgentContextRequest,
+    ) -> Result<PendingControl<Option<forge_domain::AgentContextProjection>>, ControlClientError>
+    {
+        self.submit_pending(|response| ForgeControlRequest::AgentGetContext { request, response })
+    }
+
+    pub fn agent_dag_grant_issue(
+        &self,
+        request: AgentDagGrantIssueRequest,
+    ) -> Result<forge_domain::AgentDagAuthoringGrant, ControlClientError> {
+        self.submit_agent_dag_grant_issue(request)?.recv()
+    }
+
+    pub fn submit_agent_dag_grant_issue(
+        &self,
+        request: AgentDagGrantIssueRequest,
+    ) -> Result<PendingControl<forge_domain::AgentDagAuthoringGrant>, ControlClientError> {
+        self.submit_pending(|response| ForgeControlRequest::AgentDagGrantIssue {
+            request,
+            response,
+        })
+    }
+
+    pub fn agent_dag_grant_revoke(
+        &self,
+        request: AgentDagGrantRevokeRequest,
+    ) -> Result<forge_domain::AgentDagAuthoringGrant, ControlClientError> {
+        self.submit_agent_dag_grant_revoke(request)?.recv()
+    }
+
+    pub fn submit_agent_dag_grant_revoke(
+        &self,
+        request: AgentDagGrantRevokeRequest,
+    ) -> Result<PendingControl<forge_domain::AgentDagAuthoringGrant>, ControlClientError> {
+        self.submit_pending(|response| ForgeControlRequest::AgentDagGrantRevoke {
+            request,
+            response,
+        })
+    }
+
+    pub fn agent_dag_grant_get(
+        &self,
+        request: AgentDagGrantGetRequest,
+    ) -> Result<Option<forge_domain::AgentDagAuthoringGrant>, ControlClientError> {
+        self.submit_agent_dag_grant_get(request)?.recv()
+    }
+
+    pub fn submit_agent_dag_grant_get(
+        &self,
+        request: AgentDagGrantGetRequest,
+    ) -> Result<PendingControl<Option<forge_domain::AgentDagAuthoringGrant>>, ControlClientError>
+    {
+        self.submit_pending(|response| ForgeControlRequest::AgentDagGrantGet { request, response })
+    }
+
+    pub fn agent_dag_grant_discover(
+        &self,
+        request: AgentDagGrantDiscoverRequest,
+    ) -> Result<Option<forge_domain::AgentDagAuthoringGrant>, ControlClientError> {
+        self.submit_agent_dag_grant_discover(request)?.recv()
+    }
+
+    pub fn submit_agent_dag_grant_discover(
+        &self,
+        request: AgentDagGrantDiscoverRequest,
+    ) -> Result<PendingControl<Option<forge_domain::AgentDagAuthoringGrant>>, ControlClientError>
+    {
+        self.submit_pending(|response| ForgeControlRequest::AgentDagGrantDiscover {
+            request,
+            response,
+        })
+    }
+
+    pub fn agent_dag_replan_commit(
+        &self,
+        request: AgentDagReplanCommitRequest,
+    ) -> Result<forge_persistence::AgentDagReplanCommitResult, ControlClientError> {
+        self.submit_agent_dag_replan_commit(request)?.recv()
+    }
+
+    pub fn submit_agent_dag_replan_commit(
+        &self,
+        request: AgentDagReplanCommitRequest,
+    ) -> Result<PendingControl<forge_persistence::AgentDagReplanCommitResult>, ControlClientError>
+    {
+        self.submit_pending(|response| ForgeControlRequest::AgentDagReplanCommit {
+            request,
+            response,
+        })
     }
 
     /// Blocking confined file read through the single-owner application
@@ -1810,8 +2081,27 @@ fn dispatch_request(control: &ForgeControl, request: ForgeControlRequest) {
         ForgeControlRequest::HarnessApply { request, response } => {
             let _ignored = response.send(control.harness_apply(&request));
         }
+        ForgeControlRequest::HarnessLifecyclePreview { request, response } => {
+            let _ignored = response.send(control.harness_lifecycle_preview(&request));
+        }
+        ForgeControlRequest::HarnessLifecycleApply { request, response } => {
+            let _ignored = response.send(control.harness_lifecycle_apply(&request));
+        }
         ForgeControlRequest::HarnessVerifySource { request, response } => {
             let _ignored = response.send(control.harness_verify_source(&request));
+        }
+        request @ (ForgeControlRequest::AgentAttach { .. }
+        | ForgeControlRequest::AgentSetFocus { .. }
+        | ForgeControlRequest::AgentPublishWorkUpdate { .. }
+        | ForgeControlRequest::AgentDetach { .. }
+        | ForgeControlRequest::AgentList { .. }
+        | ForgeControlRequest::AgentGetContext { .. }
+        | ForgeControlRequest::AgentDagGrantIssue { .. }
+        | ForgeControlRequest::AgentDagGrantRevoke { .. }
+        | ForgeControlRequest::AgentDagGrantGet { .. }
+        | ForgeControlRequest::AgentDagGrantDiscover { .. }
+        | ForgeControlRequest::AgentDagReplanCommit { .. }) => {
+            dispatch_agent_request(control, request);
         }
         ForgeControlRequest::BootstrapActivity {
             scope,
@@ -1850,8 +2140,21 @@ fn dispatch_activity_request(control: &ForgeControl, request: ForgeControlReques
         | ForgeControlRequest::HarnessVerifierPersist { .. }
         | ForgeControlRequest::HarnessPreview { .. }
         | ForgeControlRequest::HarnessApply { .. }
+        | ForgeControlRequest::HarnessLifecyclePreview { .. }
+        | ForgeControlRequest::HarnessLifecycleApply { .. }
         | ForgeControlRequest::HarnessVerifySource { .. }
-        | ForgeControlRequest::BootstrapActivity { .. }) => {
+        | ForgeControlRequest::BootstrapActivity { .. }
+        | ForgeControlRequest::AgentAttach { .. }
+        | ForgeControlRequest::AgentSetFocus { .. }
+        | ForgeControlRequest::AgentPublishWorkUpdate { .. }
+        | ForgeControlRequest::AgentDetach { .. }
+        | ForgeControlRequest::AgentList { .. }
+        | ForgeControlRequest::AgentGetContext { .. }
+        | ForgeControlRequest::AgentDagGrantIssue { .. }
+        | ForgeControlRequest::AgentDagGrantRevoke { .. }
+        | ForgeControlRequest::AgentDagGrantGet { .. }
+        | ForgeControlRequest::AgentDagGrantDiscover { .. }
+        | ForgeControlRequest::AgentDagReplanCommit { .. }) => {
             dispatch_request(control, request);
         }
         ForgeControlRequest::RenewActivityLease {
@@ -2019,36 +2322,10 @@ fn dispatch_supervisor_request(control: &ForgeControl, request: ForgeControlRequ
 }
 
 fn dispatch_effect_request(control: &ForgeControl, request: ForgeControlRequest) {
+    let Some(request) = dispatch_workspace_effect_request(control, request) else {
+        return;
+    };
     match request {
-        ForgeControlRequest::ReconcileExpiredActivityLeases {
-            scope,
-            observed_at,
-            limit,
-            response,
-        } => {
-            let _ignored = response.send(control.reconcile_expired_activity_leases_limited(
-                &scope,
-                observed_at,
-                limit,
-            ));
-        }
-        ForgeControlRequest::ListActivityProjections {
-            scope,
-            now,
-            limit,
-            response,
-        } => {
-            let _ignored = response.send(control.list_activity_projections(&scope, now, limit));
-        }
-        ForgeControlRequest::ListWorkspaceActivityProjections { request, response } => {
-            let _ignored = response.send(control.list_workspace_activity_projections(&request));
-        }
-        ForgeControlRequest::FileRead { request, response } => {
-            dispatch_file_read(control, request, &response);
-        }
-        ForgeControlRequest::FileMutate { request, response } => {
-            dispatch_file_mutation(control, request, &response);
-        }
         request @ (ForgeControlRequest::ExecutionMarkRunning { .. }
         | ForgeControlRequest::ExecutionComplete { .. }
         | ForgeControlRequest::ExecutionFail { .. }
@@ -2105,7 +2382,98 @@ fn dispatch_effect_request(control: &ForgeControl, request: ForgeControlRequest)
         | ForgeControlRequest::DeleteOrphanDiffArtifact { .. }) => {
             dispatch_diff_request(control, request);
         }
+        request @ (ForgeControlRequest::AgentAttach { .. }
+        | ForgeControlRequest::AgentSetFocus { .. }
+        | ForgeControlRequest::AgentPublishWorkUpdate { .. }
+        | ForgeControlRequest::AgentDetach { .. }
+        | ForgeControlRequest::AgentList { .. }
+        | ForgeControlRequest::AgentGetContext { .. }
+        | ForgeControlRequest::AgentDagGrantIssue { .. }
+        | ForgeControlRequest::AgentDagGrantRevoke { .. }
+        | ForgeControlRequest::AgentDagGrantGet { .. }
+        | ForgeControlRequest::AgentDagGrantDiscover { .. }
+        | ForgeControlRequest::AgentDagReplanCommit { .. }) => {
+            dispatch_agent_request(control, request);
+        }
         other => dispatch_supervisor_request(control, other),
+    }
+}
+
+fn dispatch_workspace_effect_request(
+    control: &ForgeControl,
+    request: ForgeControlRequest,
+) -> Option<ForgeControlRequest> {
+    match request {
+        ForgeControlRequest::ReconcileExpiredActivityLeases {
+            scope,
+            observed_at,
+            limit,
+            response,
+        } => {
+            let _ignored = response.send(control.reconcile_expired_activity_leases_limited(
+                &scope,
+                observed_at,
+                limit,
+            ));
+        }
+        ForgeControlRequest::ListActivityProjections {
+            scope,
+            now,
+            limit,
+            response,
+        } => {
+            let _ignored = response.send(control.list_activity_projections(&scope, now, limit));
+        }
+        ForgeControlRequest::ListWorkspaceActivityProjections { request, response } => {
+            let _ignored = response.send(control.list_workspace_activity_projections(&request));
+        }
+        ForgeControlRequest::FileRead { request, response } => {
+            dispatch_file_read(control, request, &response);
+        }
+        ForgeControlRequest::FileMutate { request, response } => {
+            dispatch_file_mutation(control, request, &response);
+        }
+        other => return Some(other),
+    }
+    None
+}
+
+fn dispatch_agent_request(control: &ForgeControl, request: ForgeControlRequest) {
+    match request {
+        ForgeControlRequest::AgentAttach { request, response } => {
+            let _ignored = response.send(control.agent_attach(&request));
+        }
+        ForgeControlRequest::AgentSetFocus { request, response } => {
+            let _ignored = response.send(control.agent_set_focus(&request));
+        }
+        ForgeControlRequest::AgentPublishWorkUpdate { request, response } => {
+            let _ignored = response.send(control.agent_publish_work_update(&request));
+        }
+        ForgeControlRequest::AgentDetach { request, response } => {
+            let _ignored = response.send(control.agent_detach(&request));
+        }
+        ForgeControlRequest::AgentList { request, response } => {
+            let _ignored = response.send(control.agent_list(&request));
+        }
+        ForgeControlRequest::AgentGetContext { request, response } => {
+            let _ignored = response.send(control.agent_get_context(&request));
+        }
+        ForgeControlRequest::AgentDagGrantIssue { request, response } => {
+            let _ignored = response.send(control.agent_dag_grant_issue(&request));
+        }
+        ForgeControlRequest::AgentDagGrantRevoke { request, response } => {
+            let _ignored = response.send(control.agent_dag_grant_revoke(&request));
+        }
+        ForgeControlRequest::AgentDagGrantGet { request, response } => {
+            let _ignored = response.send(control.agent_dag_grant_get(&request));
+        }
+        ForgeControlRequest::AgentDagGrantDiscover { request, response } => {
+            let _ignored = response.send(control.agent_dag_grant_discover(&request));
+        }
+        ForgeControlRequest::AgentDagReplanCommit { request, response } => {
+            let _ignored = response.send(control.agent_dag_replan_commit(&request));
+        }
+        other => dispatch_effect_request(control, other),
     }
 }
 
@@ -2668,6 +3036,7 @@ fn close_owned_activities(
     report
 }
 
+#[allow(clippy::too_many_lines)]
 fn drain_queued_requests(receiver: &Receiver<ForgeControlRequest>) {
     while let Ok(request) = receiver.try_recv() {
         match request {
@@ -2680,8 +3049,21 @@ fn drain_queued_requests(receiver: &Receiver<ForgeControlRequest>) {
             | ForgeControlRequest::HarnessVerifierPersist { .. }
             | ForgeControlRequest::HarnessPreview { .. }
             | ForgeControlRequest::HarnessApply { .. }
+            | ForgeControlRequest::HarnessLifecyclePreview { .. }
+            | ForgeControlRequest::HarnessLifecycleApply { .. }
             | ForgeControlRequest::HarnessVerifySource { .. }
             | ForgeControlRequest::BootstrapActivity { .. }) => reject_queued_workspace(request),
+            request @ (ForgeControlRequest::AgentAttach { .. }
+            | ForgeControlRequest::AgentSetFocus { .. }
+            | ForgeControlRequest::AgentPublishWorkUpdate { .. }
+            | ForgeControlRequest::AgentDetach { .. }
+            | ForgeControlRequest::AgentList { .. }
+            | ForgeControlRequest::AgentGetContext { .. }
+            | ForgeControlRequest::AgentDagGrantIssue { .. }
+            | ForgeControlRequest::AgentDagGrantRevoke { .. }
+            | ForgeControlRequest::AgentDagGrantGet { .. }
+            | ForgeControlRequest::AgentDagGrantDiscover { .. }
+            | ForgeControlRequest::AgentDagReplanCommit { .. }) => reject_queued_agent(request),
             ForgeControlRequest::RenewActivityLease { response, .. }
             | ForgeControlRequest::RenewActivityLeaseBatch { response, .. }
             | ForgeControlRequest::CloseActivity { response, .. }
@@ -2767,6 +3149,44 @@ fn drain_queued_requests(receiver: &Receiver<ForgeControlRequest>) {
     }
 }
 
+fn reject_queued_agent(request: ForgeControlRequest) {
+    match request {
+        ForgeControlRequest::AgentAttach { response, .. }
+        | ForgeControlRequest::AgentSetFocus { response, .. }
+        | ForgeControlRequest::AgentDetach { response, .. } => {
+            let _ignored =
+                response.send(Err(ControlError::new(ControlErrorCode::WorkerShuttingDown)));
+        }
+        ForgeControlRequest::AgentPublishWorkUpdate { response, .. } => {
+            let _ignored =
+                response.send(Err(ControlError::new(ControlErrorCode::WorkerShuttingDown)));
+        }
+        ForgeControlRequest::AgentList { response, .. } => {
+            let _ignored =
+                response.send(Err(ControlError::new(ControlErrorCode::WorkerShuttingDown)));
+        }
+        ForgeControlRequest::AgentGetContext { response, .. } => {
+            let _ignored =
+                response.send(Err(ControlError::new(ControlErrorCode::WorkerShuttingDown)));
+        }
+        ForgeControlRequest::AgentDagGrantIssue { response, .. }
+        | ForgeControlRequest::AgentDagGrantRevoke { response, .. } => {
+            let _ignored =
+                response.send(Err(ControlError::new(ControlErrorCode::WorkerShuttingDown)));
+        }
+        ForgeControlRequest::AgentDagGrantGet { response, .. }
+        | ForgeControlRequest::AgentDagGrantDiscover { response, .. } => {
+            let _ignored =
+                response.send(Err(ControlError::new(ControlErrorCode::WorkerShuttingDown)));
+        }
+        ForgeControlRequest::AgentDagReplanCommit { response, .. } => {
+            let _ignored =
+                response.send(Err(ControlError::new(ControlErrorCode::WorkerShuttingDown)));
+        }
+        other => reject_queued_workspace(other),
+    }
+}
+
 fn reject_queued_workspace(request: ForgeControlRequest) {
     match request {
         ForgeControlRequest::WorkspaceList { response, .. } => {
@@ -2781,7 +3201,8 @@ fn reject_queued_workspace(request: ForgeControlRequest) {
         ForgeControlRequest::WorkspaceIdentityDoctor { response } => {
             let _ignored = response.send(worker_shutting_down());
         }
-        ForgeControlRequest::HarnessGetApplied { response, .. } => {
+        ForgeControlRequest::HarnessGetApplied { response, .. }
+        | ForgeControlRequest::HarnessLifecycleApply { response, .. } => {
             let _ignored = response.send(worker_shutting_down());
         }
         ForgeControlRequest::HarnessVerifierGetLatest { response, .. } => {
@@ -2795,6 +3216,9 @@ fn reject_queued_workspace(request: ForgeControlRequest) {
         }
         ForgeControlRequest::HarnessApply { response, .. }
         | ForgeControlRequest::HarnessVerifySource { response, .. } => {
+            let _ignored = response.send(worker_shutting_down());
+        }
+        ForgeControlRequest::HarnessLifecyclePreview { response, .. } => {
             let _ignored = response.send(worker_shutting_down());
         }
         ForgeControlRequest::BootstrapActivity { response, .. } => {
@@ -2952,7 +3376,11 @@ fn worker_shutting_down<T>() -> Result<T, ControlError> {
 mod tests {
     use std::path::Path;
 
-    use forge_domain::{LocationId, LocationRevision, WorkspaceId, WorkspaceRevision};
+    use forge_domain::{
+        ActivityId, AgentDeclaredRole, AgentDisplayName, AgentInstanceId, AgentTransportKind,
+        LocationId, LocationRevision, RegisteredAgentInstance, TimestampMillis, WorkspaceId,
+        WorkspaceRevision,
+    };
     use forge_workspace::WorkspaceLocator;
     use uuid::Uuid;
 
@@ -3052,6 +3480,45 @@ mod tests {
         drain_queued_requests(&request_receiver);
         let Err(error) = response_receiver.recv()? else {
             return Err("shutdown unexpectedly accepted queued Workspace Doctor".into());
+        };
+        assert_eq!(error.code(), ControlErrorCode::WorkerShuttingDown);
+        Ok(())
+    }
+
+    #[test]
+    fn queued_agent_requests_are_rejected_during_shutdown_drain()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let scope = ResolvedWorkspaceScope::from_observation(
+            WorkspaceId::from_uuid(Uuid::from_u128(0x4001)),
+            WorkspaceRevision::INITIAL,
+            WorkspaceLocator::new(
+                LocationId::from_uuid(Uuid::from_u128(0x4002)),
+                LocationRevision::INITIAL,
+                Path::new("."),
+            )?,
+        );
+        let agent = RegisteredAgentInstance::create(
+            AgentInstanceId::from_uuid(Uuid::from_u128(0x4003)),
+            scope.workspace_id(),
+            ActivityId::from_uuid(Uuid::from_u128(0x4004)),
+            AgentDisplayName::new("Planner".to_owned())?,
+            AgentDeclaredRole::new("planner".to_owned())?,
+            AgentTransportKind::Mcp,
+            TimestampMillis::new(1)?,
+        );
+        let (request_sender, request_receiver) = mpsc::sync_channel(1);
+        let (response_sender, response_receiver) = mpsc::sync_channel(1);
+        request_sender.send(ForgeControlRequest::AgentAttach {
+            request: AgentAttachRequest {
+                scope,
+                activity_id: agent.activity_id(),
+                agent,
+            },
+            response: response_sender,
+        })?;
+        drain_queued_requests(&request_receiver);
+        let Err(error) = response_receiver.recv()? else {
+            return Err("queued Agent attach was unexpectedly accepted".into());
         };
         assert_eq!(error.code(), ControlErrorCode::WorkerShuttingDown);
         Ok(())

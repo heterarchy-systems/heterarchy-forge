@@ -430,6 +430,47 @@ impl ConfinedWorkspace {
         Ok(post)
     }
 
+    /// Delete one Harness-owned regular file under an already-held Workspace
+    /// writer guard. The exact previewed file state is a compare-before-delete
+    /// guard; this helper deliberately does not reacquire the mutation lock.
+    pub(crate) fn delete_bounded_atomic(
+        &self,
+        _write_guard: &ConfinedWorkspaceWriteGuard,
+        path: &WorkspaceRelativePath,
+        expected: FilePathState,
+        maximum: usize,
+    ) -> Result<FilePathState, ConfinedFilesystemError> {
+        if !matches!(expected, FilePathState::Regular { .. }) {
+            return Err(ConfinedFilesystemError::InvalidPayload);
+        }
+        self.ensure_root()?;
+        let (parent, basename, _) = self.open_parent(path)?;
+        let current = read_leaf(&parent, &basename, maximum, None)?
+            .map_or(FilePathState::Absent, |read| read.state);
+        if current != expected {
+            return Err(ConfinedFilesystemError::StaleWrite);
+        }
+        unlinkat(&parent, &basename, AtFlags::empty()).map_err(|source| {
+            ConfinedFilesystemError::Syscall {
+                operation: FilesystemOperation::DeleteLeaf,
+                committed: false,
+                source,
+            }
+        })?;
+        fsync(&parent).map_err(|source| ConfinedFilesystemError::Syscall {
+            operation: FilesystemOperation::SyncParent,
+            committed: true,
+            source,
+        })?;
+        self.ensure_root_with_committed(true)?;
+        let post = read_leaf(&parent, &basename, maximum, None)?
+            .map_or(FilePathState::Absent, |read| read.state);
+        if post != FilePathState::Absent {
+            return Err(ConfinedFilesystemError::CommittedObservationFailed);
+        }
+        Ok(post)
+    }
+
     /// Read a checkpoint-sized regular file through the same descriptor-rooted
     /// no-follow traversal used by Workspace mutations. The root and owned
     /// state directory are revalidated before and after the read.

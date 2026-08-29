@@ -3,10 +3,16 @@
 use std::env;
 use std::fs;
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use forge_control::{ForgeControl, ForgeControlClient};
+use forge_control::{ForgeControl, ForgeControlClient, McpTokenIssueRequest};
+use forge_domain::{
+    LocationId, LocationRevision, McpTokenId, McpTokenLabel, McpTokenRevision,
+    McpTokenWorkspaceScope, TimestampMillis, WorkspaceId, WorkspaceRevision,
+};
 use forge_persistence::{GlobalRegistry, RegistryHealth};
 use forge_platform::{AppPaths, init_logging};
+use forge_workspace::WorkspaceLocator;
 use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -14,25 +20,55 @@ use tokio::runtime::Builder;
 use uuid::Uuid;
 
 use forge_control::ControlWorkerError;
-use forge_mcp::{MCP_TOOL_NAMES, McpServerProcess, McpServerProcessError, McpShutdownReport};
+use forge_mcp::{
+    MCP_TOOL_NAMES, McpHttpServerHandle, McpServerProcess, McpServerProcessError,
+    McpShutdownReport, McpTokenRuntime, McpTokenRuntimeError,
+};
 
 const REGISTRY_PATH_ENV: &str = "HETERARCHY_FORGE_REGISTRY_PATH";
 const DOCTOR_ARG: &str = "--doctor";
 const DOCTOR_DUPLEX_CAPACITY: usize = 32 * 1024;
 
 fn main() {
-    let doctor = env::args().any(|argument| argument == DOCTOR_ARG);
-    if let Err(error) = run(doctor) {
+    let arguments = env::args().skip(1).collect::<Vec<_>>();
+    let command = parse_command(&arguments);
+    if let Err(error) = command.and_then(run) {
         eprintln!("forge-mcp failed: {error}");
         std::process::exit(1);
     }
 }
 
-fn run(doctor: bool) -> Result<(), MainError> {
+#[derive(Debug)]
+enum MainCommand {
+    Stdio,
+    Doctor,
+    HttpServe {
+        port: u16,
+    },
+    TokenIssue {
+        label: McpTokenLabel,
+        location_id: LocationId,
+        location_revision: LocationRevision,
+        workspace_id: WorkspaceId,
+        workspace_revision: WorkspaceRevision,
+        locator: WorkspaceLocator,
+    },
+    TokenRotate {
+        id: McpTokenId,
+        revision: McpTokenRevision,
+    },
+    TokenRevoke {
+        id: McpTokenId,
+        revision: McpTokenRevision,
+    },
+    TokenList,
+}
+
+fn run(command: MainCommand) -> Result<(), MainError> {
     let paths = AppPaths::discover().map_err(MainError::AppPaths)?;
     let registry_path =
         env::var_os(REGISTRY_PATH_ENV).map_or_else(|| paths.global_registry_path(), PathBuf::from);
-    if doctor {
+    if matches!(command, MainCommand::Doctor) {
         let registry_health = GlobalRegistry::inspect_existing_read_only(&registry_path)
             .map_err(MainError::Registry)?;
         return run_doctor_mode(registry_health);
@@ -51,7 +87,7 @@ fn run(doctor: bool) -> Result<(), MainError> {
         .build()
         .map_err(MainError::Runtime)?;
 
-    let result = runtime.block_on(run_stdio(client));
+    let result = execute_command(command, &paths, client, &runtime);
 
     // The MCP process closes its owned Activities before returning.  The
     // control worker is a separate owner and must be stopped and joined after
@@ -59,6 +95,223 @@ fn run(doctor: bool) -> Result<(), MainError> {
     worker.shutdown().map_err(MainError::ControlWorker)?;
     result?;
     Ok(())
+}
+
+fn execute_command(
+    command: MainCommand,
+    paths: &AppPaths,
+    client: ForgeControlClient,
+    runtime: &tokio::runtime::Runtime,
+) -> Result<(), MainError> {
+    match command {
+        MainCommand::Stdio => runtime.block_on(run_stdio(client)),
+        MainCommand::HttpServe { port } => {
+            let token_runtime =
+                McpTokenRuntime::start(paths, forge_mcp::McpTokenBootstrapMode::ExistingAuthority)
+                    .map_err(MainError::TokenRuntime)?;
+            runtime.block_on(run_http(client, token_runtime, port))
+        }
+        MainCommand::TokenIssue {
+            label,
+            location_id,
+            location_revision,
+            workspace_id,
+            workspace_revision,
+            locator,
+        } => {
+            let scope = client
+                .resolve_workspace(location_id, location_revision, locator)
+                .map_err(MainError::ControlClient)?;
+            if scope.workspace_id() != workspace_id
+                || scope.workspace_revision() != workspace_revision
+            {
+                return Err(MainError::Arguments(
+                    "token scope does not match the current durable Workspace".to_owned(),
+                ));
+            }
+            let mut token_runtime = McpTokenRuntime::start(
+                paths,
+                forge_mcp::McpTokenBootstrapMode::InitializeAuthority,
+            )
+            .map_err(MainError::TokenRuntime)?;
+            let issued = token_runtime
+                .issue(
+                    McpTokenIssueRequest::new(
+                        label,
+                        vec![McpTokenWorkspaceScope::new(location_id, workspace_id)],
+                        current_timestamp()?,
+                    )
+                    .map_err(|error| MainError::Arguments(error.to_string()))?,
+                )
+                .map_err(MainError::TokenClient)?;
+            println!("token_id={}", issued.metadata().id());
+            println!("bearer_token={}", issued.reveal().as_str());
+            println!("scope={location_id}/{workspace_id}");
+            token_runtime.shutdown().map_err(MainError::TokenWorker)?;
+            Ok(())
+        }
+        MainCommand::TokenRotate { id, revision } => {
+            let mut token_runtime =
+                McpTokenRuntime::start(paths, forge_mcp::McpTokenBootstrapMode::ExistingAuthority)
+                    .map_err(MainError::TokenRuntime)?;
+            let rotated = token_runtime
+                .rotate(id, revision, current_timestamp()?)
+                .map_err(MainError::TokenClient)?;
+            println!("token_id={}", rotated.replacement().metadata().id());
+            println!("bearer_token={}", rotated.replacement().reveal().as_str());
+            token_runtime.shutdown().map_err(MainError::TokenWorker)?;
+            Ok(())
+        }
+        MainCommand::TokenRevoke { id, revision } => {
+            let mut token_runtime =
+                McpTokenRuntime::start(paths, forge_mcp::McpTokenBootstrapMode::ExistingAuthority)
+                    .map_err(MainError::TokenRuntime)?;
+            let revoked = token_runtime
+                .revoke(id, revision, current_timestamp()?)
+                .map_err(MainError::TokenClient)?;
+            println!("token_id={}", revoked.id());
+            println!("state=revoked");
+            token_runtime.shutdown().map_err(MainError::TokenWorker)?;
+            Ok(())
+        }
+        MainCommand::TokenList => {
+            let mut token_runtime =
+                McpTokenRuntime::start(paths, forge_mcp::McpTokenBootstrapMode::ExistingAuthority)
+                    .map_err(MainError::TokenRuntime)?;
+            for token in token_runtime
+                .list(forge_control::MAX_MCP_TOKEN_LIST_RESULTS)
+                .map_err(MainError::TokenClient)?
+            {
+                println!(
+                    "token_id={} state={:?} revision={} scopes={} label={}",
+                    token.id(),
+                    token.state(),
+                    token.revision().get(),
+                    token.scopes().len(),
+                    token.label().as_str()
+                );
+            }
+            token_runtime.shutdown().map_err(MainError::TokenWorker)?;
+            Ok(())
+        }
+        MainCommand::Doctor => Err(MainError::Arguments(
+            "doctor command reached normal runtime".to_owned(),
+        )),
+    }
+}
+
+async fn run_http(
+    client: ForgeControlClient,
+    mut token_runtime: McpTokenRuntime,
+    port: u16,
+) -> Result<(), MainError> {
+    let server = McpHttpServerHandle::start(client, token_runtime.client(), port)
+        .await
+        .map_err(MainError::Http)?;
+    println!("mcp_endpoint={}", server.endpoint());
+    tokio::signal::ctrl_c().await.map_err(MainError::Signal)?;
+    let _report = server.shutdown().await.map_err(MainError::Http)?;
+    token_runtime.shutdown().map_err(MainError::TokenWorker)?;
+    Ok(())
+}
+
+fn parse_command(arguments: &[String]) -> Result<MainCommand, MainError> {
+    if arguments.is_empty() {
+        return Ok(MainCommand::Stdio);
+    }
+    if arguments == [DOCTOR_ARG] {
+        return Ok(MainCommand::Doctor);
+    }
+    match arguments.first().map(String::as_str) {
+        Some("http") if arguments.get(1).map(String::as_str) == Some("serve") => {
+            if arguments.len() != 3 {
+                return Err(argument_usage());
+            }
+            let port = arguments[2]
+                .parse::<u16>()
+                .map_err(|_| MainError::Arguments("HTTP port is invalid".to_owned()))?;
+            Ok(MainCommand::HttpServe { port })
+        }
+        Some("token") if arguments.get(1).map(String::as_str) == Some("issue") => {
+            if arguments.len() != 8 {
+                return Err(argument_usage());
+            }
+            Ok(MainCommand::TokenIssue {
+                label: McpTokenLabel::new(arguments[2].clone())
+                    .map_err(|_| MainError::Arguments("token label is invalid".to_owned()))?,
+                location_id: arguments[3]
+                    .parse()
+                    .map_err(|_| MainError::Arguments("Location id is invalid".to_owned()))?,
+                location_revision: LocationRevision::new(parse_i64(
+                    &arguments[4],
+                    "Location revision",
+                )?)
+                .map_err(|_| MainError::Arguments("Location revision is invalid".to_owned()))?,
+                workspace_id: arguments[5]
+                    .parse()
+                    .map_err(|_| MainError::Arguments("Workspace id is invalid".to_owned()))?,
+                workspace_revision: WorkspaceRevision::new(parse_i64(
+                    &arguments[6],
+                    "Workspace revision",
+                )?)
+                .map_err(|_| MainError::Arguments("Workspace revision is invalid".to_owned()))?,
+                locator: WorkspaceLocator::decode(&arguments[7])
+                    .map_err(|_| MainError::Arguments("Workspace locator is invalid".to_owned()))?,
+            })
+        }
+        Some("token") if arguments.get(1).map(String::as_str) == Some("rotate") => {
+            parse_token_revision_command(arguments, true)
+        }
+        Some("token") if arguments.get(1).map(String::as_str) == Some("revoke") => {
+            parse_token_revision_command(arguments, false)
+        }
+        Some("token")
+            if arguments.get(1).map(String::as_str) == Some("list") && arguments.len() == 2 =>
+        {
+            Ok(MainCommand::TokenList)
+        }
+        Some(_) | None => Err(argument_usage()),
+    }
+}
+
+fn parse_token_revision_command(
+    arguments: &[String],
+    rotate: bool,
+) -> Result<MainCommand, MainError> {
+    if arguments.len() != 4 {
+        return Err(argument_usage());
+    }
+    let id = arguments[2]
+        .parse()
+        .map_err(|_| MainError::Arguments("token id is invalid".to_owned()))?;
+    let revision = McpTokenRevision::new(parse_i64(&arguments[3], "token revision")?)
+        .map_err(|_| MainError::Arguments("token revision is invalid".to_owned()))?;
+    if rotate {
+        Ok(MainCommand::TokenRotate { id, revision })
+    } else {
+        Ok(MainCommand::TokenRevoke { id, revision })
+    }
+}
+
+fn parse_i64(value: &str, label: &str) -> Result<i64, MainError> {
+    value
+        .parse()
+        .map_err(|_| MainError::Arguments(format!("{label} is invalid")))
+}
+
+fn argument_usage() -> MainError {
+    MainError::Arguments(
+        "usage: forge-mcp [--doctor|http serve <port>|token issue <label> <location-id> <location-revision> <workspace-id> <workspace-revision> <locator>|token rotate <token-id> <revision>|token revoke <token-id> <revision>|token list]"
+            .to_owned(),
+    )
+}
+
+fn current_timestamp() -> Result<TimestampMillis, MainError> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| MainError::Clock)?;
+    let millis = i64::try_from(duration.as_millis()).map_err(|_| MainError::Clock)?;
+    TimestampMillis::new(millis).map_err(|_| MainError::Clock)
 }
 
 fn run_doctor_mode(registry_health: Option<RegistryHealth>) -> Result<(), MainError> {
@@ -172,7 +425,7 @@ impl Drop for DoctorRegistry {
 
 #[derive(Debug)]
 struct DoctorSmokeReport {
-    tool_names: [&'static str; 12],
+    tool_names: [&'static str; 22],
     shutdown_report: McpShutdownReport,
 }
 
@@ -275,7 +528,7 @@ where
     serde_json::from_str(&line).map_err(MainError::DoctorJson)
 }
 
-fn tool_names(response: &Value) -> Result<[&'static str; 12], MainError> {
+fn tool_names(response: &Value) -> Result<[&'static str; 22], MainError> {
     let tools = response["result"]["tools"]
         .as_array()
         .ok_or(MainError::DoctorInvariant(
@@ -294,6 +547,8 @@ fn tool_names(response: &Value) -> Result<[&'static str; 12], MainError> {
 
 #[derive(Debug, Error)]
 enum MainError {
+    #[error("invalid arguments: {0}")]
+    Arguments(String),
     #[error("application paths failed")]
     AppPaths(#[source] forge_platform::AppPathError),
     #[error("logging initialization failed")]
@@ -302,10 +557,24 @@ enum MainError {
     Registry(#[source] forge_persistence::RegistryError),
     #[error("control worker lifecycle failed")]
     ControlWorker(#[source] ControlWorkerError),
+    #[error("control client operation failed")]
+    ControlClient(#[source] forge_control::ControlClientError),
     #[error("Tokio runtime startup failed")]
     Runtime(#[source] std::io::Error),
     #[error("MCP server lifecycle failed")]
     Mcp(#[source] McpServerProcessError),
+    #[error("MCP HTTP server lifecycle failed")]
+    Http(#[source] forge_mcp::McpHttpServerError),
+    #[error("MCP token runtime bootstrap failed")]
+    TokenRuntime(#[source] McpTokenRuntimeError),
+    #[error("MCP token worker lifecycle failed")]
+    TokenWorker(#[source] forge_control::McpTokenWorkerError),
+    #[error("MCP token operation failed")]
+    TokenClient(#[source] forge_control::McpTokenClientError),
+    #[error("MCP HTTP shutdown signal failed")]
+    Signal(#[source] std::io::Error),
+    #[error("system clock is outside the supported range")]
+    Clock,
     #[error("doctor check failed: {0}")]
     DoctorInvariant(&'static str),
     #[error("doctor JSON processing failed")]
@@ -314,4 +583,45 @@ enum MainError {
     DoctorTask(#[source] tokio::task::JoinError),
     #[error("doctor transport I/O failed")]
     DoctorIo(#[source] std::io::Error),
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn command_parser_preserves_stdio_doctor_and_explicit_http_modes() {
+        assert!(matches!(parse_command(&[]), Ok(MainCommand::Stdio)));
+        assert!(matches!(
+            parse_command(&["--doctor".to_owned()]),
+            Ok(MainCommand::Doctor)
+        ));
+        assert!(matches!(
+            parse_command(&["http".to_owned(), "serve".to_owned(), "8765".to_owned()]),
+            Ok(MainCommand::HttpServe { port: 8765 })
+        ));
+        assert!(parse_command(&["http".to_owned(), "serve".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn token_commands_reject_malformed_identity_and_revision() {
+        assert!(
+            parse_command(&[
+                "token".to_owned(),
+                "rotate".to_owned(),
+                "not-a-token".to_owned(),
+                "1".to_owned(),
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_command(&[
+                "token".to_owned(),
+                "revoke".to_owned(),
+                Uuid::from_u128(1).to_string(),
+                "0".to_owned(),
+            ])
+            .is_err()
+        );
+    }
 }

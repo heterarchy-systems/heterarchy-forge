@@ -54,6 +54,14 @@ pub enum ControlErrorCode {
     CheckpointUnavailable = 1875,
     HarnessNotFound = 1880,
     HarnessConflict = 1881,
+    AgentNotFound = 1890,
+    AgentConflict = 1891,
+    AgentFocusConflict = 1892,
+    AgentEvidenceConflict = 1893,
+    AgentDagGrantNotFound = 1894,
+    AgentDagGrantConflict = 1895,
+    AgentDagReplanConflict = 1896,
+    AgentDagReplayConflict = 1897,
     Internal = 1900,
 }
 
@@ -105,6 +113,14 @@ impl ControlErrorCode {
             Self::CheckpointUnavailable => "CONTROL_CHECKPOINT_UNAVAILABLE",
             Self::HarnessNotFound => "CONTROL_HARNESS_NOT_FOUND",
             Self::HarnessConflict => "CONTROL_HARNESS_CONFLICT",
+            Self::AgentNotFound => "CONTROL_AGENT_NOT_FOUND",
+            Self::AgentConflict => "CONTROL_AGENT_CONFLICT",
+            Self::AgentFocusConflict => "CONTROL_AGENT_FOCUS_CONFLICT",
+            Self::AgentEvidenceConflict => "CONTROL_AGENT_EVIDENCE_CONFLICT",
+            Self::AgentDagGrantNotFound => "CONTROL_AGENT_DAG_GRANT_NOT_FOUND",
+            Self::AgentDagGrantConflict => "CONTROL_AGENT_DAG_GRANT_CONFLICT",
+            Self::AgentDagReplanConflict => "CONTROL_AGENT_DAG_REPLAN_CONFLICT",
+            Self::AgentDagReplayConflict => "CONTROL_AGENT_DAG_REPLAY_CONFLICT",
             Self::Internal => "CONTROL_INTERNAL",
         }
     }
@@ -165,6 +181,22 @@ impl ControlErrorCode {
             }
             Self::HarnessNotFound => "no Harness Bundle is applied to the Workspace",
             Self::HarnessConflict => "the Harness state conflicts with durable authority",
+            Self::AgentNotFound => "the requested Agent instance was not found",
+            Self::AgentConflict => "the Agent instance conflicts with durable state",
+            Self::AgentFocusConflict => "the Agent focus conflicts with the current Goal or DAG",
+            Self::AgentEvidenceConflict => {
+                "the Agent public evidence reference conflicts with Workspace evidence"
+            }
+            Self::AgentDagGrantNotFound => "the Agent DAG authoring grant was not found",
+            Self::AgentDagGrantConflict => {
+                "the Agent DAG authoring grant conflicts with durable authority"
+            }
+            Self::AgentDagReplanConflict => {
+                "the Agent DAG replan conflicts with the current Goal or DAG head"
+            }
+            Self::AgentDagReplayConflict => {
+                "the Agent DAG replan request conflicts with its replay ledger"
+            }
             Self::Internal => "the control service encountered an internal failure",
         }
     }

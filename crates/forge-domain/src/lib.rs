@@ -1,5 +1,7 @@
 //! Typed, deterministic domain models for Heterarchy Forge.
 
+mod agent;
+mod agent_dag;
 mod approval;
 mod checkpoint;
 mod dag;
@@ -9,12 +11,38 @@ mod execution;
 mod filesystem;
 mod goal;
 mod harness;
+mod harness_skill;
 mod harness_verifier;
 mod location;
+mod mcp_connection;
+mod mcp_token;
 mod recovery;
 mod runtime;
 mod workspace;
 
+pub use agent::{
+    AgentAttachmentProjection, AgentAttachmentState, AgentContextProjection, AgentDeclaredRole,
+    AgentDisplayName, AgentFocus, AgentFocusError, AgentFocusEvent, AgentFocusEventKind,
+    AgentFocusEventSequence, AgentFocusEventSequenceError, AgentFocusNode, AgentInstanceId,
+    AgentInstanceIdParseError, AgentInstanceRevision, AgentInstanceRevisionError, AgentListLimit,
+    AgentListLimitError, AgentMetadataError, AgentTransitionError, AgentTransportKind,
+    AgentWorkPhase, AgentWorkSummary, AgentWorkSummaryError, AgentWorkUpdate, AgentWorkUpdateError,
+    AgentWorkUpdateId, AgentWorkUpdateIdParseError, AgentWorkUpdateSequence,
+    AgentWorkUpdateSequenceError, AttachAgent, DetachAgent, MAX_AGENT_DISPLAY_NAME_BYTES,
+    MAX_AGENT_FOCUS_EVENTS, MAX_AGENT_LIST_RESULTS, MAX_AGENT_ROLE_BYTES,
+    MAX_AGENT_WORK_EVIDENCE_REFS, MAX_AGENT_WORK_SUMMARY_BYTES, MAX_AGENT_WORK_UPDATES,
+    PublishAgentWorkUpdate, RegisteredAgentInstance, SetAgentFocus,
+};
+pub use agent_dag::{
+    AgentAuthoringCredential, AgentDagAuthoringActor, AgentDagAuthoringGrant,
+    AgentDagAuthoringGrantAvailability, AgentDagAuthoringGrantError, AgentDagAuthoringGrantId,
+    AgentDagAuthoringGrantIdParseError, AgentDagAuthoringGrantRevision,
+    AgentDagAuthoringGrantRevisionError, AgentDagAuthoringGrantState, AgentDagAuthoringGrantTtl,
+    AgentDagAuthoringGrantTtlError, AgentDagDraft, AgentDagDraftDigest, AgentDagDraftError,
+    AgentDagReplanReceipt, AgentDagReplanRequest, AgentDagReplanRequestId,
+    AgentDagReplanRequestIdParseError, DEFAULT_AGENT_DAG_AUTHORING_GRANT_TTL_MILLIS,
+    MAX_AGENT_DAG_AUTHORING_GRANT_TTL_MILLIS, MAX_AGENT_DAG_REPLAN_REQUESTS,
+};
 pub use approval::{
     ApprovalDecision, ApprovalRequestId, ApprovalRequestState, ApprovalRevision,
     AuthorizationSource, AutoApprovalScope, AutoApprovalScopeId, AutoApprovalScopeRevision,
@@ -105,18 +133,37 @@ pub use harness::{
     MAX_HARNESS_MANAGED_FILES, MAX_HARNESS_NAME_BYTES, MAX_HARNESS_SKILLS, MAX_HARNESS_VERIFIERS,
     MAX_HARNESS_VERSION_BYTES, RegisteredHarnessBundle, RegisteredHarnessBundleError,
 };
+pub use harness_skill::{
+    HarnessSkillDescriptor, HarnessSkillDescriptorError, HarnessSkillId, HarnessSkillIdParseError,
+    HarnessSkillName, HarnessSkillNameError, HarnessSkillRevision, HarnessSkillRevisionError,
+    MAX_HARNESS_SKILL_FILES, MAX_HARNESS_SKILL_NAME_BYTES, RegisteredHarnessSkill,
+    RegisteredHarnessSkillError,
+};
 pub use harness_verifier::{
-    HarnessVerifierDomainError, HarnessVerifierItem, HarnessVerifierItemState, HarnessVerifierName,
-    HarnessVerifierNameError, HarnessVerifierRun, HarnessVerifierRunAttribution,
-    HarnessVerifierRunId, HarnessVerifierRunIdParseError, HarnessVerifierRunRevision,
-    HarnessVerifierRunRevisionError, HarnessVerifierRunState, HarnessVerifierRunTimestamps,
-    MAX_HARNESS_VERIFIER_NAME_BYTES,
+    HarnessVerifierDomainError, HarnessVerifierItem, HarnessVerifierItemIdentity,
+    HarnessVerifierItemState, HarnessVerifierName, HarnessVerifierNameError, HarnessVerifierRun,
+    HarnessVerifierRunAttribution, HarnessVerifierRunId, HarnessVerifierRunIdParseError,
+    HarnessVerifierRunRevision, HarnessVerifierRunRevisionError, HarnessVerifierRunState,
+    HarnessVerifierRunTimestamps, MAX_HARNESS_VERIFIER_NAME_BYTES,
 };
 pub use location::{
     LocationId, LocationIdParseError, LocationListLimit, LocationListLimitError, LocationName,
     LocationNameError, LocationRevision, LocationRevisionError, LocationRoot, LocationRootError,
     LocationState, RegisterLocation, RegisteredLocation, SetLocationState, TimestampMillis,
     TimestampMillisError,
+};
+pub use mcp_connection::{
+    DEFAULT_MCP_LOCAL_PORT, MAX_MCP_ENDPOINT_BYTES, MAX_MCP_PUBLIC_HOST_BYTES,
+    MAX_MCP_PUBLIC_ORIGIN_BYTES, McpConnectionRevision, McpConnectionRevisionError,
+    McpConnectionSettings, McpConnectionSettingsError, McpConnectionSettingsTransitionError,
+    McpLocalPort, McpLocalPortError, McpPublicBase, McpPublicBaseError, McpPublicOrigin,
+    RegisteredMcpConnectionSettings,
+};
+pub use mcp_token::{
+    MAX_MCP_TOKEN_LABEL_BYTES, MAX_MCP_TOKEN_SCOPES, MCP_TOKEN_DIGEST_BYTES, McpTokenDigest,
+    McpTokenId, McpTokenIdParseError, McpTokenLabel, McpTokenLabelError, McpTokenRecordParts,
+    McpTokenRevision, McpTokenRevisionError, McpTokenState, McpTokenTransitionError,
+    McpTokenWorkspaceScope, RegisteredMcpToken,
 };
 pub use recovery::{
     ClaimRecoveryLease, MAX_RECOVERY_LEASE_DURATION_MILLIS, MIN_RECOVERY_LEASE_DURATION_MILLIS,

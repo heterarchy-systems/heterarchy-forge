@@ -116,6 +116,29 @@ pub(crate) fn insert_revision(
     lineage: &[DagNodeLineage],
     expected_head_revision: Option<DagHeadRevision>,
 ) -> Result<StoredDagRevision, DagStoreError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let result = insert_revision_in_transaction(
+        &transaction,
+        revision,
+        nodes,
+        lineage,
+        expected_head_revision,
+    )?;
+    transaction.commit()?;
+    Ok(result)
+}
+
+/// Insert one immutable DAG revision into a caller-owned IMMEDIATE
+/// transaction.  This is intentionally crate-private: Agent authoring uses
+/// it to atomically commit the DAG head, grant consumption, ledger row, and
+/// factual Agent history in one transaction.
+pub(crate) fn insert_revision_in_transaction(
+    transaction: &Transaction<'_>,
+    revision: &DagRevision,
+    nodes: &[RegisteredDagNode],
+    lineage: &[DagNodeLineage],
+    expected_head_revision: Option<DagHeadRevision>,
+) -> Result<StoredDagRevision, DagStoreError> {
     revision
         .project(nodes)
         .map_err(|_| DagStoreError::ProjectionMismatch)?;
@@ -123,24 +146,22 @@ pub(crate) fn insert_revision(
     // Canonicalize it once at the persistence boundary so retries made from a
     // different caller collection order converge to the same durable result.
     let lineage = canonical_lineage(lineage);
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     // Resolve an exact committed retry before checking the mutable Goal
     // projection.  A Goal lifecycle update after a DAG commit must not make
     // the same durable request non-idempotent.  The revision, node set, and
     // canonical lineage comparisons still protect identity/scope safety.
-    if let Some(existing) = get_revision_tx(&transaction, revision.goal_id(), revision.number())? {
+    if let Some(existing) = get_revision_tx(transaction, revision.goal_id(), revision.number())? {
         if existing.revision() == revision
             && nodes_equivalent(existing.nodes(), nodes)
             && existing.lineage() == lineage
         {
-            transaction.commit()?;
             return Ok(existing);
         }
         return Err(DagStoreError::IdentityConflict);
     }
-    validate_goal_for_revision(&transaction, revision)?;
+    validate_goal_for_revision(transaction, revision)?;
     let current_head = validate_revision_preconditions(
-        &transaction,
+        transaction,
         revision,
         nodes,
         &lineage,
@@ -163,7 +184,7 @@ pub(crate) fn insert_revision(
         ],
     )?;
     for node in nodes {
-        insert_node(&transaction, node)?;
+        insert_node(transaction, node)?;
     }
     for edge in revision.edges() {
         transaction.execute(
@@ -178,8 +199,8 @@ pub(crate) fn insert_revision(
             ],
         )?;
     }
-    insert_lineage(&transaction, revision, &lineage)?;
-    copy_head_evidence_if_needed(&transaction, revision, nodes, current_head)?;
+    insert_lineage(transaction, revision, &lineage)?;
+    copy_head_evidence_if_needed(transaction, revision, nodes, current_head)?;
     let head_revision = match current_head {
         None => {
             transaction.execute(
@@ -210,12 +231,11 @@ pub(crate) fn insert_revision(
             next
         }
     };
-    let result = get_revision_tx(&transaction, revision.goal_id(), revision.number())?
+    let result = get_revision_tx(transaction, revision.goal_id(), revision.number())?
         .ok_or(DagStoreError::CorruptRecord("dag.inserted_revision"))?;
     if result.head().revision() != head_revision {
         return Err(DagStoreError::HeadConflict);
     }
-    transaction.commit()?;
     Ok(result)
 }
 

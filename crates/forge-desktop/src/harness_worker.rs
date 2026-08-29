@@ -11,9 +11,11 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use forge_control::{HarnessLibrary, HarnessLibraryError};
-use forge_domain::{HarnessBundleId, HarnessRevision, TimestampMillis};
-use forge_persistence::HarnessCatalogEntry;
+use forge_control::{HarnessCompositionRequest, HarnessLibrary, HarnessLibraryError};
+use forge_domain::{
+    HarnessBundleId, HarnessRevision, HarnessSkillId, HarnessSkillRevision, TimestampMillis,
+};
+use forge_persistence::{HarnessCatalogEntry, HarnessSkillCatalogEntry};
 use thiserror::Error;
 
 const REQUEST_QUEUE_CAPACITY: usize = 8;
@@ -34,6 +36,19 @@ pub(crate) enum HarnessWorkerAction {
         expected_revision: HarnessRevision,
         observed_at: TimestampMillis,
     },
+    ListSkills,
+    RegisterSkill {
+        source_root: PathBuf,
+        observed_at: TimestampMillis,
+    },
+    RefreshSkill {
+        id: HarnessSkillId,
+        expected_revision: HarnessSkillRevision,
+        observed_at: TimestampMillis,
+    },
+    SaveComposition {
+        request: HarnessCompositionRequest,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +56,10 @@ pub(crate) enum HarnessWorkerOutcome {
     Listed(Vec<HarnessCatalogEntry>),
     Registered(HarnessCatalogEntry),
     Refreshed(HarnessCatalogEntry),
+    SkillsListed(Vec<HarnessSkillCatalogEntry>),
+    SkillRegistered(HarnessSkillCatalogEntry),
+    SkillRefreshed(HarnessSkillCatalogEntry),
+    CompositionSaved(HarnessCatalogEntry),
 }
 
 #[derive(Debug, Error)]
@@ -198,6 +217,29 @@ fn run_action(library: &mut HarnessLibrary, action: HarnessWorkerAction) -> Repl
             .refresh_bundle(id, expected_revision, observed_at)
             .map(HarnessWorkerOutcome::Refreshed)
             .map_err(HarnessWorkerError::from),
+        HarnessWorkerAction::ListSkills => library
+            .list_skills()
+            .map(HarnessWorkerOutcome::SkillsListed)
+            .map_err(HarnessWorkerError::from),
+        HarnessWorkerAction::RegisterSkill {
+            source_root,
+            observed_at,
+        } => library
+            .register_skill_path(&source_root, observed_at)
+            .map(HarnessWorkerOutcome::SkillRegistered)
+            .map_err(HarnessWorkerError::from),
+        HarnessWorkerAction::RefreshSkill {
+            id,
+            expected_revision,
+            observed_at,
+        } => library
+            .refresh_skill(id, expected_revision, observed_at)
+            .map(HarnessWorkerOutcome::SkillRefreshed)
+            .map_err(HarnessWorkerError::from),
+        HarnessWorkerAction::SaveComposition { request } => library
+            .save_composition(&request)
+            .map(HarnessWorkerOutcome::CompositionSaved)
+            .map_err(HarnessWorkerError::from),
     }
 }
 
@@ -207,7 +249,10 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
+    use forge_control::{HarnessCompositionRequest, HarnessCompositionSkillSelection};
+    use forge_domain::{HarnessBundleId, HarnessName, HarnessVersion};
     use forge_persistence::HarnessCatalog;
+    use forge_workspace::{HARNESS_SKILL_ENTRY_FILE, HarnessCompositionIdentity};
     use uuid::Uuid;
 
     use super::*;
@@ -229,6 +274,18 @@ mod tests {
                 Uuid::from_u128(0x4200 + u128::from(serial))
             ),
         )?;
+        Ok(root)
+    }
+
+    fn skill_root() -> Result<PathBuf, Box<dyn std::error::Error>> {
+        let serial = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "heterarchy-forge-harness-worker-skill-{}-{serial}",
+            std::process::id()
+        ));
+        fs::create_dir_all(root.join("references"))?;
+        fs::write(root.join(HARNESS_SKILL_ENTRY_FILE), b"# Optional Skill\n")?;
+        fs::write(root.join("references/guide.md"), b"# Guide\n")?;
         Ok(root)
     }
 
@@ -295,6 +352,105 @@ mod tests {
         ));
         drop(worker);
         fs::remove_dir_all(source)?;
+        fs::remove_file(database)?;
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_worker_handles_skill_composition_and_rejects_after_shutdown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let source = source_root()?;
+        let skill_source = skill_root()?;
+        let saved_root = std::env::temp_dir().join(format!(
+            "heterarchy-forge-harness-worker-saved-{}-{}",
+            std::process::id(),
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let database = source
+            .parent()
+            .ok_or("fixture parent missing")?
+            .join(format!(
+                "harness-worker-composition-{}-{}.sqlite3",
+                std::process::id(),
+                NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
+            ));
+        let library = HarnessLibrary::with_saved_harness_bundles_root(
+            HarnessCatalog::open(&database)?,
+            saved_root.clone(),
+        );
+        let mut worker = HarnessLibraryWorker::start(library)?;
+        let client = worker.client();
+
+        let registered = recv(&client.submit(HarnessWorkerAction::Register {
+            source_root: source.clone(),
+            observed_at: TimestampMillis::new(10)?,
+        })?)??;
+        let HarnessWorkerOutcome::Registered(base) = registered else {
+            return Err("unexpected base registration outcome".into());
+        };
+        let initial_skills = recv(&client.submit(HarnessWorkerAction::ListSkills)?)??;
+        assert_eq!(
+            initial_skills,
+            HarnessWorkerOutcome::SkillsListed(Vec::new())
+        );
+
+        let registered_skill = recv(&client.submit(HarnessWorkerAction::RegisterSkill {
+            source_root: skill_source.clone(),
+            observed_at: TimestampMillis::new(10)?,
+        })?)??;
+        let HarnessWorkerOutcome::SkillRegistered(skill) = registered_skill else {
+            return Err("unexpected Skill registration outcome".into());
+        };
+        let listed_skills = recv(&client.submit(HarnessWorkerAction::ListSkills)?)??;
+        assert_eq!(
+            listed_skills,
+            HarnessWorkerOutcome::SkillsListed(vec![skill.clone()])
+        );
+        fs::write(skill_source.join("references/guide.md"), b"# Changed\n")?;
+        let refreshed_skill = recv(&client.submit(HarnessWorkerAction::RefreshSkill {
+            id: skill.skill().descriptor().id(),
+            expected_revision: skill.skill().revision(),
+            observed_at: TimestampMillis::new(11)?,
+        })?)??;
+        let HarnessWorkerOutcome::SkillRefreshed(skill) = refreshed_skill else {
+            return Err("unexpected Skill refresh outcome".into());
+        };
+        assert_eq!(skill.skill().revision().get(), 2);
+
+        let request = HarnessCompositionRequest::new(
+            base.bundle().descriptor().id(),
+            base.bundle().revision(),
+            vec![HarnessCompositionSkillSelection::new(
+                skill.skill().descriptor().id(),
+                skill.skill().revision(),
+                skill.skill().descriptor().content_hash(),
+            )],
+            HarnessCompositionIdentity::new(
+                HarnessBundleId::from_uuid(Uuid::from_u128(0x4270)),
+                HarnessName::new("Worker Composition".to_owned())?,
+                HarnessVersion::new("1.0.0".to_owned())?,
+            ),
+            TimestampMillis::new(12)?,
+        )?;
+        let saved = recv(&client.submit(HarnessWorkerAction::SaveComposition {
+            request: request.clone(),
+        })?)??;
+        let HarnessWorkerOutcome::CompositionSaved(saved) = saved else {
+            return Err("unexpected composition outcome".into());
+        };
+        assert_eq!(
+            saved.bundle().descriptor().name().as_str(),
+            "Worker Composition"
+        );
+
+        worker.shutdown()?;
+        assert!(matches!(
+            client.submit(HarnessWorkerAction::SaveComposition { request }),
+            Err(HarnessWorkerError::ShuttingDown)
+        ));
+        fs::remove_dir_all(source)?;
+        fs::remove_dir_all(skill_source)?;
+        fs::remove_dir_all(saved_root)?;
         fs::remove_file(database)?;
         Ok(())
     }

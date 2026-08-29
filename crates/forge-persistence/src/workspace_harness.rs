@@ -214,6 +214,23 @@ pub(crate) fn persist(
     }
 }
 
+pub(crate) fn delete(
+    transaction: &Transaction<'_>,
+    workspace_id: WorkspaceId,
+    expected_revision: HarnessRevision,
+) -> Result<(), HarnessStoreError> {
+    ensure_workspace_matches(transaction, workspace_id)?;
+    let changed = transaction.execute(
+        "DELETE FROM workspace_harness WHERE workspace_id = ?1 AND revision = ?2",
+        params![workspace_id.into_uuid().as_bytes(), expected_revision.get(),],
+    )?;
+    if changed == 1 {
+        Ok(())
+    } else {
+        Err(HarnessStoreError::CompareAndSwapConflict)
+    }
+}
+
 fn ensure_workspace_matches(
     transaction: &Transaction<'_>,
     workspace_id: WorkspaceId,
@@ -521,6 +538,34 @@ mod tests {
         transaction.commit()?;
         assert_eq!(stored_ready.state(), HarnessVerificationState::Ready);
         assert_eq!(get(&connection, workspace_id)?, Some(ready));
+        Ok(())
+    }
+
+    #[test]
+    fn applied_harness_delete_requires_exact_revision_cas() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut connection = connection()?;
+        let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(0x4110));
+        insert_workspace(&connection, workspace_id)?;
+        let applied =
+            AppliedHarness::applied(workspace_id, descriptor(2)?, TimestampMillis::new(20)?);
+        let transaction = connection.transaction()?;
+        let stored = persist(&transaction, &applied, None)?;
+        transaction.commit()?;
+
+        let stale_revision = HarnessRevision::new(stored.revision().get() + 1)?;
+        let transaction = connection.transaction()?;
+        assert!(matches!(
+            delete(&transaction, workspace_id, stale_revision),
+            Err(HarnessStoreError::CompareAndSwapConflict)
+        ));
+        transaction.rollback()?;
+        assert_eq!(get(&connection, workspace_id)?, Some(stored.clone()));
+
+        let transaction = connection.transaction()?;
+        delete(&transaction, workspace_id, stored.revision())?;
+        transaction.commit()?;
+        assert_eq!(get(&connection, workspace_id)?, None);
         Ok(())
     }
 

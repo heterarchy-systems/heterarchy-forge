@@ -15,16 +15,20 @@ use std::time::Duration;
 
 use forge_domain::{
     HarnessBundleDescriptor, HarnessBundleError, HarnessBundleId, HarnessContentHash, HarnessName,
-    HarnessNameError, HarnessRevision, HarnessRevisionError, HarnessVersion, HarnessVersionError,
-    RegisteredHarnessBundle, RegisteredHarnessBundleError, TimestampMillis, TimestampMillisError,
+    HarnessNameError, HarnessRevision, HarnessRevisionError, HarnessSkillDescriptorError,
+    HarnessSkillId, HarnessSkillNameError, HarnessSkillRevision, HarnessSkillRevisionError,
+    HarnessVersion, HarnessVersionError, RegisteredHarnessBundle, RegisteredHarnessBundleError,
+    RegisteredHarnessSkillError, TimestampMillis, TimestampMillisError,
 };
-use forge_workspace::InspectedHarnessBundle;
+use forge_workspace::{InspectedHarnessBundle, InspectedHarnessSkill};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, TransactionBehavior, params};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::harness_skill_catalog::{self, HarnessSkillCatalogEntry};
+
 pub const HARNESS_CATALOG_APPLICATION_ID: i64 = 0x4846_4843;
-pub const HARNESS_CATALOG_SCHEMA_VERSION: i64 = 1;
+pub const HARNESS_CATALOG_SCHEMA_VERSION: i64 = 2;
 pub const MAX_HARNESS_CATALOG_RESULTS: usize = 256;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -158,6 +162,10 @@ impl HarnessCatalog {
             }
             DatabaseOwnership::OwnedV1 => {
                 configure_connection(&catalog.connection, busy_timeout)?;
+                migrate_v1_to_v2(&mut catalog.connection)?;
+            }
+            DatabaseOwnership::OwnedV2 => {
+                configure_connection(&catalog.connection, busy_timeout)?;
             }
         }
         validate_schema(&catalog.connection)?;
@@ -281,6 +289,56 @@ impl HarnessCatalog {
             .into_iter()
             .map(decode_entry)
             .collect::<Result<Vec<_>, _>>()?;
+        self.ensure_live_binding()?;
+        Ok(entries)
+    }
+
+    pub fn register_skill(
+        &mut self,
+        inspected: &InspectedHarnessSkill,
+        observed_at: TimestampMillis,
+    ) -> Result<HarnessSkillCatalogEntry, HarnessCatalogError> {
+        self.ensure_live_binding()?;
+        let entry = harness_skill_catalog::register(&mut self.connection, inspected, observed_at)?;
+        self.capture_sidecar_identities()?;
+        self.ensure_live_binding()?;
+        Ok(entry)
+    }
+
+    pub fn refresh_skill(
+        &mut self,
+        inspected: &InspectedHarnessSkill,
+        expected_revision: HarnessSkillRevision,
+        observed_at: TimestampMillis,
+    ) -> Result<HarnessSkillCatalogEntry, HarnessCatalogError> {
+        self.ensure_live_binding()?;
+        let entry = harness_skill_catalog::refresh(
+            &mut self.connection,
+            inspected,
+            expected_revision,
+            observed_at,
+        )?;
+        self.capture_sidecar_identities()?;
+        self.ensure_live_binding()?;
+        Ok(entry)
+    }
+
+    pub fn get_skill(
+        &self,
+        id: HarnessSkillId,
+    ) -> Result<Option<HarnessSkillCatalogEntry>, HarnessCatalogError> {
+        self.ensure_live_binding()?;
+        let entry = harness_skill_catalog::get(&self.connection, id)?;
+        self.ensure_live_binding()?;
+        Ok(entry)
+    }
+
+    pub fn list_skills(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<HarnessSkillCatalogEntry>, HarnessCatalogError> {
+        self.ensure_live_binding()?;
+        let entries = harness_skill_catalog::list(&self.connection, limit)?;
         self.ensure_live_binding()?;
         Ok(entries)
     }
@@ -488,6 +546,7 @@ fn configure_connection(
 enum DatabaseOwnership {
     Fresh,
     OwnedV1,
+    OwnedV2,
 }
 
 fn inspect_database(connection: &Connection) -> Result<DatabaseOwnership, HarnessCatalogError> {
@@ -507,13 +566,14 @@ fn inspect_database(connection: &Connection) -> Result<DatabaseOwnership, Harnes
             expected: HARNESS_CATALOG_APPLICATION_ID,
         });
     }
-    if version != HARNESS_CATALOG_SCHEMA_VERSION {
-        return Err(HarnessCatalogError::UnsupportedSchemaVersion {
+    match version {
+        1 => Ok(DatabaseOwnership::OwnedV1),
+        HARNESS_CATALOG_SCHEMA_VERSION => Ok(DatabaseOwnership::OwnedV2),
+        _ => Err(HarnessCatalogError::UnsupportedSchemaVersion {
             actual: version,
             maximum_supported: HARNESS_CATALOG_SCHEMA_VERSION,
-        });
+        }),
     }
-    Ok(DatabaseOwnership::OwnedV1)
 }
 
 fn migrate_fresh(connection: &mut Connection) -> Result<(), HarnessCatalogError> {
@@ -521,6 +581,15 @@ fn migrate_fresh(connection: &mut Connection) -> Result<(), HarnessCatalogError>
     transaction.pragma_update(None, "application_id", HARNESS_CATALOG_APPLICATION_ID)?;
     transaction.execute_batch(EXPECTED_BUNDLES_TABLE_SQL)?;
     transaction.execute_batch(EXPECTED_BUNDLES_INDEX_SQL)?;
+    harness_skill_catalog::create_schema(&transaction)?;
+    transaction.pragma_update(None, "user_version", HARNESS_CATALOG_SCHEMA_VERSION)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_v1_to_v2(connection: &mut Connection) -> Result<(), HarnessCatalogError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    harness_skill_catalog::create_schema(&transaction)?;
     transaction.pragma_update(None, "user_version", HARNESS_CATALOG_SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
@@ -573,10 +642,10 @@ fn validate_schema(connection: &Connection) -> Result<(), HarnessCatalogError> {
             "harness_bundles_name_idx columns do not match the expected shape",
         ));
     }
-    Ok(())
+    harness_skill_catalog::validate_schema(connection)
 }
 
-fn validate_schema_sql(
+pub(crate) fn validate_schema_sql(
     connection: &Connection,
     object_type: &'static str,
     name: &'static str,
@@ -840,6 +909,30 @@ pub enum HarnessCatalogError {
     Timestamp(#[source] TimestampMillisError),
     #[error("Harness Catalog Bundle transition is invalid")]
     BundleTransition(#[source] RegisteredHarnessBundleError),
+    #[error("Harness Catalog Skill identity already exists with different metadata: {0}")]
+    SkillIdConflict(HarnessSkillId),
+    #[error("Harness Catalog Skill source root is already registered by Skill {0}")]
+    SkillSourceAlreadyRegistered(HarnessSkillId),
+    #[error("Harness Catalog Skill source root changed for Skill {0}")]
+    SkillSourceMismatch(HarnessSkillId),
+    #[error("Harness Catalog Skill was not found: {0}")]
+    SkillRecordMissing(HarnessSkillId),
+    #[error("Harness Catalog Skill compare-and-set found a changed row")]
+    SkillCompareAndSwapConflict,
+    #[error("Harness Catalog Skill list limit {actual} is outside 1..={maximum}")]
+    InvalidSkillListLimit { actual: usize, maximum: usize },
+    #[error("Harness Catalog Skill source root is {actual} bytes; maximum is {maximum}")]
+    SkillSourceRootTooLarge { actual: usize, maximum: usize },
+    #[error("Harness Catalog persisted Skill field is corrupt: {field}")]
+    SkillCorruptRecord { field: &'static str },
+    #[error("Harness Catalog Skill name is invalid")]
+    SkillName(#[source] HarnessSkillNameError),
+    #[error("Harness Catalog Skill descriptor is invalid")]
+    SkillDescriptor(#[source] HarnessSkillDescriptorError),
+    #[error("Harness Catalog Skill revision is invalid")]
+    SkillRevision(#[source] HarnessSkillRevisionError),
+    #[error("Harness Catalog Skill transition is invalid")]
+    SkillTransition(#[source] RegisteredHarnessSkillError),
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
 }
@@ -849,7 +942,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
-    use forge_workspace::inspect_harness_bundle;
+    use forge_workspace::{inspect_harness_bundle, inspect_harness_skill};
 
     static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
 
@@ -867,6 +960,21 @@ mod tests {
                 "[harness]\nid = \"00000000-0000-0000-0000-{serial:012x}\"\nname = \"Rust Dev Harness\"\nversion = \"1.0.0\"\ninstall_root = \".agents/rust_dev_harness\"\nmanaged_files = [\"rules/base.md\"]\nskills = []\n"
             ),
         )?;
+        Ok(root)
+    }
+
+    fn skill_source(label: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+        let serial = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "heterarchy-forge-skill-catalog-{label}-{}-{serial}",
+            std::process::id()
+        ));
+        fs::create_dir_all(root.join("references"))?;
+        fs::write(
+            root.join(forge_workspace::HARNESS_SKILL_ENTRY_FILE),
+            b"# Skill\n",
+        )?;
+        fs::write(root.join("references/guide.md"), b"# Guide\n")?;
         Ok(root)
     }
 
@@ -936,6 +1044,78 @@ mod tests {
         ));
         assert_eq!(catalog.get(first.bundle().descriptor().id())?, Some(first));
         fs::remove_dir_all(source)?;
+        fs::remove_file(database)?;
+        Ok(())
+    }
+
+    #[test]
+    fn catalog_v2_skill_register_refresh_and_reopen_are_durable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let source = skill_source("durable")?;
+        let id = HarnessSkillId::from_uuid(Uuid::from_u128(0x4604));
+        let inspected = inspect_harness_skill(&source, id)?;
+        let database = source
+            .parent()
+            .ok_or("fixture parent missing")?
+            .join(format!(
+                "skill-catalog-{}-{}.sqlite3",
+                std::process::id(),
+                NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
+            ));
+        let mut catalog = HarnessCatalog::open(&database)?;
+        let first = catalog.register_skill(&inspected, TimestampMillis::new(10)?)?;
+        assert_eq!(catalog.list_skills(10)?, vec![first.clone()]);
+        let duplicate_id = HarnessSkillId::from_uuid(Uuid::from_u128(0x4605));
+        let duplicate = inspect_harness_skill(&source, duplicate_id)?;
+        assert!(matches!(
+            catalog.register_skill(&duplicate, TimestampMillis::new(10)?),
+            Err(HarnessCatalogError::SkillSourceAlreadyRegistered(existing))
+                if existing == first.skill().descriptor().id()
+        ));
+        drop(catalog);
+
+        fs::write(source.join("references/guide.md"), b"# Changed\n")?;
+        let changed = inspect_harness_skill(&source, id)?;
+        let mut catalog = HarnessCatalog::open(&database)?;
+        let refreshed = catalog.refresh_skill(
+            &changed,
+            first.skill().revision(),
+            TimestampMillis::new(11)?,
+        )?;
+        assert_eq!(refreshed.skill().revision().get(), 2);
+        assert_ne!(
+            refreshed.skill().descriptor().content_hash(),
+            first.skill().descriptor().content_hash()
+        );
+        assert_eq!(catalog.get_skill(id)?, Some(refreshed));
+        fs::remove_dir_all(source)?;
+        fs::remove_file(database)?;
+        Ok(())
+    }
+
+    #[test]
+    fn catalog_v1_migration_adds_empty_skill_library_without_fabrication()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let serial = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+        let database = std::env::temp_dir().join(format!(
+            "heterarchy-forge-catalog-v1-{serial}-{}.sqlite3",
+            std::process::id()
+        ));
+        let connection = Connection::open(&database)?;
+        connection.pragma_update(None, "application_id", HARNESS_CATALOG_APPLICATION_ID)?;
+        connection.execute_batch(EXPECTED_BUNDLES_TABLE_SQL)?;
+        connection.execute_batch(EXPECTED_BUNDLES_INDEX_SQL)?;
+        connection.pragma_update(None, "user_version", 1_i64)?;
+        drop(connection);
+
+        let catalog = HarnessCatalog::open(&database)?;
+        assert!(catalog.list(10)?.is_empty());
+        assert!(catalog.list_skills(10)?.is_empty());
+        let version: i64 = catalog
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))?;
+        assert_eq!(version, HARNESS_CATALOG_SCHEMA_VERSION);
+        drop(catalog);
         fs::remove_file(database)?;
         Ok(())
     }

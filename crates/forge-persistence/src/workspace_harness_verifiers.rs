@@ -7,11 +7,12 @@
 
 use forge_domain::{
     ActivityId, ApprovalRequestId, ExecutionId, ExecutionRequestDigest, HarnessBundleId,
-    HarnessContentHash, HarnessVerifierDomainError, HarnessVerifierItem, HarnessVerifierItemState,
-    HarnessVerifierName, HarnessVerifierNameError, HarnessVerifierRun,
-    HarnessVerifierRunAttribution, HarnessVerifierRunId, HarnessVerifierRunRevision,
-    HarnessVerifierRunRevisionError, HarnessVerifierRunState, HarnessVerifierRunTimestamps,
-    RuntimeInstanceId, TimestampMillis, TimestampMillisError, WorkspaceId,
+    HarnessContentHash, HarnessVerifierDomainError, HarnessVerifierItem,
+    HarnessVerifierItemIdentity, HarnessVerifierItemState, HarnessVerifierName,
+    HarnessVerifierNameError, HarnessVerifierRun, HarnessVerifierRunAttribution,
+    HarnessVerifierRunId, HarnessVerifierRunRevision, HarnessVerifierRunRevisionError,
+    HarnessVerifierRunState, HarnessVerifierRunTimestamps, RuntimeInstanceId, TimestampMillis,
+    TimestampMillisError, WorkspaceId,
 };
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 use thiserror::Error;
@@ -492,14 +493,17 @@ fn decode_checked_item(row: &Row<'_>) -> Result<HarnessVerifierItem, HarnessVeri
     validate_exact_length("execution_id", row.get(5)?, ID_BYTES)?;
     validate_exact_length("request_digest", row.get(7)?, REQUEST_DIGEST_BYTES)?;
     HarnessVerifierItem::new(
-        u16::try_from(ordinal).map_err(|_| HarnessVerifierStoreError::InvalidFieldValue {
-            field: "ordinal",
-            actual: ordinal,
-        })?,
-        HarnessVerifierName::new(row.get(2)?).map_err(HarnessVerifierStoreError::Name)?,
-        ApprovalRequestId::from_uuid(decode_uuid("approval_id", &row.get::<_, Vec<u8>>(4)?)?),
-        ExecutionId::from_uuid(decode_uuid("execution_id", &row.get::<_, Vec<u8>>(6)?)?),
-        decode_request_digest(&row.get::<_, Vec<u8>>(8)?)?,
+        HarnessVerifierItemIdentity::new(
+            u16::try_from(ordinal).map_err(|_| HarnessVerifierStoreError::InvalidFieldValue {
+                field: "ordinal",
+                actual: ordinal,
+            })?,
+            HarnessVerifierName::new(row.get(2)?).map_err(HarnessVerifierStoreError::Name)?,
+            ApprovalRequestId::from_uuid(decode_uuid("approval_id", &row.get::<_, Vec<u8>>(4)?)?),
+            ExecutionId::from_uuid(decode_uuid("execution_id", &row.get::<_, Vec<u8>>(6)?)?),
+            decode_request_digest(&row.get::<_, Vec<u8>>(8)?)?,
+        )
+        .map_err(HarnessVerifierStoreError::Domain)?,
         decode_item_state(row.get(9)?)?,
         row.get(10)?,
         row.get::<_, Option<i64>>(11)?
@@ -653,11 +657,13 @@ mod tests {
         workspace_id: WorkspaceId,
     ) -> Result<HarnessVerifierRun, Box<dyn std::error::Error>> {
         let items = vec![HarnessVerifierItem::new(
-            0,
-            HarnessVerifierName::new("rules".to_owned())?,
-            ApprovalRequestId::from_uuid(Uuid::from_u128(7)),
-            ExecutionId::from_uuid(Uuid::from_u128(8)),
-            ExecutionRequestDigest::from_bytes([9; ExecutionRequestDigest::BYTE_LEN]),
+            HarnessVerifierItemIdentity::new(
+                0,
+                HarnessVerifierName::new("rules".to_owned())?,
+                ApprovalRequestId::from_uuid(Uuid::from_u128(7)),
+                ExecutionId::from_uuid(Uuid::from_u128(8)),
+                ExecutionRequestDigest::from_bytes([9; ExecutionRequestDigest::BYTE_LEN]),
+            )?,
             HarnessVerifierItemState::PendingApproval,
             None,
             None,
@@ -692,11 +698,13 @@ mod tests {
 
         let running = run.reconcile(
             vec![HarnessVerifierItem::new(
-                0,
-                HarnessVerifierName::new("rules".to_owned())?,
-                ApprovalRequestId::from_uuid(Uuid::from_u128(7)),
-                ExecutionId::from_uuid(Uuid::from_u128(8)),
-                ExecutionRequestDigest::from_bytes([9; ExecutionRequestDigest::BYTE_LEN]),
+                HarnessVerifierItemIdentity::new(
+                    0,
+                    HarnessVerifierName::new("rules".to_owned())?,
+                    ApprovalRequestId::from_uuid(Uuid::from_u128(7)),
+                    ExecutionId::from_uuid(Uuid::from_u128(8)),
+                    ExecutionRequestDigest::from_bytes([9; ExecutionRequestDigest::BYTE_LEN]),
+                )?,
                 HarnessVerifierItemState::Running,
                 None,
                 None,

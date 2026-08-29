@@ -1,0 +1,306 @@
+import { HorizontalBox, VerticalBox } from "std-widgets.slint";
+import { ForgeTheme } from "theme.slint";
+
+export component ReferenceNavItem inherits Rectangle {
+    in property <string> icon: "◉";
+    in property <string> label: "Item";
+    in property <bool> active: false;
+    in property <string> accessible-name: root.label;
+    callback activated();
+
+    height: 52px;
+    width: 72px;
+    border-radius: 7px;
+    background: root.active ? ForgeTheme.accent-soft : touch.has-hover ? ForgeTheme.panel-hover : transparent;
+    border-width: root.active ? 1px : 0px;
+    border-color: root.active ? ForgeTheme.accent-border : transparent;
+    accessible-role: button;
+    accessible-label: root.accessible-name;
+    accessible-action-default => { root.activated(); }
+    forward-focus: focus;
+
+    VerticalBox {
+        padding-top: 6px;
+        padding-bottom: 5px;
+        spacing: 3px;
+        Text {
+            text: root.icon;
+            color: root.active ? ForgeTheme.accent : ForgeTheme.text-secondary;
+            font-size: 18px;
+            font-weight: 600;
+            horizontal-alignment: center;
+        }
+        Text {
+            text: root.label;
+            color: root.active ? ForgeTheme.accent-text : ForgeTheme.text-muted;
+            font-size: 9px;
+            font-weight: root.active ? 700 : 500;
+            horizontal-alignment: center;
+            overflow: elide;
+        }
+    }
+
+    touch := TouchArea { clicked => { root.activated(); } }
+    focus := FocusScope {
+        x: 0px; width: 0px;
+        key-pressed(event) => {
+            if event.text == " " || event.text == "\n" {
+                root.activated();
+                return accept;
+            }
+            return reject;
+        }
+    }
+}
+
+export component ReferenceStatusDot inherits Rectangle {
+    in property <string> state: "";
+    in property <color> dot-color: ForgeTheme.success;
+    in property <string> label: root.state;
+    height: 20px;
+    min-width: 74px;
+    background: transparent;
+    HorizontalBox {
+        alignment: center;
+        spacing: 6px;
+        Rectangle { width: 8px; height: 8px; border-radius: 4px; background: root.dot-color; }
+        Text { text: root.label; color: ForgeTheme.text-secondary; font-size: 11px; vertical-alignment: center; overflow: elide; }
+    }
+}
+
+export component ReferenceMetric inherits Rectangle {
+    in property <string> label: "Metric";
+    in property <string> value: "—";
+    in property <string> detail: "";
+    in property <color> value-color: ForgeTheme.text;
+    height: 70px;
+    min-width: 150px;
+    background: ForgeTheme.panel;
+    border-width: 1px;
+    border-color: ForgeTheme.separator;
+    border-radius: 6px;
+    VerticalBox {
+        padding-left: 14px;
+        padding-right: 14px;
+        padding-top: 10px;
+        padding-bottom: 8px;
+        spacing: 2px;
+        Text { text: root.label; color: ForgeTheme.text-muted; font-size: 10px; font-weight: 600; }
+        Text { text: root.value; color: root.value-color; font-size: 20px; font-weight: 700; overflow: elide; }
+        Text { text: root.detail; color: ForgeTheme.text-secondary; font-size: 9px; overflow: elide; }
+    }
+}
+
+export component ReferenceSummaryMetric inherits Rectangle {
+    in property <string> label: "Metric";
+    in property <string> value: "—";
+    in property <string> detail: "";
+    in property <color> value-color: ForgeTheme.text;
+    height: 50px;
+    min-width: 120px;
+    background: transparent;
+    VerticalBox {
+        padding-left: 12px;
+        padding-right: 12px;
+        alignment: center;
+        spacing: 2px;
+        Text { text: root.label; color: ForgeTheme.text-muted; font-size: 9px; font-weight: 600; overflow: elide; }
+        HorizontalBox {
+            spacing: 7px;
+            Text { text: root.value; color: root.value-color; font-size: 15px; font-weight: 700; overflow: elide; }
+            Text { horizontal-stretch: 1; text: root.detail; color: ForgeTheme.text-muted; font-size: 9px; vertical-alignment: center; overflow: elide; }
+        }
+    }
+}
+
+export component ReferenceSectionHeader inherits Rectangle {
+    in property <string> title: "Section";
+    in property <string> detail: "";
+    height: 38px;
+    background: transparent;
+    HorizontalBox {
+        spacing: 8px;
+        Text { text: root.title; color: ForgeTheme.text; font-size: 13px; font-weight: 700; vertical-alignment: center; }
+        Rectangle { horizontal-stretch: 1; }
+        Text { text: root.detail; color: ForgeTheme.text-muted; font-size: 10px; vertical-alignment: center; overflow: elide; }
+    }
+}
+
+export component ReferenceSelectableRow inherits Rectangle {
+    in property <string> icon: "◌";
+    in property <string> title: "Row";
+    in property <string> subtitle: "";
+    in property <string> meta: "";
+    in property <string> state: "";
+    in property <color> state-color: ForgeTheme.success;
+    in property <bool> selected: false;
+    in property <bool> enabled: true;
+    in property <bool> flat: false;
+    callback activated();
+
+    height: root.flat ? 64px : 72px;
+    border-radius: root.flat ? 0px : 6px;
+    border-width: root.flat ? 0px : 1px;
+    border-color: root.selected ? ForgeTheme.accent-border : ForgeTheme.separator;
+    background: root.selected ? ForgeTheme.accent-soft : touch.has-hover ? ForgeTheme.panel-hover : root.flat ? transparent : ForgeTheme.panel;
+    accessible-role: list-item;
+    accessible-enabled: root.enabled;
+    accessible-label: root.title + " " + root.state + " " + root.subtitle;
+    accessible-action-default => { root.activated(); }
+    forward-focus: focus;
+
+    HorizontalBox {
+        padding-left: 12px;
+        padding-right: 12px;
+        spacing: 11px;
+        Rectangle {
+            width: root.flat ? 30px : 40px; height: root.flat ? 30px : 40px; border-radius: root.flat ? 5px : 7px;
+            background: root.selected ? ForgeTheme.accent-soft-strong : root.flat ? transparent : ForgeTheme.panel-raised;
+            border-width: root.flat ? 0px : 1px;
+            border-color: root.selected ? ForgeTheme.accent-border : ForgeTheme.separator;
+            Text { text: root.icon; color: root.selected ? ForgeTheme.accent : ForgeTheme.text-secondary; font-size: root.flat ? 15px : 19px; horizontal-alignment: center; vertical-alignment: center; }
+        }
+        VerticalBox {
+            horizontal-stretch: 1;
+            spacing: 3px;
+            Text { text: root.title; color: ForgeTheme.text; font-size: 13px; font-weight: 650; overflow: elide; }
+            Text { text: root.subtitle; color: root.selected ? ForgeTheme.accent-text : ForgeTheme.text-secondary; font-size: 10px; overflow: elide; }
+            Text { text: root.meta; color: ForgeTheme.text-muted; font-size: 9px; overflow: elide; }
+        }
+        VerticalBox {
+            alignment: center;
+            spacing: 4px;
+            ReferenceStatusDot { label: root.state; dot-color: root.state-color; }
+        }
+    }
+    if root.flat : Rectangle { y: root.height - 1px; width: 100%; height: 1px; background: ForgeTheme.separator; }
+    touch := TouchArea { enabled: root.enabled; clicked => { root.activated(); } }
+    focus := FocusScope {
+        x: 0px; width: 0px; enabled: root.enabled;
+        key-pressed(event) => {
+            if event.text == " " || event.text == "\n" { root.activated(); return accept; }
+            return reject;
+        }
+    }
+}
+
+export component ReferenceWorkspacePickerRow inherits Rectangle {
+    in property <string> title: "Workspace";
+    in property <string> subtitle: "";
+    in property <string> readiness-status: "연결 준비됨";
+    in property <string> harness-status: "Harness 미감지";
+    in property <color> harness-color: ForgeTheme.text-muted;
+    in property <string> work-status: "작업 미확인";
+    in property <color> work-color: ForgeTheme.text-muted;
+    in property <bool> selected: false;
+    in property <bool> enabled: true;
+    callback activated();
+
+    height: 92px;
+    border-radius: 7px;
+    border-width: 1px;
+    border-color: root.selected ? ForgeTheme.accent-border : ForgeTheme.separator;
+    background: root.selected ? ForgeTheme.accent-soft : touch.has-hover ? ForgeTheme.panel-hover : ForgeTheme.panel;
+    accessible-role: list-item;
+    accessible-enabled: root.enabled;
+    accessible-label: root.title + " " + root.readiness-status + " " + root.harness-status + " " + root.work-status;
+    accessible-action-default => { root.activated(); }
+    forward-focus: focus;
+
+    HorizontalBox {
+        padding-left: 18px;
+        padding-right: 16px;
+        spacing: 14px;
+        Rectangle {
+            width: 50px; height: 50px; border-radius: 7px;
+            background: root.selected ? ForgeTheme.accent-soft-strong : ForgeTheme.panel-raised;
+            border-width: 1px;
+            border-color: root.selected ? ForgeTheme.accent-border : ForgeTheme.separator;
+            Text { text: "▰"; color: root.selected ? ForgeTheme.accent : ForgeTheme.text-secondary; font-size: 28px; horizontal-alignment: center; vertical-alignment: center; }
+        }
+        VerticalBox {
+            horizontal-stretch: 1;
+            spacing: 5px;
+            Text { text: root.title; color: ForgeTheme.text; font-size: 16px; font-weight: 700; overflow: elide; }
+            Text { text: root.subtitle; color: ForgeTheme.text-secondary; font-family: "monospace"; font-size: 10px; overflow: elide; }
+        }
+        HorizontalBox {
+            alignment: center;
+            spacing: 12px;
+            HorizontalBox {
+                spacing: 5px;
+                Text { text: "✓"; color: ForgeTheme.success; font-size: 13px; vertical-alignment: center; }
+                Text { text: root.readiness-status; color: ForgeTheme.text-secondary; font-size: 11px; vertical-alignment: center; }
+            }
+            Rectangle { width: 1px; height: 26px; background: ForgeTheme.separator; }
+            HorizontalBox {
+                min-width: 150px;
+                spacing: 5px;
+                Text { text: "⌁"; color: root.harness-color; font-size: 14px; vertical-alignment: center; }
+                Text { text: root.harness-status; color: root.harness-color; font-size: 11px; vertical-alignment: center; overflow: elide; }
+            }
+            Rectangle { width: 1px; height: 26px; background: ForgeTheme.separator; }
+            HorizontalBox {
+                min-width: 116px;
+                spacing: 5px;
+                Text { text: "∿"; color: root.work-color; font-size: 14px; vertical-alignment: center; }
+                Text { text: root.work-status; color: root.work-color; font-size: 11px; vertical-alignment: center; overflow: elide; }
+            }
+            Text { text: "›"; color: ForgeTheme.text-muted; font-size: 26px; vertical-alignment: center; }
+        }
+    }
+
+    touch := TouchArea { enabled: root.enabled; clicked => { root.activated(); } }
+    focus := FocusScope {
+        x: 0px; width: 0px; enabled: root.enabled;
+        key-pressed(event) => {
+            if event.text == " " || event.text == "\n" { root.activated(); return accept; }
+            return reject;
+        }
+    }
+}
+
+export component ReferenceInfoRow inherits Rectangle {
+    in property <string> label: "Label";
+    in property <string> value: "";
+    in property <bool> warning: false;
+    in property <length> label-width: 118px;
+    height: 34px;
+    background: transparent;
+    border-color: ForgeTheme.separator;
+    border-width: 0px;
+    HorizontalBox {
+        spacing: 8px;
+        Text { min-width: root.label-width; text: root.label; color: ForgeTheme.text-muted; font-size: 10px; vertical-alignment: center; }
+        Text { horizontal-stretch: 1; text: root.value == "" ? "—" : root.value; color: root.warning ? ForgeTheme.warning : ForgeTheme.text-secondary; font-size: 11px; vertical-alignment: center; overflow: elide; }
+    }
+    Rectangle { y: root.height - 1px; width: 100%; height: 1px; background: ForgeTheme.separator; }
+}
+
+export component ReferenceChip inherits Rectangle {
+    in property <string> label: "Chip";
+    in property <bool> active: false;
+    height: 24px;
+    min-width: 54px;
+    border-radius: 5px;
+    border-width: 1px;
+    border-color: root.active ? ForgeTheme.accent-border : ForgeTheme.separator;
+    background: root.active ? ForgeTheme.accent-soft : ForgeTheme.panel-raised;
+    Text { text: root.label; color: root.active ? ForgeTheme.accent-text : ForgeTheme.text-secondary; font-size: 9px; horizontal-alignment: center; vertical-alignment: center; }
+}
+
+export component ReferenceToolbarButton inherits Rectangle {
+    in property <string> label: "Action";
+    in property <bool> active: false;
+    in property <bool> enabled: true;
+    in property <bool> danger: false;
+    callback activated();
+    height: 32px;
+    min-width: 76px;
+    border-radius: 5px;
+    border-width: 1px;
+    border-color: !root.enabled ? ForgeTheme.separator : root.danger ? ForgeTheme.danger-border : root.active ? ForgeTheme.accent-border : ForgeTheme.separator-strong;
+    background: !root.enabled ? ForgeTheme.panel : root.danger ? ForgeTheme.danger-soft : root.active ? ForgeTheme.accent-soft : touch.has-hover ? ForgeTheme.panel-hover : ForgeTheme.panel-raised;
+    Text { text: root.label; color: !root.enabled ? ForgeTheme.text-muted : root.danger ? ForgeTheme.danger : root.active ? ForgeTheme.accent-text : ForgeTheme.text; font-size: 10px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; overflow: elide; }
+    touch := TouchArea { enabled: root.enabled; clicked => { root.activated(); } }
+}

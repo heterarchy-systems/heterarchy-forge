@@ -1,0 +1,1011 @@
+import { HorizontalBox, LineEdit, ListView, TextEdit, VerticalBox } from "std-widgets.slint";
+import { ForgeTheme } from "theme.slint";
+import { DagEdgeConnector, DagNodeCard, EmptyState } from "components.slint";
+import { ReferenceInfoRow, ReferenceMetric, ReferenceSummaryMetric, ReferenceNavItem, ReferenceSectionHeader, ReferenceSelectableRow, ReferenceStatusDot, ReferenceToolbarButton, ReferenceWorkspacePickerRow } from "reference-components.slint";
+import { WorkspaceRow, AgentRow, ActivityRow, DiffRow, ApprovalRow, GoalRow, DagNodeRow, DagEdgeRow, WorkNarrativeRow, HarnessRow, DoctorFindingRow, McpTokenRow } from "models.slint";
+
+export component ReferenceWorkbench inherits Rectangle {
+    in-out property <int> active-page: 0;
+    in-out property <bool> workspace-view-open: false;
+
+    in property <string> runtime-status: "Starting";
+    in property <string> runtime-detail: "";
+    in property <int> runtime-generation: 0;
+    in property <int> uptime-seconds: 0;
+
+    in property <[WorkspaceRow]> workspace-rows: [];
+    in property <int> selected-workspace-index: -1;
+    in property <string> selected-workspace-id: "";
+    in property <string> selected-workspace-root: "";
+    in property <string> selected-workspace-revision: "";
+    in property <string> workspace-status: "";
+    in-out property <string> location-name-input: "";
+    in property <bool> folder-picker-open: false;
+    in property <bool> location-action-busy: false;
+
+    in property <[AgentRow]> agent-rows: [];
+    in property <string> selected-agent-id: "";
+    in property <string> selected-agent-name: "";
+    in property <string> selected-agent-role: "";
+    in property <string> selected-agent-state: "";
+    in property <string> selected-agent-liveness: "";
+    in property <string> selected-agent-current-goal: "";
+    in property <string> selected-agent-current-node: "";
+    in property <string> selected-agent-public-summary: "";
+    in property <string> selected-agent-evidence: "";
+    in property <string> selected-agent-last-observed: "";
+    in property <bool> agent-action-busy: false;
+    in property <string> agent-dag-grant-id: "";
+    in property <string> agent-dag-grant-goal-id: "";
+    in property <string> agent-dag-grant-status: "";
+    in property <string> agent-dag-grant-availability: "없음";
+    in property <bool> agent-dag-grant-active: false;
+
+    in property <[GoalRow]> goal-rows: [];
+    in property <string> goal-status: "";
+    in property <bool> goal-action-busy: false;
+    in-out property <string> goal-objective-input: "";
+    in-out property <string> goal-success-criterion-input: "";
+    in property <string> selected-goal-id: "";
+    in property <string> selected-goal-revision: "";
+    in property <string> selected-goal-state: "";
+    in property <string> selected-goal-objective: "";
+    in property <string> selected-goal-success-criterion: "";
+    in property <string> selected-goal-check-summary: "";
+    in property <string> selected-goal-evidence-summary: "";
+    in property <string> selected-goal-blocker: "";
+    in property <bool> selected-goal-terminal: false;
+    in property <bool> selected-goal-can-pause: false;
+    in property <bool> selected-goal-can-resume: false;
+    in property <bool> selected-goal-can-cancel: false;
+    in property <bool> selected-goal-can-complete: false;
+
+    in property <[DagNodeRow]> dag-node-rows: [];
+    in property <[DagEdgeRow]> dag-edge-rows: [];
+    in property <int> dag-column-count: 0;
+    in property <int> dag-lane-count: 0;
+    in property <string> dag-revision: "";
+    in property <string> dag-head-revision: "";
+    in property <string> dag-status: "";
+    in property <string> selected-dag-id: "";
+    in property <string> selected-dag-agent-name: "";
+    in property <string> selected-dag-work-summary: "";
+    in property <string> selected-dag-public-summary: "";
+    in property <string> selected-dag-last-observed: "";
+
+    in property <[ActivityRow]> activity-live-rows: [];
+    in property <[ActivityRow]> activity-history-rows: [];
+    in property <string> activity-status: "";
+    in property <string> selected-activity-id: "";
+    in property <[WorkNarrativeRow]> work-narrative-rows: [];
+    in property <[DiffRow]> diff-rows: [];
+    in property <string> diff-status: "";
+    in property <bool> diff-view-open: false;
+    in property <string> diff-view-title: "";
+    in property <string> diff-view-content: "";
+    in-out property <int> selected-diff-index: -1;
+
+    in property <[HarnessRow]> harness-rows: [];
+    in property <[HarnessRow]> harness-skill-rows: [];
+    in property <[HarnessRow]> harness-preview-rows: [];
+    in property <[HarnessRow]> harness-lifecycle-rows: [];
+    in property <[HarnessRow]> harness-verifier-rows: [];
+    in property <string> harness-library-status: "";
+    in property <string> harness-skill-status: "";
+    in property <string> harness-composition-status: "";
+    in property <string> harness-composition-base-name: "";
+    in property <int> harness-composition-base-index: -1;
+    in property <int> harness-composition-selected-skill-count: 0;
+    in-out property <string> harness-composition-name-input: "";
+    in-out property <string> harness-composition-version-input: "";
+    in property <string> harness-preview-status: "";
+    in property <string> harness-lifecycle-status: "";
+    in property <string> harness-lifecycle-mode: "";
+    in property <string> harness-verifier-status: "";
+    in property <bool> harness-preview-applyable: false;
+    in property <bool> harness-lifecycle-applyable: false;
+    in property <bool> harness-action-busy: false;
+    in property <string> harness-status: "";
+    in property <string> applied-harness-name: "Not connected";
+    in property <string> applied-harness-version: "";
+    in property <string> applied-harness-source: "";
+    in property <string> applied-harness-hash: "";
+    in property <string> applied-harness-verification: "UNVERIFIED";
+    in property <string> applied-harness-verified-at: "";
+    in-out property <int> selected-harness-index: -1;
+
+    in-out property <string> mcp-public-origin-input: "";
+    in-out property <string> mcp-local-port-input: "7979";
+    in-out property <string> mcp-credential-label-input: "Codex Desktop";
+    in property <string> mcp-public-endpoint: "";
+    in property <string> mcp-local-endpoint: "";
+    in property <string> mcp-connection-status: "";
+    in property <string> mcp-server-status: "";
+    in property <string> mcp-server-detail: "";
+    in property <string> mcp-public-route-status: "";
+    in property <bool> mcp-server-running: false;
+    in property <bool> mcp-action-busy: false;
+    in property <[McpTokenRow]> mcp-token-rows: [];
+    in property <int> mcp-active-token-count: 0;
+    in-out property <int> selected-mcp-token-index: -1;
+    in-out property <string> mcp-token-review-mode: "";
+    in property <string> mcp-token-reveal: "";
+    in property <string> mcp-token-reveal-status: "";
+
+    in property <[ApprovalRow]> approval-rows: [];
+    in property <string> approval-status: "";
+    in property <bool> approval-action-busy: false;
+    in property <bool> auto-approval-enabled: false;
+    in-out property <int> selected-approval-index: -1;
+
+    in property <[DoctorFindingRow]> doctor-finding-rows: [];
+    in property <string> doctor-status: "";
+    in property <string> doctor-summary: "";
+    in property <string> doctor-export-content: "";
+    in property <bool> doctor-action-busy: false;
+
+    callback add-location(string);
+    callback open-workspace-folder();
+    callback refresh-locations();
+    callback select-workspace(int);
+    callback select-agent(int);
+    callback issue-agent-dag-grant(string, string, string, string, string);
+    callback revoke-agent-dag-grant();
+    callback select-goal(int);
+    callback select-dag-node(int);
+    callback create-goal(string, string);
+    callback refresh-goals();
+    callback pause-goal();
+    callback resume-goal();
+    callback cancel-goal();
+    callback complete-goal();
+    callback register-harness();
+    callback refresh-harnesses();
+    callback refresh-harness(int);
+    callback select-harness-base(int);
+    callback toggle-harness-skill(int);
+    callback register-harness-skill();
+    callback refresh-harness-skills();
+    callback refresh-harness-skill(int);
+    callback save-harness-composition(string, string);
+    callback preview-harness(int);
+    callback apply-harness-preview();
+    callback preview-harness-lifecycle(int);
+    callback preview-harness-remove();
+    callback apply-harness-lifecycle();
+    callback run-harness-verifiers();
+    callback refresh-harness-verifiers();
+    callback verify-applied-harness();
+    callback save-mcp-connection(string, string);
+    callback refresh-mcp-connection();
+    callback start-mcp-server();
+    callback stop-mcp-server();
+    callback issue-mcp-token(string);
+    callback rotate-mcp-token(int);
+    callback revoke-mcp-token(int);
+    callback dismiss-mcp-token-reveal();
+    callback refresh-activities();
+    callback select-activity(string);
+    callback view-diff(string);
+    callback close-diff-view();
+    callback refresh-approvals();
+    callback approve-request(string);
+    callback reject-request(string);
+    callback set-auto-approval(bool);
+    callback stop-workspace-work();
+    callback emergency-stop();
+    callback start-runtime();
+    callback stop-runtime();
+    callback restart-runtime();
+    callback refresh-doctor();
+    callback export-doctor-diagnostics();
+
+    private property <length> nav-width: 86px;
+    private property <length> top-height: 54px;
+    private property <length> page-padding: root.width < 1260px ? 12px : root.width < 1660px ? 16px : 20px;
+    private property <length> page-gap: root.width < 1260px ? 8px : 12px;
+    private property <length> dag-node-width: root.width < 1320px ? 184px : 210px;
+    private property <length> dag-node-height: 132px;
+    private property <length> dag-column-gap: 50px;
+    private property <length> dag-lane-gap: 16px;
+    private property <int> pending-workspace-index: -1;
+
+    changed selected-workspace-index => {
+        if root.pending-workspace-index >= 0
+            && root.selected-workspace-index == root.pending-workspace-index
+            && root.selected-workspace-id != "" {
+            root.workspace-view-open = true;
+            root.active-page = 0;
+            root.pending-workspace-index = -1;
+        }
+    }
+
+    changed selected-workspace-id => {
+        if root.selected-workspace-id == "" && !root.location-action-busy {
+            root.workspace-view-open = false;
+            root.pending-workspace-index = -1;
+            root.active-page = 0;
+        }
+    }
+
+    background: ForgeTheme.void;
+
+    Rectangle {
+        x: 0px; y: 0px; width: 100%; height: root.top-height;
+        background: #091017;
+        border-width: 1px;
+        border-color: ForgeTheme.separator;
+        Text {
+            text: root.workspace-view-open && root.selected-workspace-index >= 0 && root.selected-workspace-index < root.workspace-rows.length
+                ? "Heterarchy Forge  ›  " + root.workspace-rows[root.selected-workspace-index].label
+                : "Heterarchy Forge";
+            color: ForgeTheme.text-secondary;
+            font-size: 13px;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+        Rectangle {
+            x: parent.width - 190px; y: 10px; width: 168px; height: 34px;
+            border-radius: 6px; background: ForgeTheme.panel; border-width: 1px; border-color: ForgeTheme.separator;
+            HorizontalBox {
+                padding-left: 12px; padding-right: 10px; spacing: 7px;
+                Rectangle { width: 8px; height: 8px; border-radius: 4px; background: root.mcp-server-running ? ForgeTheme.success : root.runtime-status == "Running" ? ForgeTheme.warning : ForgeTheme.text-muted; }
+                Text { text: root.mcp-server-running ? "연결 준비됨" : "런타임 " + root.runtime-status; color: ForgeTheme.text-secondary; font-size: 10px; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
+                Text { text: "⌄"; color: ForgeTheme.text-muted; font-size: 11px; vertical-alignment: center; }
+            }
+        }
+    }
+
+    Rectangle {
+        x: 0px; y: root.top-height; width: root.nav-width; height: root.height - root.top-height;
+        background: #0b1117;
+        border-width: 1px;
+        border-color: ForgeTheme.separator;
+        VerticalBox {
+            padding-top: 16px; padding-left: 7px; padding-right: 7px; spacing: 8px;
+            Rectangle { height: 54px; Text { text: "⌖"; color: ForgeTheme.accent; font-size: 30px; horizontal-alignment: center; vertical-alignment: center; } }
+            Rectangle { height: 1px; background: ForgeTheme.separator; }
+            if !root.workspace-view-open : ReferenceNavItem { icon: "▣"; label: "워크스페이스"; active: true; activated => { root.active-page = 0; } }
+            if root.workspace-view-open : ReferenceNavItem { icon: "←"; label: "목록"; active: false; activated => { root.workspace-view-open = false; root.pending-workspace-index = -1; root.active-page = 0; } }
+            if root.workspace-view-open : Rectangle { height: 1px; background: ForgeTheme.separator; }
+            if root.workspace-view-open : ReferenceNavItem { icon: "▣"; label: "개요"; active: root.active-page == 0; activated => { root.active-page = 0; } }
+            if root.workspace-view-open : ReferenceNavItem { icon: "⌘"; label: "Goal"; active: root.active-page == 1; activated => { root.active-page = 1; } }
+            if root.workspace-view-open : ReferenceNavItem { icon: "⌁"; label: "에이전트"; active: root.active-page == 2; activated => { root.active-page = 2; } }
+            if root.workspace-view-open : ReferenceNavItem { icon: "◇"; label: "하네스"; active: root.active-page == 3; activated => { root.active-page = 3; } }
+            if root.workspace-view-open : ReferenceNavItem { icon: "⚙"; label: "설정"; active: root.active-page == 4; activated => { root.active-page = 4; } }
+            Rectangle { vertical-stretch: 1; }
+            Rectangle { height: 38px; Text { text: ">_"; color: ForgeTheme.text-secondary; font-family: "monospace"; font-size: 13px; horizontal-alignment: center; vertical-alignment: center; } }
+        }
+    }
+
+    Rectangle {
+        x: root.nav-width; y: root.top-height;
+        width: root.width - root.nav-width; height: root.height - root.top-height;
+        background: #0a1118;
+
+        if !root.workspace-view-open : workspace-picker := Rectangle {
+            width: 100%; height: 100%; background: transparent;
+            HorizontalBox {
+                padding: root.page-padding; spacing: 18px;
+                VerticalBox {
+                    horizontal-stretch: 3; spacing: 12px;
+                    Text { text: "워크스페이스"; color: ForgeTheme.text; font-size: 25px; font-weight: 700; }
+                    Rectangle {
+                        height: 112px; border-radius: 8px; border-width: 1px; border-color: ForgeTheme.accent-border; background: ForgeTheme.panel;
+                        HorizontalBox {
+                            padding-left: 20px; padding-right: 18px; spacing: 14px;
+                            Rectangle { width: 46px; height: 46px; border-radius: 7px; border-width: 1px; border-color: ForgeTheme.accent-border; background: ForgeTheme.accent-soft; Text { text: "+"; color: ForgeTheme.accent; font-size: 25px; horizontal-alignment: center; vertical-alignment: center; } }
+                            VerticalBox {
+                                horizontal-stretch: 1; spacing: 5px;
+                                Text { text: "폴더 추가"; color: ForgeTheme.text; font-size: 14px; font-weight: 650; }
+                                Text { text: root.folder-picker-open ? "폴더 선택 창을 여는 중입니다…" : "클릭하여 폴더를 선택합니다"; color: ForgeTheme.text-muted; font-size: 10px; }
+                            }
+                        }
+                        TouchArea {
+                            enabled: !root.folder-picker-open && !root.location-action-busy;
+                            clicked => { root.open-workspace-folder(); }
+                        }
+                    }
+                    Rectangle {
+                        vertical-stretch: 1; background: transparent;
+                        if root.workspace-rows.length == 0 : EmptyState { title: "등록된 Workspace가 없습니다"; detail: root.workspace-status; }
+                        if root.workspace-rows.length > 0 : ListView {
+                            for workspace[index] in root.workspace-rows : ReferenceWorkspacePickerRow {
+                                title: workspace.label;
+                                subtitle: workspace.relative-display;
+                                readiness-status: workspace.readiness-status;
+                                harness-status: workspace.harness-status;
+                                harness-color: workspace.harness-status == "Harness 확인 실패" ? ForgeTheme.warning : workspace.harness-status == "Harness 미감지" ? ForgeTheme.text-muted : ForgeTheme.accent;
+                                work-status: index == root.selected-workspace-index && root.selected-workspace-id != "" ? root.activity-live-rows.length == 0 ? "현재 작업 없음" : root.activity-live-rows.length + "개 작업 중" : "작업 미확인";
+                                work-color: index == root.selected-workspace-index && root.selected-workspace-id != "" ? root.activity-live-rows.length == 0 ? ForgeTheme.text-muted : ForgeTheme.warning : ForgeTheme.text-muted;
+                                selected: index == root.selected-workspace-index;
+                                enabled: !root.location-action-busy;
+                                activated => {
+                                    if !root.location-action-busy {
+                                        if index == root.selected-workspace-index && root.selected-workspace-id != "" {
+                                            root.pending-workspace-index = -1;
+                                            root.workspace-view-open = true;
+                                            root.active-page = 0;
+                                        } else {
+                                            root.pending-workspace-index = index;
+                                            root.select-workspace(index);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Rectangle {
+                        height: 112px; border-radius: 7px; border-width: 1px; border-color: ForgeTheme.separator; background: ForgeTheme.panel;
+                        VerticalBox {
+                            padding: 10px; spacing: 3px;
+                            ReferenceSectionHeader { title: "최근 활동"; detail: root.activity-live-rows.length + " live · " + root.activity-history-rows.length + " history"; }
+                            if root.activity-live-rows.length == 0 && root.activity-history-rows.length == 0 : Text { text: root.activity-status == "" ? "Activity 기록이 없습니다." : root.activity-status; color: ForgeTheme.text-muted; font-size: 10px; }
+                            if root.activity-live-rows.length > 0 || root.activity-history-rows.length > 0 : HorizontalBox {
+                                spacing: 10px;
+                                if root.activity-live-rows.length > 0 : ListView {
+                                    horizontal-stretch: 1;
+                                    for activity[index] in root.activity-live-rows : Rectangle {
+                                        height: 38px; border-radius: 5px; border-width: 1px; border-color: activity.id == root.selected-activity-id ? ForgeTheme.accent-border : ForgeTheme.separator; background: activity.id == root.selected-activity-id ? ForgeTheme.accent-soft : ForgeTheme.panel-raised;
+                                        VerticalBox { padding-left: 8px; padding-right: 8px; spacing: 1px; Text { text: activity.display-label; color: ForgeTheme.text-secondary; font-size: 10px; font-weight: 600; overflow: elide; } Text { text: activity.state + " · " + activity.liveness; color: ForgeTheme.text-muted; font-size: 9px; overflow: elide; } }
+                                        TouchArea { clicked => { root.selected-diff-index = -1; root.select-activity(activity.id); } }
+                                    }
+                                }
+                                if root.activity-history-rows.length > 0 : ListView {
+                                    horizontal-stretch: 1;
+                                    for activity[index] in root.activity-history-rows : Rectangle {
+                                        height: 38px; border-radius: 5px; border-width: 1px; border-color: activity.id == root.selected-activity-id ? ForgeTheme.accent-border : ForgeTheme.separator; background: activity.id == root.selected-activity-id ? ForgeTheme.accent-soft : ForgeTheme.panel-raised;
+                                        VerticalBox { padding-left: 8px; padding-right: 8px; spacing: 1px; Text { text: activity.display-label; color: ForgeTheme.text-secondary; font-size: 10px; font-weight: 600; overflow: elide; } Text { text: activity.state + " · " + activity.updated-at; color: ForgeTheme.text-muted; font-size: 9px; overflow: elide; } }
+                                        TouchArea { clicked => { root.selected-diff-index = -1; root.select-activity(activity.id); } }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Rectangle {
+                    horizontal-stretch: 1; min-width: 300px; max-width: 410px; border-radius: 8px; border-width: 1px; border-color: ForgeTheme.separator; background: ForgeTheme.panel;
+                    VerticalBox {
+                        padding: 18px; spacing: 8px;
+                        Rectangle { height: 116px; Text { text: "▱"; color: root.selected-workspace-id == "" ? ForgeTheme.text-muted : ForgeTheme.accent; font-size: 72px; horizontal-alignment: center; vertical-alignment: center; } }
+                        Text { text: root.selected-workspace-id == "" ? "Workspace를 선택하세요" : root.selected-workspace-index >= 0 && root.selected-workspace-index < root.workspace-rows.length ? root.workspace-rows[root.selected-workspace-index].label : root.selected-workspace-root; color: ForgeTheme.text; font-size: 18px; font-weight: 700; overflow: elide; }
+                        Text { text: root.selected-workspace-root; color: ForgeTheme.text-muted; font-family: "monospace"; font-size: 10px; overflow: elide; }
+                        Rectangle { height: 1px; background: ForgeTheme.separator; }
+                        ReferenceInfoRow { label: "연결 상태"; value: root.mcp-server-running ? "연결 준비됨" : root.mcp-server-status; }
+                        ReferenceInfoRow { label: "하네스 상태"; value: root.applied-harness-name == "Not connected" ? "미적용" : root.applied-harness-name; }
+                        ReferenceInfoRow { label: "현재 활동"; value: root.activity-live-rows.length == 0 ? "현재 작업 없음" : root.activity-live-rows.length + "개 실행 중"; }
+                        ReferenceInfoRow { label: "Revision"; value: root.selected-workspace-revision; }
+                        ReferenceInfoRow { label: "Agent"; value: root.agent-rows.length + " attached"; }
+                        ReferenceInfoRow { label: "Goal"; value: root.goal-rows.length + ""; }
+                        Rectangle { height: 1px; background: ForgeTheme.separator; }
+                        ReferenceSectionHeader { title: "EVIDENCE / DIFF"; detail: root.selected-activity-id == "" ? "Activity 미선택" : root.selected-activity-id; }
+                        if root.selected-activity-id == "" : Text { text: "최근 활동에서 Activity를 선택하면 해당 범위의 변경 증거를 읽기 전용으로 볼 수 있습니다."; color: ForgeTheme.text-muted; font-size: 9px; wrap: word-wrap; }
+                        if root.selected-activity-id != "" && root.diff-rows.length == 0 && !root.diff-view-open : Text { text: root.diff-status == "" ? "기록된 Diff가 없습니다." : root.diff-status; color: ForgeTheme.text-muted; font-size: 9px; wrap: word-wrap; }
+                        if root.selected-activity-id != "" && root.diff-rows.length > 0 && !root.diff-view-open : ListView {
+                            vertical-stretch: 1;
+                            for diff[index] in root.diff-rows : Rectangle {
+                                height: 42px; border-radius: 5px; border-width: 1px; border-color: index == root.selected-diff-index ? ForgeTheme.accent-border : ForgeTheme.separator; background: index == root.selected-diff-index ? ForgeTheme.accent-soft : ForgeTheme.panel-raised;
+                                HorizontalBox { padding-left: 8px; padding-right: 8px; spacing: 6px; VerticalBox { horizontal-stretch: 1; spacing: 1px; Text { text: diff.path; color: ForgeTheme.text-secondary; font-size: 9px; font-weight: 600; overflow: elide; } Text { text: diff.kind + " · " + diff.state; color: ForgeTheme.text-muted; font-size: 8px; overflow: elide; } } Text { text: "보기"; color: ForgeTheme.accent-text; font-size: 9px; vertical-alignment: center; } }
+                                TouchArea { clicked => { root.selected-diff-index = index; root.view-diff(diff.id); } }
+                            }
+                        }
+                        if root.diff-view-open : VerticalBox {
+                            vertical-stretch: 1; spacing: 5px;
+                            Text { text: root.diff-view-title; color: ForgeTheme.text-secondary; font-size: 10px; font-weight: 600; overflow: elide; }
+                            TextEdit { text: root.diff-view-content; read-only: true; font-family: "monospace"; font-size: 9px; vertical-stretch: 1; }
+                            ReferenceToolbarButton { label: "Diff 닫기"; activated => { root.close-diff-view(); } }
+                        }
+                    }
+                }
+            }
+        }
+
+        if root.workspace-view-open && root.active-page == 0 : workspace-overview := Rectangle {
+            width: 100%; height: 100%; background: transparent;
+            VerticalBox {
+                padding: root.page-padding; spacing: 12px;
+                HorizontalBox {
+                    spacing: 12px;
+                    VerticalBox {
+                        horizontal-stretch: 1; spacing: 3px;
+                        Text {
+                            text: root.selected-workspace-index >= 0 && root.selected-workspace-index < root.workspace-rows.length
+                                ? root.workspace-rows[root.selected-workspace-index].label
+                                : "Workspace";
+                            color: ForgeTheme.text; font-size: 25px; font-weight: 700; overflow: elide;
+                        }
+                        Text { text: root.selected-workspace-root; color: ForgeTheme.text-muted; font-family: "monospace"; font-size: 10px; overflow: elide; }
+                    }
+                    ReferenceToolbarButton { label: "목록으로"; activated => { root.workspace-view-open = false; root.pending-workspace-index = -1; root.active-page = 0; } }
+                }
+
+                HorizontalBox {
+                    spacing: 10px;
+                    ReferenceMetric { horizontal-stretch: 1; label: "연결 상태"; value: root.mcp-server-running ? "READY" : "대기"; detail: root.mcp-server-status; value-color: root.mcp-server-running ? ForgeTheme.success : ForgeTheme.text-muted; }
+                    ReferenceMetric { horizontal-stretch: 1; label: "하네스"; value: root.applied-harness-name == "Not connected" ? "미적용" : "적용됨"; detail: root.applied-harness-name; value-color: root.applied-harness-name == "Not connected" ? ForgeTheme.text-muted : ForgeTheme.accent; }
+                    ReferenceMetric { horizontal-stretch: 1; label: "현재 활동"; value: root.activity-live-rows.length + ""; detail: root.activity-live-rows.length == 0 ? "현재 작업 없음" : "실행 중"; }
+                    ReferenceMetric { horizontal-stretch: 1; label: "Agent / Goal"; value: root.agent-rows.length + " / " + root.goal-rows.length; detail: "현재 Workspace 범위"; }
+                }
+
+                HorizontalBox {
+                    vertical-stretch: 1; spacing: 12px;
+                    Rectangle {
+                        horizontal-stretch: 2; border-radius: 8px; border-width: 1px; border-color: ForgeTheme.separator; background: ForgeTheme.panel;
+                        VerticalBox {
+                            padding: 14px; spacing: 8px;
+                            ReferenceSectionHeader { title: "최근 활동"; detail: root.activity-live-rows.length + " live · " + root.activity-history-rows.length + " history"; }
+                            if root.activity-live-rows.length == 0 && root.activity-history-rows.length == 0 : EmptyState { title: "Activity 기록이 없습니다"; detail: root.activity-status; }
+                            if root.activity-live-rows.length > 0 : ListView {
+                                vertical-stretch: 1;
+                                for activity[index] in root.activity-live-rows : ReferenceSelectableRow {
+                                    icon: "●";
+                                    title: activity.display-label;
+                                    subtitle: activity.state + " · " + activity.liveness;
+                                    meta: activity.updated-at;
+                                    state: activity.id == root.selected-activity-id ? "선택됨" : "LIVE";
+                                    state-color: activity.id == root.selected-activity-id ? ForgeTheme.accent : ForgeTheme.success;
+                                    selected: activity.id == root.selected-activity-id;
+                                    activated => { root.selected-diff-index = -1; root.select-activity(activity.id); }
+                                }
+                            }
+                            if root.activity-live-rows.length == 0 && root.activity-history-rows.length > 0 : ListView {
+                                vertical-stretch: 1;
+                                for activity[index] in root.activity-history-rows : ReferenceSelectableRow {
+                                    icon: "○";
+                                    title: activity.display-label;
+                                    subtitle: activity.state;
+                                    meta: activity.updated-at;
+                                    state: activity.id == root.selected-activity-id ? "선택됨" : "HISTORY";
+                                    state-color: ForgeTheme.text-muted;
+                                    selected: activity.id == root.selected-activity-id;
+                                    activated => { root.selected-diff-index = -1; root.select-activity(activity.id); }
+                                }
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        horizontal-stretch: 1; min-width: 320px; max-width: 430px; border-radius: 8px; border-width: 1px; border-color: ForgeTheme.separator; background: ForgeTheme.panel;
+                        VerticalBox {
+                            padding: 16px; spacing: 8px;
+                            ReferenceSectionHeader { title: "Workspace 상태"; detail: root.workspace-status; }
+                            ReferenceInfoRow { label: "Revision"; value: root.selected-workspace-revision; }
+                            ReferenceInfoRow { label: "Root"; value: root.selected-workspace-root; }
+                            ReferenceInfoRow { label: "Agent"; value: root.agent-rows.length + " attached"; }
+                            ReferenceInfoRow { label: "Goal"; value: root.goal-rows.length + ""; }
+                            Rectangle { height: 1px; background: ForgeTheme.separator; }
+                            ReferenceSectionHeader { title: "EVIDENCE / DIFF"; detail: root.selected-activity-id == "" ? "Activity 미선택" : root.selected-activity-id; }
+                            if root.selected-activity-id == "" : Text { text: "Activity를 선택하면 해당 범위의 변경 증거를 읽기 전용으로 볼 수 있습니다."; color: ForgeTheme.text-muted; font-size: 9px; wrap: word-wrap; }
+                            if root.selected-activity-id != "" && root.diff-rows.length == 0 && !root.diff-view-open : Text { text: root.diff-status == "" ? "기록된 Diff가 없습니다." : root.diff-status; color: ForgeTheme.text-muted; font-size: 9px; wrap: word-wrap; }
+                            if root.selected-activity-id != "" && root.diff-rows.length > 0 && !root.diff-view-open : ListView {
+                                vertical-stretch: 1;
+                                for diff[index] in root.diff-rows : Rectangle {
+                                    height: 42px; border-radius: 5px; border-width: 1px; border-color: index == root.selected-diff-index ? ForgeTheme.accent-border : ForgeTheme.separator; background: index == root.selected-diff-index ? ForgeTheme.accent-soft : ForgeTheme.panel-raised;
+                                    HorizontalBox { padding-left: 8px; padding-right: 8px; spacing: 6px; VerticalBox { horizontal-stretch: 1; spacing: 1px; Text { text: diff.path; color: ForgeTheme.text-secondary; font-size: 9px; font-weight: 600; overflow: elide; } Text { text: diff.kind + " · " + diff.state; color: ForgeTheme.text-muted; font-size: 8px; overflow: elide; } } Text { text: "보기"; color: ForgeTheme.accent-text; font-size: 9px; vertical-alignment: center; } }
+                                    TouchArea { clicked => { root.selected-diff-index = index; root.view-diff(diff.id); } }
+                                }
+                            }
+                            if root.diff-view-open : VerticalBox {
+                                vertical-stretch: 1; spacing: 5px;
+                                Text { text: root.diff-view-title; color: ForgeTheme.text-secondary; font-size: 10px; font-weight: 600; overflow: elide; }
+                                TextEdit { text: root.diff-view-content; read-only: true; font-family: "monospace"; font-size: 9px; vertical-stretch: 1; }
+                                ReferenceToolbarButton { label: "Diff 닫기"; activated => { root.close-diff-view(); } }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if root.workspace-view-open && root.active-page == 2 : agent-page := Rectangle {
+            width: 100%; height: 100%; background: transparent;
+            VerticalBox {
+                padding: root.page-padding; spacing: 10px;
+                HorizontalBox {
+                    height: 50px; spacing: 12px;
+                    VerticalBox {
+                        horizontal-stretch: 1; spacing: 2px;
+                        Text { text: "에이전트"; color: ForgeTheme.text; font-size: 24px; font-weight: 700; }
+                        Text { text: "현재 Workspace에 연결된 실행 주체와 관측 가능한 작업 상태"; color: ForgeTheme.text-muted; font-size: 10px; overflow: elide; }
+                    }
+                    ReferenceStatusDot { label: root.agent-rows.length == 0 ? "연결 없음" : root.agent-rows.length + " 연결"; dot-color: root.agent-rows.length == 0 ? ForgeTheme.text-muted : ForgeTheme.success; }
+                }
+                agent-summary := Rectangle {
+                    height: 56px; background: #0b1218; border-width: 1px; border-color: ForgeTheme.separator; border-radius: 4px;
+                    HorizontalBox {
+                        ReferenceSummaryMetric { horizontal-stretch: 1; label: "연결됨"; value: root.agent-rows.length + ""; detail: "attachment"; }
+                        Rectangle { width: 1px; background: ForgeTheme.separator; }
+                        ReferenceSummaryMetric { horizontal-stretch: 1; label: "선택 Agent"; value: root.selected-agent-id == "" ? "—" : root.selected-agent-state; detail: root.selected-agent-liveness; value-color: root.selected-agent-id == "" ? ForgeTheme.text-muted : ForgeTheme.success; }
+                        Rectangle { width: 1px; background: ForgeTheme.separator; }
+                        ReferenceSummaryMetric { horizontal-stretch: 1; label: "현재 Goal"; value: root.selected-agent-current-goal == "" ? "—" : "선택됨"; detail: root.selected-agent-current-goal; }
+                        Rectangle { width: 1px; background: ForgeTheme.separator; }
+                        ReferenceSummaryMetric { horizontal-stretch: 1; label: "DAG Revision"; value: root.dag-revision == "" ? "—" : root.dag-revision; detail: root.selected-agent-current-node; }
+                    }
+                }
+                HorizontalBox {
+                    vertical-stretch: 1; spacing: root.page-gap;
+                    agent-list-pane := Rectangle {
+                        horizontal-stretch: 3; min-width: 220px; border-width: 1px; border-color: ForgeTheme.separator; background: ForgeTheme.panel;
+                        VerticalBox {
+                            padding-left: 8px; padding-right: 8px; padding-top: 6px; padding-bottom: 6px; spacing: 2px;
+                            ReferenceSectionHeader { title: "에이전트"; detail: root.agent-rows.length + ""; }
+                            if root.agent-rows.length == 0 : EmptyState { title: "연결된 Agent가 없습니다"; detail: "Activity에 attach된 durable participant가 여기에 표시됩니다."; }
+                            if root.agent-rows.length > 0 : ListView {
+                                vertical-stretch: 1;
+                                for agent[index] in root.agent-rows : ReferenceSelectableRow {
+                                    flat: true; icon: "◉"; title: agent.display-name; subtitle: agent.role;
+                                    meta: agent.current-node == "" ? agent.public-summary : agent.current-node + " · " + agent.public-summary;
+                                    state: agent.state + " · " + agent.liveness;
+                                    state-color: agent.state == "ATTACHED" ? ForgeTheme.success : ForgeTheme.info;
+                                    selected: agent.id == root.selected-agent-id;
+                                    activated => { root.select-agent(index); }
+                                }
+                            }
+                        }
+                    }
+                    VerticalBox {
+                        horizontal-stretch: 6; min-width: 450px; spacing: root.page-gap;
+                        agent-context-pane := Rectangle {
+                            height: 210px; border-width: 1px; border-color: ForgeTheme.separator; background: ForgeTheme.panel;
+                            VerticalBox {
+                                padding-left: 10px; padding-right: 10px; padding-top: 7px; padding-bottom: 8px; spacing: 2px;
+                                ReferenceSectionHeader { title: "현재 컨텍스트"; detail: root.selected-agent-name; }
+                                if root.selected-agent-id == "" : EmptyState { title: "Agent를 선택하세요"; detail: "선택한 Agent의 operator-safe projection만 표시합니다."; }
+                                if root.selected-agent-id != "" : HorizontalBox {
+                                    spacing: 14px;
+                                    VerticalBox {
+                                        horizontal-stretch: 1; spacing: 0px;
+                                        ReferenceInfoRow { label-width: 76px; label: "Agent"; value: root.selected-agent-name; }
+                                        ReferenceInfoRow { label-width: 76px; label: "Role"; value: root.selected-agent-role; }
+                                        ReferenceInfoRow { label-width: 76px; label: "Activity"; value: root.selected-agent-state + " · " + root.selected-agent-liveness; }
+                                    }
+                                    VerticalBox {
+                                        horizontal-stretch: 1; spacing: 0px;
+                                        ReferenceInfoRow { label-width: 84px; label: "Goal"; value: root.selected-agent-current-goal; }
+                                        ReferenceInfoRow { label-width: 84px; label: "Current Node"; value: root.selected-agent-current-node; }
+                                        ReferenceInfoRow { label-width: 84px; label: "Summary"; value: root.selected-agent-public-summary; }
+                                        ReferenceInfoRow { label-width: 84px; label: "Evidence"; value: root.selected-agent-evidence; }
+                                    }
+                                }
+                            }
+                        }
+                        agent-dag-pane := Rectangle {
+                            vertical-stretch: 1; min-height: 330px; border-width: 1px; border-color: ForgeTheme.separator; background: ForgeTheme.panel;
+                            VerticalBox {
+                                padding-left: 9px; padding-right: 9px; padding-top: 6px; padding-bottom: 8px; spacing: 2px;
+                                ReferenceSectionHeader { title: "작업 DAG"; detail: root.dag-node-rows.length == 0 ? "DAG 없음" : "REV " + root.dag-revision; }
+                                if root.dag-node-rows.length == 0 : EmptyState { title: "현재 DAG가 없습니다"; detail: root.dag-status; }
+                                if root.dag-node-rows.length > 0 : agent-graph := Flickable {
+                                    viewport-width: max(self.width, 24px + root.dag-column-count * root.dag-node-width + max(0, root.dag-column-count - 1) * root.dag-column-gap);
+                                    viewport-height: max(self.height, 24px + root.dag-lane-count * root.dag-node-height + max(0, root.dag-lane-count - 1) * root.dag-lane-gap);
+                                    Rectangle {
+                                        width: agent-graph.viewport-width; height: agent-graph.viewport-height; background: #091017;
+                                        for edge[index] in root.dag-edge-rows : DagEdgeConnector {
+                                            x: 12px + edge.from-column * (root.dag-node-width + root.dag-column-gap) + root.dag-node-width;
+                                            y: min(12px + edge.from-lane * (root.dag-node-height + root.dag-lane-gap) + root.dag-node-height / 2, 12px + edge.to-lane * (root.dag-node-height + root.dag-lane-gap) + root.dag-node-height / 2);
+                                            width: max(1px, 12px + edge.to-column * (root.dag-node-width + root.dag-column-gap) - self.x);
+                                            from-y: 12px + edge.from-lane * (root.dag-node-height + root.dag-lane-gap) + root.dag-node-height / 2;
+                                            to-y: 12px + edge.to-lane * (root.dag-node-height + root.dag-lane-gap) + root.dag-node-height / 2;
+                                            blocked: edge.blocked; current-path: edge.current-path; accessible-name: edge.upstream-label + " → " + edge.downstream-label;
+                                        }
+                                        for node[index] in root.dag-node-rows : DagNodeCard {
+                                            x: 12px + node.column * (root.dag-node-width + root.dag-column-gap);
+                                            y: 12px + node.lane * (root.dag-node-height + root.dag-lane-gap);
+                                            width: root.dag-node-width; height: root.dag-node-height;
+                                            node-id: node.id; label: node.label; state: node.state; state-label: node.state-label; objective: node.objective; acceptance: node.acceptance; depends-on: node.depends-on; waiting-on: node.waiting-on; evidence: node.evidence; revision: node.revision; current: node.current; terminal: node.terminal;
+                                            selected: node.id == root.selected-dag-id; activated => { root.select-dag-node(index); }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    agent-inspector-pane := Rectangle {
+                        horizontal-stretch: 4; min-width: 260px; border-width: 1px; border-color: ForgeTheme.separator; background: ForgeTheme.panel;
+                        VerticalBox {
+                            padding-left: 10px; padding-right: 10px; padding-top: 6px; padding-bottom: 8px; spacing: 3px;
+                            ReferenceSectionHeader { title: "활동"; detail: root.work-narrative-rows.length + ""; }
+                            if root.work-narrative-rows.length == 0 : EmptyState { title: "공개된 작업 내역이 없습니다"; detail: root.selected-agent-public-summary == "" ? "Private model reasoning is never displayed." : root.selected-agent-public-summary; }
+                            if root.work-narrative-rows.length > 0 : ListView {
+                                vertical-stretch: 1;
+                                for item[index] in root.work-narrative-rows : Rectangle {
+                                    height: 74px; background: transparent;
+                                    HorizontalBox {
+                                        padding-left: 3px; padding-right: 4px; spacing: 8px;
+                                        Rectangle {
+                                            width: 16px; background: transparent;
+                                            Rectangle { x: 7px; y: 0px; width: 1px; height: 100%; background: ForgeTheme.separator-strong; }
+                                            Rectangle { x: 3px; y: 13px; width: 9px; height: 9px; border-radius: 5px; background: item.state == "COMPLETED" ? ForgeTheme.success : item.state == "BLOCKED" || item.state == "FAILED" ? ForgeTheme.danger : ForgeTheme.accent; border-width: 2px; border-color: ForgeTheme.panel; }
+                                        }
+                                        VerticalBox { horizontal-stretch: 1; padding-top: 7px; padding-bottom: 6px; spacing: 2px; HorizontalBox { Text { text: item.phase; color: ForgeTheme.accent-text; font-size: 9px; font-weight: 700; } Rectangle { horizontal-stretch: 1; } Text { text: item.state; color: ForgeTheme.text-muted; font-size: 9px; } } Text { text: item.action; color: ForgeTheme.text; font-size: 11px; font-weight: 600; overflow: elide; } Text { text: item.rationale; color: ForgeTheme.text-secondary; font-size: 9px; overflow: elide; } Text { text: item.evidence; color: ForgeTheme.text-muted; font-size: 9px; overflow: elide; } }
+                                    }
+                                    Rectangle { y: parent.height - 1px; width: 100%; height: 1px; background: ForgeTheme.separator; }
+                                }
+                            }
+                            Rectangle { height: 1px; background: ForgeTheme.separator; }
+                            ReferenceSectionHeader { title: "선택 노드"; detail: root.selected-dag-id; }
+                            ReferenceInfoRow { label-width: 90px; label: "담당 Agent"; value: root.selected-dag-agent-name; }
+                            ReferenceInfoRow { label-width: 90px; label: "Work Summary"; value: root.selected-dag-work-summary; }
+                            ReferenceInfoRow { label-width: 90px; label: "Public Summary"; value: root.selected-dag-public-summary; }
+                            ReferenceInfoRow { label-width: 90px; label: "Last Observed"; value: root.selected-dag-last-observed; }
+                            Rectangle { height: 1px; background: ForgeTheme.separator; }
+                            ReferenceSectionHeader { title: "DAG 재계획 권한"; detail: root.agent-dag-grant-availability; }
+                            Text { text: root.agent-dag-grant-status; color: root.agent-dag-grant-active ? ForgeTheme.accent-text : ForgeTheme.text-muted; font-size: 9px; wrap: word-wrap; }
+                            HorizontalBox {
+                                spacing: 6px;
+                                ReferenceToolbarButton { horizontal-stretch: 1; label: "5분간 1회 허용"; active: !root.agent-dag-grant-active; enabled: !root.agent-dag-grant-active && !root.agent-action-busy && root.selected-agent-liveness == "실시간" && root.selected-goal-id != "" && root.selected-goal-revision != "" && root.dag-revision != "" && root.dag-head-revision != "" && !root.selected-goal-terminal; activated => { root.issue-agent-dag-grant(root.selected-agent-id, root.selected-goal-id, root.selected-goal-revision, root.dag-revision, root.dag-head-revision); } }
+                                if root.agent-dag-grant-active : ReferenceToolbarButton { label: "회수"; danger: true; enabled: !root.agent-action-busy; activated => { root.revoke-agent-dag-grant(); } }
+                            }
+                            Text { text: "내부 추론은 표시하지 않습니다. 관측 가능한 작업과 근거만 표시합니다."; color: ForgeTheme.unavailable-text; font-size: 9px; wrap: word-wrap; }
+                        }
+                    }
+                }
+            }
+        }
+
+        if root.workspace-view-open && root.active-page == 3 : harness-page := Rectangle {
+            width: 100%; height: 100%; background: transparent;
+            VerticalBox {
+                padding: root.page-padding; spacing: 12px;
+                Text { text: "하네스"; color: ForgeTheme.text; font-size: 25px; font-weight: 700; }
+                HorizontalBox {
+                    spacing: 10px;
+                    ReferenceMetric { horizontal-stretch: 1; label: "라이브러리"; value: root.harness-rows.length + ""; detail: root.harness-library-status; }
+                    ReferenceMetric { horizontal-stretch: 1; label: "스킬"; value: root.harness-skill-rows.length + ""; detail: root.harness-skill-status; }
+                    ReferenceMetric { horizontal-stretch: 1; label: "현재 적용"; value: root.applied-harness-name == "Not connected" ? "0" : "1"; detail: root.applied-harness-name; value-color: root.applied-harness-name == "Not connected" ? ForgeTheme.text-muted : ForgeTheme.accent; }
+                    ReferenceMetric { horizontal-stretch: 1; label: "검증 상태"; value: root.applied-harness-verification; detail: root.applied-harness-verified-at; value-color: root.applied-harness-verification == "READY" || root.applied-harness-verification == "SOURCE VERIFIED" ? ForgeTheme.success : ForgeTheme.warning; }
+                }
+                HorizontalBox {
+                    vertical-stretch: 1; spacing: 12px;
+                    Rectangle {
+                        horizontal-stretch: 1; min-width: 330px; max-width: 420px; border-radius: 7px; border-width: 1px; border-color: ForgeTheme.separator; background: ForgeTheme.panel;
+                        VerticalBox {
+                            padding: 10px; spacing: 8px;
+                            HorizontalBox { ReferenceSectionHeader { horizontal-stretch: 1; title: "하네스 라이브러리"; detail: root.harness-rows.length + ""; } ReferenceToolbarButton { label: "+ 하네스"; active: true; enabled: !root.harness-action-busy; activated => { root.register-harness(); } } }
+                            if root.harness-rows.length == 0 : EmptyState { title: "등록된 Harness가 없습니다"; detail: root.harness-library-status; }
+                            if root.harness-rows.length > 0 : ListView {
+                                max-height: 360px;
+                                for harness[index] in root.harness-rows : ReferenceSelectableRow {
+                                    icon: "◇"; title: harness.label; subtitle: harness.value; meta: "Revision " + harness.revision; state: harness.state;
+                                    state-color: harness.state == "CURRENT" || harness.state == "READY" ? ForgeTheme.success : ForgeTheme.text-muted;
+                                    selected: index == root.selected-harness-index || harness.state == "CURRENT";
+                                    activated => { root.selected-harness-index = index; }
+                                }
+                            }
+                            if root.selected-harness-index >= 0 && root.selected-harness-index < root.harness-rows.length : HorizontalBox {
+                                spacing: 6px;
+                                ReferenceToolbarButton { label: "새로고침"; enabled: !root.harness-action-busy; activated => { root.refresh-harness(root.selected-harness-index); } }
+                                ReferenceToolbarButton { label: root.selected-harness-index == root.harness-composition-base-index ? "Base" : "Use as Base"; active: root.selected-harness-index == root.harness-composition-base-index; enabled: !root.harness-action-busy; activated => { root.select-harness-base(root.selected-harness-index); } }
+                                ReferenceToolbarButton {
+                                    label: root.applied-harness-name == "Not connected" ? "Preview" : root.harness-rows[root.selected-harness-index].state == "CURRENT" ? "Current" : root.harness-rows[root.selected-harness-index].state == "UPDATE AVAILABLE" ? "Update" : "Switch";
+                                    active: root.applied-harness-name == "Not connected";
+                                    enabled: !root.harness-action-busy && root.selected-workspace-id != "" && root.harness-rows[root.selected-harness-index].state != "CURRENT";
+                                    activated => {
+                                        if root.applied-harness-name == "Not connected" { root.preview-harness(root.selected-harness-index); }
+                                        else { root.preview-harness-lifecycle(root.selected-harness-index); }
+                                    }
+                                }
+                            }
+                            Rectangle { height: 1px; background: ForgeTheme.separator; }
+                            HorizontalBox { ReferenceSectionHeader { horizontal-stretch: 1; title: "주요 스킬"; detail: root.harness-skill-rows.length + ""; } ReferenceToolbarButton { label: "새로고침"; enabled: !root.harness-action-busy; activated => { root.refresh-harness-skills(); } } ReferenceToolbarButton { label: "+ 스킬"; enabled: !root.harness-action-busy; activated => { root.register-harness-skill(); } } }
+                            if root.harness-skill-rows.length == 0 : Text { text: root.harness-skill-status; color: ForgeTheme.text-muted; font-size: 10px; wrap: word-wrap; }
+                            if root.harness-skill-rows.length > 0 : ListView {
+                                vertical-stretch: 1;
+                                for skill[index] in root.harness-skill-rows : Rectangle {
+                                    height: 40px; border-radius: 5px; border-width: 1px; border-color: skill.state == "SELECTED" ? ForgeTheme.accent-border : ForgeTheme.separator; background: skill.state == "SELECTED" ? ForgeTheme.accent-soft : ForgeTheme.panel-raised;
+                                    HorizontalBox {
+                                        padding-left: 9px; padding-right: 9px; spacing: 7px;
+                                        Rectangle { width: 7px; height: 7px; border-radius: 4px; background: skill.state == "SELECTED" ? ForgeTheme.accent : ForgeTheme.success; }
+                                        VerticalBox { horizontal-stretch: 1; spacing: 1px; Text { text: skill.label; color: ForgeTheme.text-secondary; font-size: 10px; font-weight: 600; overflow: elide; } Text { text: skill.value; color: ForgeTheme.text-muted; font-size: 8px; overflow: elide; } }
+                                        Text { text: skill.state; color: skill.state == "SELECTED" ? ForgeTheme.accent-text : ForgeTheme.text-muted; font-size: 8px; vertical-alignment: center; }
+                                    }
+                                    TouchArea { enabled: !root.harness-action-busy; clicked => { root.toggle-harness-skill(index); } }
+                                }
+                            }
+                        }
+                    }
+                    Rectangle {
+                        horizontal-stretch: 2; min-width: 440px; border-radius: 7px; border-width: 1px; border-color: ForgeTheme.separator; background: ForgeTheme.panel;
+                        VerticalBox {
+                            padding: 14px; spacing: 10px;
+                            ReferenceSectionHeader { title: "선택된 하네스"; detail: root.applied-harness-name == "Not connected" ? "미적용" : "APPLIED"; }
+                            HorizontalBox {
+                                spacing: 12px;
+                                Rectangle { width: 58px; height: 58px; border-radius: 8px; background: ForgeTheme.accent-soft; border-width: 1px; border-color: ForgeTheme.accent-border; Text { text: "◇"; color: ForgeTheme.accent; font-size: 29px; horizontal-alignment: center; vertical-alignment: center; } }
+                                VerticalBox { spacing: 4px; Text { text: root.applied-harness-name; color: ForgeTheme.text; font-size: 18px; font-weight: 700; } Text { text: root.applied-harness-source; color: ForgeTheme.text-muted; font-size: 10px; overflow: elide; } }
+                            }
+                            ReferenceInfoRow { label: "Version"; value: root.applied-harness-version; }
+                            ReferenceInfoRow { label: "Verified At"; value: root.applied-harness-verified-at; }
+                            ReferenceInfoRow { label: "Source"; value: root.applied-harness-source; }
+                            ReferenceInfoRow { label: "Content Hash"; value: root.applied-harness-hash; }
+                            HorizontalBox {
+                                spacing: 7px;
+                                ReferenceToolbarButton { label: "소스 검증"; enabled: !root.harness-action-busy && root.applied-harness-name != "Not connected"; activated => { root.verify-applied-harness(); } }
+                                ReferenceToolbarButton { label: "검증 실행"; active: true; enabled: !root.harness-action-busy && root.applied-harness-verification == "SOURCE VERIFIED"; activated => { root.run-harness-verifiers(); } }
+                                ReferenceToolbarButton { label: "제거 미리보기"; danger: true; enabled: !root.harness-action-busy && root.applied-harness-name != "Not connected"; activated => { root.preview-harness-remove(); } }
+                            }
+                            Rectangle { height: 1px; background: ForgeTheme.separator; }
+                            ReferenceSectionHeader { title: "구성 (Composition)"; detail: root.harness-composition-status; }
+                            HorizontalBox {
+                                height: 108px; spacing: 8px;
+                                Rectangle {
+                                    horizontal-stretch: 1; border-radius: 6px; border-width: 1px; border-color: ForgeTheme.separator; background: ForgeTheme.panel-raised;
+                                    VerticalBox { padding: 9px; spacing: 4px; Text { text: "Base Harness"; color: ForgeTheme.text-muted; font-size: 9px; font-weight: 700; } Rectangle { vertical-stretch: 1; } Text { text: root.harness-composition-base-name == "" ? "미선택" : root.harness-composition-base-name; color: ForgeTheme.text; font-size: 11px; font-weight: 650; overflow: elide; } }
+                                }
+                                Text { text: "+"; color: ForgeTheme.text-muted; font-size: 18px; horizontal-alignment: center; vertical-alignment: center; }
+                                Rectangle {
+                                    horizontal-stretch: 1; border-radius: 6px; border-width: 1px; border-color: ForgeTheme.separator; background: ForgeTheme.panel-raised;
+                                    VerticalBox { padding: 9px; spacing: 4px; Text { text: "선택된 Skill"; color: ForgeTheme.text-muted; font-size: 9px; font-weight: 700; } Rectangle { vertical-stretch: 1; } Text { text: root.harness-composition-selected-skill-count + "개"; color: root.harness-composition-selected-skill-count > 0 ? ForgeTheme.accent-text : ForgeTheme.text-secondary; font-size: 13px; font-weight: 700; } }
+                                }
+                                Text { text: "→"; color: ForgeTheme.text-muted; font-size: 17px; horizontal-alignment: center; vertical-alignment: center; }
+                                Rectangle {
+                                    horizontal-stretch: 1; border-radius: 6px; border-width: 1px; border-color: ForgeTheme.accent-border; background: ForgeTheme.accent-soft;
+                                    VerticalBox { padding: 9px; spacing: 4px; Text { text: "결합 결과"; color: ForgeTheme.accent-text; font-size: 9px; font-weight: 700; } Rectangle { vertical-stretch: 1; } Text { text: root.harness-composition-name-input == "" ? root.applied-harness-name : root.harness-composition-name-input; color: ForgeTheme.text; font-size: 11px; font-weight: 650; overflow: elide; } }
+                                }
+                            }
+                            HorizontalBox {
+                                spacing: 7px;
+                                LineEdit { horizontal-stretch: 2; text <=> root.harness-composition-name-input; placeholder-text: "Composition 이름"; enabled: !root.harness-action-busy; }
+                                LineEdit { horizontal-stretch: 1; text <=> root.harness-composition-version-input; placeholder-text: "1.0.0"; enabled: !root.harness-action-busy; }
+                                ReferenceToolbarButton { label: "Bundle 저장"; active: true; enabled: !root.harness-action-busy && root.harness-composition-base-index >= 0 && root.harness-composition-name-input != "" && root.harness-composition-version-input != ""; activated => { root.save-harness-composition(root.harness-composition-name-input, root.harness-composition-version-input); } }
+                            }
+                            if root.harness-preview-rows.length > 0 : ListView { max-height: 130px; for item[index] in root.harness-preview-rows : ReferenceSelectableRow { icon: "·"; title: item.label; subtitle: item.value; state: item.state; } }
+                            if root.harness-preview-applyable : ReferenceToolbarButton { label: "Preview 적용"; active: true; enabled: !root.harness-action-busy; activated => { root.apply-harness-preview(); } }
+                            if root.harness-lifecycle-mode != "" : ReferenceInfoRow { label: "Lifecycle"; value: root.harness-lifecycle-mode + " · " + root.harness-lifecycle-status; warning: true; }
+                            if root.harness-lifecycle-applyable : ReferenceToolbarButton { label: root.harness-lifecycle-mode == "REMOVE" ? "제거 적용" : "변경 적용"; danger: root.harness-lifecycle-mode == "REMOVE"; active: root.harness-lifecycle-mode != "REMOVE"; enabled: !root.harness-action-busy; activated => { root.apply-harness-lifecycle(); } }
+                            Rectangle { vertical-stretch: 1; }
+                        }
+                    }
+                    Rectangle {
+                        horizontal-stretch: 1; min-width: 330px; max-width: 430px; border-radius: 7px; border-width: 1px; border-color: ForgeTheme.separator; background: ForgeTheme.panel;
+                        VerticalBox {
+                            padding: 12px; spacing: 9px;
+                            ReferenceSectionHeader { title: "현재 적용된 하네스"; detail: root.applied-harness-verification; }
+                            Rectangle { height: 68px; border-radius: 6px; background: ForgeTheme.panel-raised; border-width: 1px; border-color: ForgeTheme.separator; HorizontalBox { padding: 10px; spacing: 10px; Text { text: "◇"; color: ForgeTheme.accent; font-size: 28px; vertical-alignment: center; } VerticalBox { spacing: 2px; Text { text: root.selected-workspace-root == "" ? "Workspace 미선택" : root.selected-workspace-root; color: ForgeTheme.text; font-size: 12px; font-weight: 650; overflow: elide; } Text { text: root.applied-harness-name; color: ForgeTheme.text-secondary; font-size: 10px; overflow: elide; } } Rectangle { horizontal-stretch: 1; } Text { text: root.applied-harness-verification; color: root.applied-harness-verification == "READY" || root.applied-harness-verification == "SOURCE VERIFIED" ? ForgeTheme.success : ForgeTheme.warning; font-size: 11px; font-weight: 700; vertical-alignment: center; } } }
+                            ReferenceSectionHeader { title: "검증 결과"; detail: root.harness-verifier-rows.length + " checks"; }
+                            if root.harness-verifier-rows.length == 0 : EmptyState { title: "Verifier 결과 없음"; detail: root.harness-verifier-status; }
+                            if root.harness-verifier-rows.length > 0 : ListView {
+                                vertical-stretch: 1;
+                                for verifier[index] in root.harness-verifier-rows : Rectangle {
+                                    height: 38px; background: transparent;
+                                    HorizontalBox {
+                                        spacing: 7px;
+                                        Rectangle { width: 8px; height: 8px; border-radius: 4px; background: verifier.state == "READY" || verifier.state == "PASSED" || verifier.state == "SUCCESS" ? ForgeTheme.success : ForgeTheme.warning; }
+                                        Text { horizontal-stretch: 1; text: verifier.label; color: ForgeTheme.text-secondary; font-size: 10px; font-weight: 600; vertical-alignment: center; overflow: elide; }
+                                        Text { text: verifier.value; color: ForgeTheme.text-muted; font-size: 9px; vertical-alignment: center; overflow: elide; }
+                                        Text { text: verifier.state; color: verifier.state == "READY" || verifier.state == "PASSED" || verifier.state == "SUCCESS" ? ForgeTheme.success : ForgeTheme.warning; font-size: 9px; font-weight: 650; vertical-alignment: center; }
+                                    }
+                                    Rectangle { y: parent.height - 1px; width: 100%; height: 1px; background: ForgeTheme.separator; }
+                                }
+                            }
+                            HorizontalBox { spacing: 7px; ReferenceToolbarButton { label: "새로고침"; enabled: !root.harness-action-busy; activated => { root.refresh-harness-verifiers(); } } ReferenceToolbarButton { label: "하네스 새로고침"; enabled: !root.harness-action-busy; activated => { root.refresh-harnesses(); } } }
+                        }
+                    }
+                }
+            }
+        }
+
+        if root.workspace-view-open && root.active-page == 1 : goal-page := Rectangle {
+            width: 100%; height: 100%; background: transparent;
+            VerticalBox {
+                padding: root.page-padding; spacing: 10px;
+                HorizontalBox {
+                    height: 50px; spacing: 12px;
+                    VerticalBox {
+                        horizontal-stretch: 1; spacing: 2px;
+                        Text { text: "Goal"; color: ForgeTheme.text; font-size: 24px; font-weight: 700; }
+                        Text { text: "목표를 선택하고 DAG, 작업 근거, 허용된 상태 전이를 한 화면에서 검토합니다"; color: ForgeTheme.text-muted; font-size: 10px; overflow: elide; }
+                    }
+                    ReferenceStatusDot { label: root.selected-goal-id == "" ? "Goal 미선택" : root.selected-goal-state; dot-color: root.selected-goal-id == "" ? ForgeTheme.text-muted : root.selected-goal-state == "ACTIVE" ? ForgeTheme.accent : root.selected-goal-terminal ? ForgeTheme.success : ForgeTheme.info; }
+                }
+                HorizontalBox {
+                    vertical-stretch: 1; spacing: root.page-gap;
+                    goal-list-pane := Rectangle {
+                        horizontal-stretch: 3; min-width: 220px; border-width: 1px; border-color: ForgeTheme.separator; background: ForgeTheme.panel;
+                        VerticalBox {
+                            padding-left: 8px; padding-right: 8px; padding-top: 6px; padding-bottom: 6px; spacing: 3px;
+                            HorizontalBox {
+                                ReferenceSectionHeader { horizontal-stretch: 1; title: "Goal 목록"; detail: root.goal-rows.length + ""; }
+                                ReferenceToolbarButton { label: "+ 새 Goal"; active: true; enabled: root.selected-workspace-id != "" && !root.goal-action-busy; activated => { goal-create.visible = !goal-create.visible; } }
+                            }
+                            goal-create := Rectangle {
+                                visible: false; height: self.visible ? 120px : 0px; border-width: self.visible ? 1px : 0px; border-color: ForgeTheme.accent-border; background: ForgeTheme.accent-soft;
+                                if self.visible : VerticalBox { padding: 8px; spacing: 6px; LineEdit { text <=> root.goal-objective-input; placeholder-text: "달성할 결과"; enabled: !root.goal-action-busy; } LineEdit { text <=> root.goal-success-criterion-input; placeholder-text: "완료 기준"; enabled: !root.goal-action-busy; } HorizontalBox { Rectangle { horizontal-stretch: 1; } ReferenceToolbarButton { label: "생성"; active: true; enabled: !root.goal-action-busy && root.goal-objective-input != "" && root.goal-success-criterion-input != ""; activated => { root.create-goal(root.goal-objective-input, root.goal-success-criterion-input); goal-create.visible = false; } } } }
+                            }
+                            if root.goal-rows.length == 0 : EmptyState { title: "Goal이 없습니다"; detail: root.goal-status; }
+                            if root.goal-rows.length > 0 : ListView {
+                                vertical-stretch: 1;
+                                for goal[index] in root.goal-rows : ReferenceSelectableRow {
+                                    flat: true; icon: "◎"; title: goal.title; subtitle: goal.objective;
+                                    meta: "REV " + goal.revision + " · " + goal.check-summary;
+                                    state: goal.blocker == "" ? goal.state : goal.state + " · BLOCKED";
+                                    state-color: goal.state == "ACTIVE" ? ForgeTheme.accent : goal.terminal ? ForgeTheme.success : ForgeTheme.info;
+                                    selected: goal.id == root.selected-goal-id;
+                                    activated => { root.select-goal(index); }
+                                }
+                            }
+                            HorizontalBox { spacing: 7px; ReferenceToolbarButton { label: "새로고침"; enabled: root.selected-workspace-id != "" && !root.goal-action-busy; activated => { root.refresh-goals(); } } Rectangle { horizontal-stretch: 1; } }
+                        }
+                    }
+                    VerticalBox {
+                        horizontal-stretch: 7; min-width: 430px; spacing: root.page-gap;
+                        goal-focus := Rectangle {
+                            height: 100px; border-width: 1px; border-color: ForgeTheme.separator; background: ForgeTheme.panel;
+                            VerticalBox {
+                                padding-left: 12px; padding-right: 12px; padding-top: 10px; padding-bottom: 9px; spacing: 4px;
+                                HorizontalBox {
+                                    spacing: 10px;
+                                    Text { text: root.selected-goal-id == "" ? "Goal을 선택하세요" : root.selected-goal-objective; color: ForgeTheme.text; font-size: 18px; font-weight: 700; overflow: elide; horizontal-stretch: 1; }
+                                    ReferenceStatusDot { label: root.selected-goal-state; dot-color: root.selected-goal-state == "ACTIVE" ? ForgeTheme.accent : root.selected-goal-terminal ? ForgeTheme.success : ForgeTheme.info; }
+                                }
+                                Text { text: root.selected-goal-success-criterion; color: ForgeTheme.text-secondary; font-size: 10px; overflow: elide; }
+                                Text { text: root.selected-goal-check-summary; color: ForgeTheme.text-muted; font-size: 9px; overflow: elide; }
+                            }
+                        }
+                        goal-dag-pane := Rectangle {
+                            vertical-stretch: 1; min-height: 360px; border-width: 1px; border-color: ForgeTheme.separator; background: ForgeTheme.panel;
+                            VerticalBox {
+                                padding-left: 9px; padding-right: 9px; padding-top: 6px; padding-bottom: 8px; spacing: 2px;
+                                ReferenceSectionHeader { title: "DAG 계획"; detail: root.dag-node-rows.length == 0 ? "읽기 전용 · DAG 없음" : "읽기 전용 · Revision " + root.dag-revision; }
+                                if root.dag-node-rows.length == 0 : EmptyState { title: "게시된 DAG가 없습니다"; detail: root.dag-status; }
+                                if root.dag-node-rows.length > 0 : goal-graph := Flickable {
+                                    viewport-width: max(self.width, 24px + root.dag-column-count * root.dag-node-width + max(0, root.dag-column-count - 1) * root.dag-column-gap);
+                                    viewport-height: max(self.height, 24px + root.dag-lane-count * root.dag-node-height + max(0, root.dag-lane-count - 1) * root.dag-lane-gap);
+                                    Rectangle {
+                                        width: goal-graph.viewport-width; height: goal-graph.viewport-height; background: #091017;
+                                        for edge[index] in root.dag-edge-rows : DagEdgeConnector {
+                                            x: 12px + edge.from-column * (root.dag-node-width + root.dag-column-gap) + root.dag-node-width;
+                                            y: min(12px + edge.from-lane * (root.dag-node-height + root.dag-lane-gap) + root.dag-node-height / 2, 12px + edge.to-lane * (root.dag-node-height + root.dag-lane-gap) + root.dag-node-height / 2);
+                                            width: max(1px, 12px + edge.to-column * (root.dag-node-width + root.dag-column-gap) - self.x);
+                                            from-y: 12px + edge.from-lane * (root.dag-node-height + root.dag-lane-gap) + root.dag-node-height / 2;
+                                            to-y: 12px + edge.to-lane * (root.dag-node-height + root.dag-lane-gap) + root.dag-node-height / 2;
+                                            blocked: edge.blocked; current-path: edge.current-path; accessible-name: edge.upstream-label + " → " + edge.downstream-label;
+                                        }
+                                        for node[index] in root.dag-node-rows : DagNodeCard {
+                                            x: 12px + node.column * (root.dag-node-width + root.dag-column-gap);
+                                            y: 12px + node.lane * (root.dag-node-height + root.dag-lane-gap);
+                                            width: root.dag-node-width; height: root.dag-node-height;
+                                            node-id: node.id; label: node.label; state: node.state; state-label: node.state-label; objective: node.objective; acceptance: node.acceptance; depends-on: node.depends-on; waiting-on: node.waiting-on; evidence: node.evidence; revision: node.revision; current: node.current; terminal: node.terminal;
+                                            selected: node.id == root.selected-dag-id; activated => { root.select-dag-node(index); }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        goal-support-strip := HorizontalBox {
+                            height: 146px; spacing: root.page-gap;
+                            Rectangle {
+                                horizontal-stretch: 2; border-width: 1px; border-color: ForgeTheme.separator; background: ForgeTheme.panel;
+                                VerticalBox {
+                                    padding: 9px; spacing: 3px;
+                                    ReferenceSectionHeader { title: "현재 작업"; detail: root.selected-dag-id == "" ? "미선택" : root.selected-dag-id; }
+                                    Text { text: root.selected-dag-id == "" ? "DAG 노드를 선택하세요" : root.selected-dag-work-summary; color: ForgeTheme.text; font-size: 10px; font-weight: 650; wrap: word-wrap; }
+                                    Text { text: root.selected-dag-agent-name == "" ? "담당 Agent —" : "담당 · " + root.selected-dag-agent-name; color: ForgeTheme.accent-text; font-size: 9px; overflow: elide; }
+                                    Text { text: root.selected-dag-public-summary; color: ForgeTheme.text-muted; font-size: 9px; wrap: word-wrap; }
+                                    Rectangle { vertical-stretch: 1; }
+                                    Text { text: root.selected-dag-last-observed == "" ? "관측 기록 없음" : root.selected-dag-last-observed; color: ForgeTheme.text-muted; font-family: "monospace"; font-size: 9px; overflow: elide; }
+                                }
+                            }
+                            Rectangle {
+                                horizontal-stretch: 1; border-width: 1px; border-color: ForgeTheme.separator; background: ForgeTheme.panel;
+                                VerticalBox {
+                                    padding: 9px; spacing: 3px;
+                                    ReferenceSectionHeader { title: "참여 에이전트"; detail: root.agent-rows.length + ""; }
+                                    if root.agent-rows.length == 0 : Text { text: "현재 연결된 Agent가 없습니다."; color: ForgeTheme.text-muted; font-size: 9px; wrap: word-wrap; }
+                                    if root.agent-rows.length > 0 : ListView {
+                                        for agent[index] in root.agent-rows : Rectangle {
+                                            height: 32px; background: transparent;
+                                            HorizontalBox { spacing: 6px; Rectangle { width: 7px; height: 7px; border-radius: 4px; background: agent.id == root.selected-agent-id ? ForgeTheme.accent : ForgeTheme.success; } VerticalBox { horizontal-stretch: 1; spacing: 1px; Text { text: agent.display-name; color: ForgeTheme.text-secondary; font-size: 9px; font-weight: 600; overflow: elide; } Text { text: agent.current-node == "" ? agent.role : agent.current-node; color: ForgeTheme.text-muted; font-size: 8px; overflow: elide; } } }
+                                            TouchArea { clicked => { root.active-page = 2; root.select-agent(index); } }
+                                        }
+                                    }
+                                }
+                            }
+                            Rectangle {
+                                horizontal-stretch: 1; border-width: 1px; border-color: ForgeTheme.separator; background: ForgeTheme.panel;
+                                VerticalBox {
+                                    padding: 9px; spacing: 3px;
+                                    ReferenceSectionHeader { title: "Goal 근거"; detail: root.diff-rows.length + " diff"; }
+                                    Text { text: root.selected-goal-evidence-summary == "" ? "기록된 Goal Evidence가 없습니다." : root.selected-goal-evidence-summary; color: ForgeTheme.text-secondary; font-size: 9px; wrap: word-wrap; }
+                                    Rectangle { vertical-stretch: 1; }
+                                    Text { text: root.selected-goal-blocker == "" ? "차단 요소 없음" : "차단 · " + root.selected-goal-blocker; color: root.selected-goal-blocker == "" ? ForgeTheme.success : ForgeTheme.warning; font-size: 9px; wrap: word-wrap; }
+                                }
+                            }
+                        }
+                    }
+                    goal-inspector-pane := Rectangle {
+                        horizontal-stretch: 4; min-width: 250px; border-width: 1px; border-color: ForgeTheme.separator; background: ForgeTheme.panel;
+                        VerticalBox {
+                            padding-left: 10px; padding-right: 10px; padding-top: 6px; padding-bottom: 8px; spacing: 3px;
+                            ReferenceSectionHeader { title: "Goal 상세"; detail: root.selected-goal-state; }
+                            ReferenceInfoRow { label-width: 86px; label: "Revision"; value: root.selected-goal-revision; }
+                            ReferenceInfoRow { label-width: 86px; label: "현재 상태"; value: root.selected-goal-state; }
+                            ReferenceInfoRow { label-width: 86px; label: "설명"; value: root.selected-goal-objective; }
+                            ReferenceInfoRow { label-width: 86px; label: "성공 기준"; value: root.selected-goal-success-criterion; }
+                            ReferenceInfoRow { label-width: 86px; label: "검증"; value: root.selected-goal-check-summary; }
+                            ReferenceInfoRow { label-width: 86px; label: "근거"; value: root.selected-goal-evidence-summary; }
+                            ReferenceInfoRow { label-width: 86px; label: "차단"; value: root.selected-goal-blocker == "" ? "없음" : root.selected-goal-blocker; warning: root.selected-goal-blocker != ""; }
+                            ReferenceInfoRow { label-width: 86px; label: "Timeline"; value: "현재 projection에는 상태 전이 이력이 없습니다."; }
+                            Rectangle { height: 1px; background: ForgeTheme.separator; }
+                            ReferenceSectionHeader { title: "작업"; detail: root.selected-goal-terminal ? "종료됨" : "허용된 전이만 표시"; }
+                            HorizontalBox { spacing: 6px; if root.selected-goal-can-pause : ReferenceToolbarButton { label: "일시정지"; enabled: !root.goal-action-busy; activated => { root.pause-goal(); } } if root.selected-goal-can-resume : ReferenceToolbarButton { label: "재개"; active: true; enabled: !root.goal-action-busy; activated => { root.resume-goal(); } } }
+                            if root.selected-goal-can-complete : ReferenceToolbarButton { label: "완료"; active: true; enabled: !root.goal-action-busy; activated => { root.complete-goal(); } }
+                            if root.selected-goal-can-cancel : ReferenceToolbarButton { label: "종료"; danger: true; enabled: !root.goal-action-busy; activated => { root.cancel-goal(); } }
+                            Rectangle { vertical-stretch: 1; }
+                        }
+                    }
+                }
+            }
+        }
+
+        if root.workspace-view-open && root.active-page == 4 : settings-page := Rectangle {
+            width: 100%; height: 100%; background: transparent;
+            VerticalBox {
+                padding: root.page-padding; spacing: 12px;
+                Text { text: "설정"; color: ForgeTheme.text; font-size: 25px; font-weight: 700; }
+                HorizontalBox {
+                    vertical-stretch: 1; spacing: 12px;
+                    Rectangle {
+                        horizontal-stretch: 2; border-radius: 7px; border-width: 1px; border-color: ForgeTheme.separator; background: ForgeTheme.panel;
+                        VerticalBox {
+                            padding: 14px; spacing: 9px;
+                            ReferenceSectionHeader { title: "MCP 연결"; detail: root.mcp-server-status; }
+                            Text { text: "Custom domain이 있으면 우선 사용하고, 비워두면 Cloudflare Quick Tunnel을 사용합니다."; color: ForgeTheme.text-secondary; font-size: 10px; wrap: word-wrap; }
+                            HorizontalBox { spacing: 7px; LineEdit { horizontal-stretch: 2; text <=> root.mcp-public-origin-input; placeholder-text: "선택 · 비워두면 Quick Tunnel"; enabled: !root.mcp-action-busy && !root.mcp-server-running; } LineEdit { width: 94px; text <=> root.mcp-local-port-input; placeholder-text: "7979"; input-type: number; enabled: !root.mcp-action-busy && !root.mcp-server-running; } ReferenceToolbarButton { label: "저장"; active: true; enabled: !root.mcp-action-busy && !root.mcp-server-running && root.mcp-local-port-input != ""; activated => { root.save-mcp-connection(root.mcp-public-origin-input, root.mcp-local-port-input); } } ReferenceToolbarButton { label: "새로고침"; enabled: !root.mcp-action-busy; activated => { root.refresh-mcp-connection(); } } }
+                            ReferenceInfoRow { label: "외부 Endpoint"; value: root.mcp-public-endpoint; }
+                            ReferenceInfoRow { label: "로컬 Listener"; value: root.mcp-local-endpoint; }
+                            ReferenceInfoRow { label: "Public Route"; value: root.mcp-public-route-status; }
+                            ReferenceInfoRow { label: "Bridge"; value: root.mcp-server-detail; }
+                            HorizontalBox { spacing: 7px; ReferenceToolbarButton { label: root.mcp-server-running ? "브리지 중지" : "브리지 시작"; active: root.mcp-server-running; enabled: !root.mcp-action-busy; activated => { if root.mcp-server-running { root.stop-mcp-server(); } else { root.start-mcp-server(); } } } }
+                            Rectangle { height: 1px; background: ForgeTheme.separator; }
+                            ReferenceSectionHeader { title: "Workspace 접근 토큰"; detail: root.mcp-active-token-count + " active"; }
+                            HorizontalBox { spacing: 7px; LineEdit { horizontal-stretch: 1; text <=> root.mcp-credential-label-input; placeholder-text: "접근 토큰 이름"; enabled: root.selected-workspace-id != "" && !root.mcp-action-busy; } ReferenceToolbarButton { label: "토큰 발급"; enabled: root.selected-workspace-id != "" && !root.mcp-action-busy && root.mcp-credential-label-input != ""; activated => { root.issue-mcp-token(root.mcp-credential-label-input); } } }
+                            if root.mcp-token-reveal != "" : Rectangle {
+                                height: 92px; border-radius: 6px; border-width: 1px; border-color: ForgeTheme.warning; background: #211b12;
+                                VerticalBox { padding: 8px; spacing: 4px; Text { text: "새 접근 토큰 · 지금 한 번만 표시"; color: ForgeTheme.warning; font-size: 10px; font-weight: 700; } Text { text: root.mcp-token-reveal; color: ForgeTheme.text; font-family: "monospace"; font-size: 10px; overflow: elide; } Text { text: root.mcp-token-reveal-status; color: ForgeTheme.text-muted; font-size: 9px; overflow: elide; } ReferenceToolbarButton { label: "표시 닫기"; enabled: true; activated => { root.dismiss-mcp-token-reveal(); } } }
+                            }
+                            if root.mcp-token-rows.length == 0 : EmptyState { title: "접근 토큰 없음"; detail: root.mcp-connection-status; }
+                            if root.mcp-token-rows.length > 0 : ListView { vertical-stretch: 1; for token[index] in root.mcp-token-rows : ReferenceSelectableRow { icon: "⌁"; title: token.label; subtitle: token.detail; state: token.state; state-color: token.state == "ACTIVE" ? ForgeTheme.success : ForgeTheme.text-muted; selected: index == root.selected-mcp-token-index; activated => { root.selected-mcp-token-index = index; root.mcp-token-review-mode = ""; } } }
+                            if root.selected-mcp-token-index >= 0 && root.selected-mcp-token-index < root.mcp-token-rows.length && root.mcp-token-review-mode == "" : HorizontalBox {
+                                spacing: 7px;
+                                ReferenceToolbarButton { label: "토큰 교체"; enabled: !root.mcp-action-busy && !root.mcp-server-running; activated => { root.mcp-token-review-mode = "ROTATE"; } }
+                                ReferenceToolbarButton { label: "토큰 폐기"; danger: true; enabled: !root.mcp-action-busy; activated => { root.mcp-token-review-mode = "REVOKE"; } }
+                            }
+                            if root.mcp-token-review-mode != "" : Rectangle {
+                                height: 86px; border-radius: 6px; border-width: 1px; border-color: root.mcp-token-review-mode == "REVOKE" ? ForgeTheme.danger-border : ForgeTheme.warning; background: root.mcp-token-review-mode == "REVOKE" ? ForgeTheme.danger-soft : #211b12;
+                                VerticalBox { padding: 8px; spacing: 5px; Text { text: root.mcp-token-review-mode == "ROTATE" ? "선택한 접근 토큰을 교체할까요?" : "선택한 접근 토큰을 폐기할까요?"; color: root.mcp-token-review-mode == "REVOKE" ? ForgeTheme.danger : ForgeTheme.warning; font-size: 10px; font-weight: 700; } HorizontalBox { spacing: 6px; ReferenceToolbarButton { label: "취소"; enabled: !root.mcp-action-busy; activated => { root.mcp-token-review-mode = ""; } } ReferenceToolbarButton { label: root.mcp-token-review-mode == "ROTATE" ? "교체 확인" : "폐기 확인"; danger: root.mcp-token-review-mode == "REVOKE"; active: root.mcp-token-review-mode == "ROTATE"; enabled: !root.mcp-action-busy; activated => { if root.mcp-token-review-mode == "ROTATE" { root.rotate-mcp-token(root.selected-mcp-token-index); } else { root.revoke-mcp-token(root.selected-mcp-token-index); } root.mcp-token-review-mode = ""; } } } }
+                            }
+                        }
+                    }
+                    Rectangle {
+                        horizontal-stretch: 1; border-radius: 7px; border-width: 1px; border-color: ForgeTheme.separator; background: ForgeTheme.panel;
+                        VerticalBox {
+                            padding: 14px; spacing: 9px;
+                            ReferenceSectionHeader { title: "런타임 / 안전"; detail: root.runtime-status; }
+                            ReferenceInfoRow { label: "Runtime"; value: root.runtime-status; }
+                            ReferenceInfoRow { label: "Generation"; value: root.runtime-generation + ""; }
+                            ReferenceInfoRow { label: "Uptime"; value: root.uptime-seconds + "s"; }
+                            ReferenceInfoRow { label: "승인 대기"; value: root.approval-rows.length + ""; warning: root.approval-rows.length > 0; }
+                            HorizontalBox { spacing: 6px; ReferenceToolbarButton { label: root.runtime-status == "Stopped" ? "시작" : "중지"; enabled: true; activated => { if root.runtime-status == "Stopped" { root.start-runtime(); } else { root.stop-runtime(); } } } ReferenceToolbarButton { label: "재시작"; enabled: root.runtime-status == "Running"; activated => { root.restart-runtime(); } } }
+                            ReferenceToolbarButton { label: root.auto-approval-enabled ? "Auto Approval 끄기" : "Auto Approval 켜기"; active: root.auto-approval-enabled; enabled: !root.approval-action-busy; activated => { root.set-auto-approval(!root.auto-approval-enabled); } }
+                            ReferenceSectionHeader { title: "승인 대기"; detail: root.approval-rows.length + ""; }
+                            if root.approval-rows.length == 0 : Text { text: root.approval-status == "" ? "대기 중인 승인 요청이 없습니다." : root.approval-status; color: ForgeTheme.text-muted; font-size: 10px; wrap: word-wrap; }
+                            if root.approval-rows.length > 0 : ListView { max-height: 190px; for approval[index] in root.approval-rows : ReferenceSelectableRow { icon: "!"; title: approval.action; subtitle: approval.scope; meta: "expires " + approval.expires-at; state: "PENDING"; state-color: ForgeTheme.warning; selected: index == root.selected-approval-index; activated => { root.selected-approval-index = index; } } }
+                            if root.selected-approval-index >= 0 && root.selected-approval-index < root.approval-rows.length : HorizontalBox { spacing: 7px; ReferenceToolbarButton { label: "승인"; active: true; enabled: !root.approval-action-busy; activated => { root.approve-request(root.approval-rows[root.selected-approval-index].id); root.selected-approval-index = -1; } } ReferenceToolbarButton { label: "거부"; danger: true; enabled: !root.approval-action-busy; activated => { root.reject-request(root.approval-rows[root.selected-approval-index].id); root.selected-approval-index = -1; } } ReferenceToolbarButton { label: "새로고침"; enabled: !root.approval-action-busy; activated => { root.refresh-approvals(); } } }
+                            ReferenceToolbarButton { label: "Workspace 작업 중지"; danger: true; enabled: root.selected-workspace-id != ""; activated => { root.stop-workspace-work(); } }
+                            ReferenceToolbarButton { label: "긴급 중지"; danger: true; enabled: root.runtime-status != "Stopped"; activated => { root.emergency-stop(); } }
+                            Rectangle { height: 1px; background: ForgeTheme.separator; }
+                            ReferenceSectionHeader { title: "Workspace Doctor"; detail: root.doctor-status; }
+                            Text { text: root.doctor-summary; color: ForgeTheme.text-secondary; font-size: 10px; wrap: word-wrap; }
+                            HorizontalBox { spacing: 7px; ReferenceToolbarButton { label: "Doctor 새로고침"; enabled: root.selected-workspace-id != "" && !root.doctor-action-busy; activated => { root.refresh-doctor(); } } ReferenceToolbarButton { label: "진단 내보내기"; enabled: root.doctor-export-content != ""; activated => { root.export-doctor-diagnostics(); } } }
+                            if root.doctor-finding-rows.length > 0 : ListView { max-height: 180px; for finding[index] in root.doctor-finding-rows : ReferenceSelectableRow { icon: "!"; title: finding.area; subtitle: finding.detail; state: finding.status; state-color: finding.status == "PASS" || finding.status == "READY" ? ForgeTheme.success : ForgeTheme.warning; } }
+                            Text { text: "COPYABLE DIAGNOSTICS · bounded read-only projection"; color: ForgeTheme.text-muted; font-size: 9px; font-weight: 650; }
+                            if root.doctor-export-content != "" : TextEdit { text: root.doctor-export-content; read-only: true; height: 120px; font-family: "monospace"; font-size: 9px; }
+                            if root.doctor-export-content == "" : Text { text: "진단 본문은 Workspace 범위에서 명시적으로 생성된 경우에만 표시됩니다."; color: ForgeTheme.text-muted; font-size: 9px; wrap: word-wrap; }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

@@ -44,6 +44,8 @@ use rusqlite::{
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::workspace_agent_dag::{self, AgentDagReplanCommitResult, AgentDagStoreError};
+use crate::workspace_agents::{self, AgentStoreError};
 use crate::workspace_approvals::{self, ApprovalStoreError};
 use crate::workspace_changesets::{self, ChangeSetStoreError};
 use crate::workspace_checkpoints::{self, CheckpointDoctorReport, CheckpointStoreError};
@@ -60,8 +62,10 @@ use crate::workspace_recovery::{self, RecoveryStoreError};
 /// This is deliberately different from the Global Registry marker.
 pub const WORKSPACE_APPLICATION_ID: i64 = 0x4846_5753;
 
-const CURRENT_SCHEMA_VERSION: i64 = 14;
+const CURRENT_SCHEMA_VERSION: i64 = 16;
 const HARNESS_VERIFIER_PREVIOUS_SCHEMA_VERSION: i64 = 13;
+const AGENT_PREVIOUS_SCHEMA_VERSION: i64 = 14;
+const AGENT_DAG_PREVIOUS_SCHEMA_VERSION: i64 = 15;
 const HARNESS_PREVIOUS_SCHEMA_VERSION: i64 = 12;
 const RESTORE_PROVENANCE_PREVIOUS_SCHEMA_VERSION: i64 = 11;
 const RECOVERY_PREVIOUS_SCHEMA_VERSION: i64 = 10;
@@ -1374,6 +1378,33 @@ impl WorkspaceStore {
         Ok(persisted)
     }
 
+    /// Remove the exact applied Harness snapshot through revision CAS.
+    pub fn delete_applied_harness(
+        &mut self,
+        expected_revision: HarnessRevision,
+    ) -> Result<(), WorkspaceStoreError> {
+        self.ensure_live_binding()?;
+        let workspace = self.workspace()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        workspace_harness::delete(&transaction, workspace.id(), expected_revision)?;
+        ensure_live_paths(WorkspaceLiveBinding {
+            state_root: &self.state_root,
+            state_root_identity: self.state_root_identity,
+            workspace_root: &self.workspace_root,
+            root_fingerprint: self.root_fingerprint,
+            database_path: &self.path,
+            database_identity: self.database_identity,
+            wal_identity: self.wal_identity,
+            shm_identity: self.shm_identity,
+        })?;
+        transaction.commit()?;
+        self.capture_sidecar_identities()?;
+        self.ensure_live_binding()?;
+        Ok(())
+    }
+
     /// Read one exact durable Harness verifier run snapshot.
     pub fn get_harness_verifier_run(
         &self,
@@ -1646,6 +1677,195 @@ impl WorkspaceStore {
         }
         self.ensure_live_binding()?;
         Ok(activities)
+    }
+
+    /// Persist one newly attached Agent instance.  The application boundary
+    /// supplies the identity; retries with the exact same immutable snapshot
+    /// are idempotent and conflicting identities fail closed.
+    pub fn attach_agent(
+        &mut self,
+        agent: &forge_domain::RegisteredAgentInstance,
+    ) -> Result<forge_domain::RegisteredAgentInstance, WorkspaceStoreError> {
+        self.ensure_live_binding()?;
+        let result = workspace_agents::attach(&mut self.connection, agent)?;
+        self.capture_sidecar_identities()?;
+        self.ensure_live_binding()?;
+        Ok(result)
+    }
+
+    /// Read one Agent instance by identity.
+    pub fn get_agent(
+        &self,
+        agent_id: forge_domain::AgentInstanceId,
+    ) -> Result<Option<forge_domain::RegisteredAgentInstance>, WorkspaceStoreError> {
+        self.ensure_live_binding()?;
+        let result = workspace_agents::get(&self.connection, agent_id)?;
+        self.ensure_live_binding()?;
+        Ok(result)
+    }
+
+    /// Change an Agent's exact Goal/DAG/node focus through revision CAS.
+    /// Persistence validates that the referenced Goal and current DAG/node
+    /// still match; it never remaps a focus after a replan.
+    pub fn set_agent_focus(
+        &mut self,
+        command: &forge_domain::SetAgentFocus,
+    ) -> Result<forge_domain::RegisteredAgentInstance, WorkspaceStoreError> {
+        self.ensure_live_binding()?;
+        let result = workspace_agents::set_focus(&mut self.connection, command)?;
+        self.capture_sidecar_identities()?;
+        self.ensure_live_binding()?;
+        Ok(result)
+    }
+
+    /// Append one bounded public Agent work update.
+    pub fn publish_agent_work_update(
+        &mut self,
+        update: &forge_domain::AgentWorkUpdate,
+    ) -> Result<forge_domain::AgentWorkUpdate, WorkspaceStoreError> {
+        self.ensure_live_binding()?;
+        let result = workspace_agents::publish_work_update(&mut self.connection, update)?;
+        self.capture_sidecar_identities()?;
+        self.ensure_live_binding()?;
+        Ok(result)
+    }
+
+    /// Detach an Agent instance through revision CAS and append a terminal
+    /// focus event.  Activity lease state is left to the Activity authority.
+    pub fn detach_agent(
+        &mut self,
+        command: &forge_domain::DetachAgent,
+    ) -> Result<forge_domain::RegisteredAgentInstance, WorkspaceStoreError> {
+        self.ensure_live_binding()?;
+        let result = workspace_agents::detach(&mut self.connection, command)?;
+        self.capture_sidecar_identities()?;
+        self.ensure_live_binding()?;
+        Ok(result)
+    }
+
+    /// List Agent attachment projections for one exact Workspace/Activity.
+    /// Activity lease/liveness is projected from the same `SQLite` snapshot and
+    /// is never duplicated into an Agent heartbeat table.
+    pub fn list_agent_attachments(
+        &self,
+        activity_id: Option<forge_domain::ActivityId>,
+        now: TimestampMillis,
+        limit: forge_domain::AgentListLimit,
+    ) -> Result<Vec<forge_domain::AgentAttachmentProjection>, WorkspaceStoreError> {
+        self.ensure_live_binding()?;
+        let workspace = self.workspace()?;
+        let result = workspace_agents::list_attachments(
+            &self.connection,
+            workspace.id(),
+            activity_id,
+            now,
+            limit.get(),
+        )?;
+        self.ensure_live_binding()?;
+        Ok(result)
+    }
+
+    /// Read one bounded Agent context from one `SQLite` snapshot.
+    pub fn get_agent_context(
+        &self,
+        agent_id: forge_domain::AgentInstanceId,
+        activity_id: forge_domain::ActivityId,
+        now: TimestampMillis,
+        event_limit: forge_domain::AgentListLimit,
+        update_limit: forge_domain::AgentListLimit,
+    ) -> Result<Option<forge_domain::AgentContextProjection>, WorkspaceStoreError> {
+        self.ensure_live_binding()?;
+        let workspace = self.workspace()?;
+        let result = workspace_agents::get_context(
+            &self.connection,
+            workspace.id(),
+            activity_id,
+            agent_id,
+            now,
+            event_limit.get(),
+            update_limit.get(),
+        )?;
+        self.ensure_live_binding()?;
+        Ok(result)
+    }
+
+    /// Read one exact Agent DAG authoring grant by identity.
+    pub fn get_agent_dag_authoring_grant(
+        &self,
+        grant_id: forge_domain::AgentDagAuthoringGrantId,
+    ) -> Result<Option<forge_domain::AgentDagAuthoringGrant>, WorkspaceStoreError> {
+        self.ensure_live_binding()?;
+        let grant = workspace_agent_dag::get_grant(&self.connection, grant_id)?;
+        self.ensure_live_binding()?;
+        Ok(grant)
+    }
+
+    /// Discover the currently usable operator-issued grant for an exact
+    /// Agent/credential/Goal/head tuple.  The read includes the caller's
+    /// observation time so expired active rows are not advertised.
+    pub fn find_active_agent_dag_authoring_grant(
+        &self,
+        actor: forge_domain::AgentDagAuthoringActor,
+        goal: forge_domain::GoalAttribution,
+        expected_dag_revision: forge_domain::DagRevisionNumber,
+        expected_head_revision: forge_domain::DagHeadRevision,
+        now: TimestampMillis,
+    ) -> Result<Option<forge_domain::AgentDagAuthoringGrant>, WorkspaceStoreError> {
+        self.ensure_live_binding()?;
+        let grant = workspace_agent_dag::find_active_grant(
+            &self.connection,
+            actor,
+            goal,
+            expected_dag_revision,
+            expected_head_revision,
+            now,
+        )?;
+        self.ensure_live_binding()?;
+        Ok(grant)
+    }
+
+    /// Persist one exact Agent DAG authoring grant issuance.
+    pub fn issue_agent_dag_authoring_grant(
+        &mut self,
+        grant: &forge_domain::AgentDagAuthoringGrant,
+    ) -> Result<forge_domain::AgentDagAuthoringGrant, WorkspaceStoreError> {
+        self.ensure_live_binding()?;
+        let result = workspace_agent_dag::issue_grant(&mut self.connection, grant)?;
+        self.capture_sidecar_identities()?;
+        self.ensure_live_binding()?;
+        Ok(result)
+    }
+
+    /// Revoke one active Agent DAG authoring grant through exact revision CAS.
+    pub fn revoke_agent_dag_authoring_grant(
+        &mut self,
+        grant_id: forge_domain::AgentDagAuthoringGrantId,
+        expected_revision: forge_domain::AgentDagAuthoringGrantRevision,
+    ) -> Result<forge_domain::AgentDagAuthoringGrant, WorkspaceStoreError> {
+        self.ensure_live_binding()?;
+        let workspace = self.workspace()?;
+        let result = workspace_agent_dag::revoke_grant(
+            &mut self.connection,
+            grant_id,
+            expected_revision,
+            workspace.id(),
+        )?;
+        self.capture_sidecar_identities()?;
+        self.ensure_live_binding()?;
+        Ok(result)
+    }
+
+    /// Atomically commit one one-shot Agent DAG replan, consuming its grant
+    /// and recording the replay ledger and factual Agent update.
+    pub fn commit_agent_dag_replan(
+        &mut self,
+        request: &forge_domain::AgentDagReplanRequest,
+    ) -> Result<AgentDagReplanCommitResult, WorkspaceStoreError> {
+        self.ensure_live_binding()?;
+        let result = workspace_agent_dag::commit_replan(&mut self.connection, request)?;
+        self.capture_sidecar_identities()?;
+        self.ensure_live_binding()?;
+        Ok(result)
     }
 
     /// Persist one Activity-attributed file mutation intent before its live
@@ -3697,6 +3917,8 @@ enum DatabaseOwnership {
     OwnedV12,
     OwnedV13,
     OwnedV14,
+    OwnedV15,
+    OwnedV16,
 }
 
 const fn migration_required_version(ownership: DatabaseOwnership) -> Option<i64> {
@@ -3714,7 +3936,9 @@ const fn migration_required_version(ownership: DatabaseOwnership) -> Option<i64>
         DatabaseOwnership::OwnedV11 => Some(RESTORE_PROVENANCE_PREVIOUS_SCHEMA_VERSION),
         DatabaseOwnership::OwnedV12 => Some(HARNESS_PREVIOUS_SCHEMA_VERSION),
         DatabaseOwnership::OwnedV13 => Some(HARNESS_VERIFIER_PREVIOUS_SCHEMA_VERSION),
-        DatabaseOwnership::Fresh | DatabaseOwnership::OwnedV14 => None,
+        DatabaseOwnership::OwnedV14 => Some(AGENT_PREVIOUS_SCHEMA_VERSION),
+        DatabaseOwnership::OwnedV15 => Some(AGENT_DAG_PREVIOUS_SCHEMA_VERSION),
+        DatabaseOwnership::Fresh | DatabaseOwnership::OwnedV16 => None,
     }
 }
 
@@ -3759,7 +3983,38 @@ fn migrate_v12_to_current(connection: &mut Connection) -> Result<(), WorkspaceSt
 }
 
 fn migrate_v13_to_current(connection: &mut Connection) -> Result<(), WorkspaceStoreError> {
-    workspace_harness_verifiers::migrate_v13_to_v14(connection, CURRENT_SCHEMA_VERSION)
+    workspace_harness_verifiers::migrate_v13_to_v14(
+        connection,
+        HARNESS_VERIFIER_PREVIOUS_SCHEMA_VERSION,
+    )
+    .map_err(WorkspaceStoreError::from)?;
+    migrate_v14_to_current(connection)
+}
+
+fn migrate_v14_to_current(connection: &mut Connection) -> Result<(), WorkspaceStoreError> {
+    workspace_agents::migrate_v14_to_v15(connection, AGENT_DAG_PREVIOUS_SCHEMA_VERSION)
+        .map_err(WorkspaceStoreError::from)?;
+    workspace_agents::validate_schema_v15(connection).map_err(WorkspaceStoreError::from)?;
+    migrate_v15_to_current(connection)
+}
+
+fn migrate_v15_to_current(connection: &mut Connection) -> Result<(), WorkspaceStoreError> {
+    // v15 attachment/principal authority is retained before the v16 grant
+    // tables are created.  Older v14 databases have no principal table yet;
+    // this idempotent v15 transition materializes that exact authority.
+    let has_principal: bool = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM sqlite_schema
+            WHERE type = 'table' AND name = 'agent_transport_principals'
+        )",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_principal {
+        workspace_agents::migrate_v15_to_v16(connection, AGENT_DAG_PREVIOUS_SCHEMA_VERSION)
+            .map_err(WorkspaceStoreError::from)?;
+    }
+    workspace_agent_dag::migrate_v15_to_v16(connection, CURRENT_SCHEMA_VERSION)
         .map_err(WorkspaceStoreError::from)
 }
 
@@ -3881,6 +4136,14 @@ fn prepare_database(
         }
         DatabaseOwnership::OwnedV14 => {
             configure_connection(connection, busy_timeout)?;
+            migrate_v14_to_current(connection)?;
+        }
+        DatabaseOwnership::OwnedV15 => {
+            configure_connection(connection, busy_timeout)?;
+            migrate_v15_to_current(connection)?;
+        }
+        DatabaseOwnership::OwnedV16 => {
+            configure_connection(connection, busy_timeout)?;
         }
     }
     validate_schema_shape(connection)
@@ -3927,7 +4190,9 @@ fn inspect_database(connection: &Connection) -> Result<DatabaseOwnership, Worksp
         RESTORE_PROVENANCE_PREVIOUS_SCHEMA_VERSION => Ok(DatabaseOwnership::OwnedV11),
         HARNESS_PREVIOUS_SCHEMA_VERSION => Ok(DatabaseOwnership::OwnedV12),
         HARNESS_VERIFIER_PREVIOUS_SCHEMA_VERSION => Ok(DatabaseOwnership::OwnedV13),
-        CURRENT_SCHEMA_VERSION => Ok(DatabaseOwnership::OwnedV14),
+        AGENT_PREVIOUS_SCHEMA_VERSION => Ok(DatabaseOwnership::OwnedV14),
+        AGENT_DAG_PREVIOUS_SCHEMA_VERSION => Ok(DatabaseOwnership::OwnedV15),
+        CURRENT_SCHEMA_VERSION => Ok(DatabaseOwnership::OwnedV16),
         actual => Err(WorkspaceStoreError::DamagedSchema {
             detail: format!("owned database has unsupported schema version {actual}"),
         }),
@@ -3949,7 +4214,9 @@ fn validate_owned_database(connection: &Connection) -> Result<(), WorkspaceStore
         DatabaseOwnership::OwnedV11 => validate_schema_shape_v11(connection),
         DatabaseOwnership::OwnedV12 => validate_schema_shape_v12(connection),
         DatabaseOwnership::OwnedV13 => validate_schema_shape_v13(connection),
-        DatabaseOwnership::OwnedV14 => validate_schema_shape(connection),
+        DatabaseOwnership::OwnedV14 => validate_schema_shape_v14(connection),
+        DatabaseOwnership::OwnedV15 => validate_schema_shape_v15(connection),
+        DatabaseOwnership::OwnedV16 => validate_schema_shape(connection),
         DatabaseOwnership::Fresh => Err(WorkspaceStoreError::DamagedSchema {
             detail: "Workspace schema is not initialized".to_owned(),
         }),
@@ -4126,6 +4393,29 @@ fn validate_schema_shape(connection: &Connection) -> Result<(), WorkspaceStoreEr
     workspace_recovery::validate_schema(connection)?;
     workspace_harness::validate_schema(connection)?;
     workspace_harness_verifiers::validate_schema(connection)?;
+    workspace_agents::validate_schema(connection)?;
+    workspace_agent_dag::validate_schema(connection)?;
+    Ok(())
+}
+
+fn validate_schema_shape_v15(connection: &Connection) -> Result<(), WorkspaceStoreError> {
+    validate_schema_objects_v15(connection)?;
+    validate_workspace_table_shape(connection)?;
+    validate_activity_table_shape(connection)?;
+    validate_activity_index_shape(connection)?;
+    validate_activity_lease_index_shape(connection)?;
+    validate_activity_foreign_key_shape(connection)?;
+    workspace_changesets::validate_schema(connection)?;
+    workspace_diffs::validate_schema(connection)?;
+    workspace_executions::validate_schema(connection)?;
+    workspace_approvals::validate_schema(connection)?;
+    workspace_checkpoints::validate_schema(connection)?;
+    workspace_goals::validate_schema(connection)?;
+    workspace_dags::validate_schema(connection)?;
+    workspace_recovery::validate_schema(connection)?;
+    workspace_harness::validate_schema(connection)?;
+    workspace_harness_verifiers::validate_schema(connection)?;
+    workspace_agents::validate_schema(connection)?;
     Ok(())
 }
 
@@ -4145,6 +4435,26 @@ fn validate_schema_shape_v13(connection: &Connection) -> Result<(), WorkspaceSto
     workspace_dags::validate_schema(connection)?;
     workspace_recovery::validate_schema(connection)?;
     workspace_harness::validate_schema(connection)?;
+    Ok(())
+}
+
+fn validate_schema_shape_v14(connection: &Connection) -> Result<(), WorkspaceStoreError> {
+    validate_schema_objects_v14(connection)?;
+    validate_workspace_table_shape(connection)?;
+    validate_activity_table_shape(connection)?;
+    validate_activity_index_shape(connection)?;
+    validate_activity_lease_index_shape(connection)?;
+    validate_activity_foreign_key_shape(connection)?;
+    workspace_changesets::validate_schema(connection)?;
+    workspace_diffs::validate_schema(connection)?;
+    workspace_executions::validate_schema(connection)?;
+    workspace_approvals::validate_schema(connection)?;
+    workspace_checkpoints::validate_schema(connection)?;
+    workspace_goals::validate_schema(connection)?;
+    workspace_dags::validate_schema(connection)?;
+    workspace_recovery::validate_schema(connection)?;
+    workspace_harness::validate_schema(connection)?;
+    workspace_harness_verifiers::validate_schema(connection)?;
     Ok(())
 }
 
@@ -4684,6 +4994,33 @@ fn validate_schema_objects(connection: &Connection) -> Result<(), WorkspaceStore
     expected.extend(workspace_recovery::schema_objects());
     expected.extend(workspace_harness::schema_objects());
     expected.extend(workspace_harness_verifiers::schema_objects());
+    expected.extend(workspace_agents::schema_objects());
+    expected.extend(workspace_agent_dag::schema_objects());
+    validate_schema_objects_for(connection, &expected)
+}
+
+fn validate_schema_objects_v15(connection: &Connection) -> Result<(), WorkspaceStoreError> {
+    let mut expected = Vec::from([
+        ("table", "workspace"),
+        ("table", "activities"),
+        ("index", "activities_workspace_updated_idx"),
+        ("index", "activities_workspace_lease_idx"),
+    ]);
+    expected.extend(workspace_changesets::schema_objects());
+    expected.extend(workspace_diffs::schema_objects());
+    expected.extend(workspace_executions::schema_objects());
+    expected.extend(workspace_approvals::schema_objects());
+    expected.extend(workspace_checkpoints::schema_objects());
+    expected.extend(workspace_goals::schema_objects());
+    expected.extend(workspace_dags::schema_objects());
+    expected.extend(workspace_recovery::schema_objects());
+    expected.extend(workspace_harness::schema_objects());
+    expected.extend(workspace_harness_verifiers::schema_objects());
+    expected.extend(workspace_agents::schema_objects_v15());
+    expected.extend([
+        ("table", "agent_transport_principals"),
+        ("index", "agent_transport_principals_workspace_token_idx"),
+    ]);
     validate_schema_objects_for(connection, &expected)
 }
 
@@ -4703,6 +5040,26 @@ fn validate_schema_objects_v13(connection: &Connection) -> Result<(), WorkspaceS
     expected.extend(workspace_dags::schema_objects());
     expected.extend(workspace_recovery::schema_objects());
     expected.extend(workspace_harness::schema_objects());
+    validate_schema_objects_for(connection, &expected)
+}
+
+fn validate_schema_objects_v14(connection: &Connection) -> Result<(), WorkspaceStoreError> {
+    let mut expected = Vec::from([
+        ("table", "workspace"),
+        ("table", "activities"),
+        ("index", "activities_workspace_updated_idx"),
+        ("index", "activities_workspace_lease_idx"),
+    ]);
+    expected.extend(workspace_changesets::schema_objects());
+    expected.extend(workspace_diffs::schema_objects());
+    expected.extend(workspace_executions::schema_objects());
+    expected.extend(workspace_approvals::schema_objects());
+    expected.extend(workspace_checkpoints::schema_objects());
+    expected.extend(workspace_goals::schema_objects());
+    expected.extend(workspace_dags::schema_objects());
+    expected.extend(workspace_recovery::schema_objects());
+    expected.extend(workspace_harness::schema_objects());
+    expected.extend(workspace_harness_verifiers::schema_objects());
     validate_schema_objects_for(connection, &expected)
 }
 
@@ -5075,6 +5432,8 @@ fn migrate_fresh(connection: &mut Connection) -> Result<(), WorkspaceStoreError>
     workspace_recovery::create_schema(&transaction)?;
     workspace_harness::create_schema(&transaction)?;
     workspace_harness_verifiers::create_schema(&transaction)?;
+    workspace_agents::create_schema(&transaction)?;
+    workspace_agent_dag::create_schema(&transaction)?;
     transaction.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
@@ -5588,6 +5947,10 @@ pub enum WorkspaceStoreError {
     Harness(#[from] HarnessStoreError),
     #[error(transparent)]
     HarnessVerifier(#[from] HarnessVerifierStoreError),
+    #[error(transparent)]
+    Agent(#[from] AgentStoreError),
+    #[error(transparent)]
+    AgentDag(#[from] AgentDagStoreError),
     #[error("Workspace database has application id {actual:#x}; expected {expected:#x}")]
     DatabaseOwnershipMismatch { actual: i64, expected: i64 },
     #[error("Workspace database is non-empty but has no Forge ownership marker")]
@@ -5881,6 +6244,14 @@ mod tests {
         connection.execute_batch(
             "PRAGMA wal_checkpoint(TRUNCATE);
              PRAGMA journal_mode = DELETE;
+             DROP TABLE agent_dag_replan_ledger;
+             DROP TABLE agent_dag_authoring_grants;
+             DROP INDEX agent_transport_principals_workspace_token_idx;
+             DROP TABLE agent_transport_principals;
+             DROP TABLE agent_work_update_evidence_refs;
+             DROP TABLE agent_work_updates;
+             DROP TABLE agent_focus_events;
+             DROP TABLE agent_instances;
              DROP TABLE workspace_harness_verifier_items;
              DROP TABLE workspace_harness_verifier_runs;",
         )?;
@@ -9474,7 +9845,13 @@ mod tests {
         let database = layout.database_path();
         let connection = Connection::open(&database)?;
         connection.execute_batch(
-            "PRAGMA wal_checkpoint(TRUNCATE);\n             PRAGMA journal_mode = DELETE;\n             DROP TABLE workspace_harness_verifier_items;\n             DROP TABLE workspace_harness_verifier_runs;\n             PRAGMA user_version = 13;",
+            "DROP TABLE agent_dag_replan_ledger;
+             DROP TABLE agent_dag_authoring_grants;
+             DROP INDEX agent_transport_principals_workspace_token_idx;
+             DROP TABLE agent_transport_principals;",
+        )?;
+        connection.execute_batch(
+            "PRAGMA wal_checkpoint(TRUNCATE);\n             PRAGMA journal_mode = DELETE;\n             DROP TABLE agent_work_update_evidence_refs;\n             DROP TABLE agent_work_updates;\n             DROP TABLE agent_focus_events;\n             DROP TABLE agent_instances;\n             DROP TABLE workspace_harness_verifier_items;\n             DROP TABLE workspace_harness_verifier_runs;\n             PRAGMA user_version = 13;",
         )?;
         drop(connection);
         for sidecar in [

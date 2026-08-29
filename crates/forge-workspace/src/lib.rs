@@ -5,6 +5,9 @@ mod diff_artifact;
 mod discovery;
 mod git_safety;
 mod harness;
+mod harness_composition;
+mod harness_presence;
+mod harness_skill;
 mod service;
 mod state_layout;
 
@@ -37,11 +40,26 @@ pub use git_safety::{
 };
 pub use harness::{
     HARNESS_MANAGED_STATE_PATH, HARNESS_MANIFEST_FILE_NAME, HarnessBundleInspectionError,
-    HarnessInstallPreview, HarnessManagedAsset, HarnessMaterializationError,
+    HarnessInstallPreview, HarnessLifecycleDisposition, HarnessLifecycleError,
+    HarnessLifecycleMode, HarnessLifecyclePreview, HarnessLifecyclePreviewItem,
+    HarnessLifecycleReceipt, HarnessManagedAsset, HarnessMaterializationError,
     HarnessMaterializationReceipt, HarnessPreviewDisposition, HarnessPreviewError,
     HarnessPreviewItem, HarnessPreviewKind, HarnessVerifierProgramError, HarnessVerifierSpec,
-    InspectedHarnessBundle, MAX_HARNESS_MANAGED_FILE_BYTES, inspect_harness_bundle,
-    materialize_harness_install, preview_harness_install, resolve_harness_verifier_program,
+    InspectedHarnessBundle, MAX_HARNESS_MANAGED_FILE_BYTES, MAX_HARNESS_TOTAL_MANAGED_BYTES,
+    inspect_harness_bundle, materialize_harness_install, materialize_harness_lifecycle,
+    preview_harness_install, preview_harness_lifecycle, resolve_harness_verifier_program,
+};
+pub use harness_composition::{
+    HarnessCompositionError, HarnessCompositionIdentity, save_harness_composition,
+};
+pub use harness_presence::{
+    MAX_AGENTS_STATUS_SCAN_ENTRIES, MAX_WORKSPACE_HARNESS_DIRECTORIES, WorkspaceHarnessDirectories,
+    WorkspaceHarnessDirectoryError, inspect_workspace_harness_directories,
+};
+pub use harness_skill::{
+    HARNESS_SKILL_ENTRY_FILE, HarnessSkillAsset, HarnessSkillInspectionError,
+    InspectedHarnessSkill, MAX_HARNESS_SKILL_FILE_BYTES, MAX_HARNESS_SKILL_TOTAL_BYTES,
+    inspect_harness_skill,
 };
 pub use service::{
     BoxedRepositoryError, LocationRepository, LocationRepositoryError, LocationService,

@@ -8,6 +8,8 @@ publish = false
 [dependencies]
 forge-control = { path = "../forge-control" }
 forge-domain = { path = "../forge-domain" }
+forge-execution = { path = "../forge-execution" }
+forge-mcp = { path = "../forge-mcp" }
 forge-persistence = { path = "../forge-persistence" }
 forge-platform = { path = "../forge-platform" }
 forge-runtime = { path = "../forge-runtime" }

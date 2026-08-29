@@ -6,10 +6,13 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+base64.workspace = true
+blake3.workspace = true
 forge-domain = { path = "../forge-domain" }
 forge-execution = { path = "../forge-execution" }
 forge-persistence = { path = "../forge-persistence" }
 forge-workspace = { path = "../forge-workspace" }
+getrandom.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 uuid.workspace = true

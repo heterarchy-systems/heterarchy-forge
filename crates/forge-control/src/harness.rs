@@ -5,18 +5,26 @@
 //! short catalog transaction, while Workspace projection resolves an exact
 //! durable Workspace and reads only its applied Bundle snapshot.
 
+use std::collections::BTreeSet;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use forge_domain::{
-    AppliedHarness, AppliedHarnessError, HarnessBundleDescriptor, HarnessBundleId, HarnessRevision,
-    HarnessVerificationOutcome, HarnessVerifierRun, HarnessVerifierRunRevision, TimestampMillis,
+    AppliedHarness, AppliedHarnessError, HarnessBundleDescriptor, HarnessBundleId,
+    HarnessContentHash, HarnessRevision, HarnessSkillId, HarnessSkillRevision,
+    HarnessVerificationOutcome, HarnessVerifierRun, HarnessVerifierRunRevision, MAX_HARNESS_SKILLS,
+    TimestampMillis,
 };
 use forge_persistence::{
-    HarnessCatalog, HarnessCatalogEntry, HarnessCatalogError, MAX_HARNESS_CATALOG_RESULTS,
+    HarnessCatalog, HarnessCatalogEntry, HarnessCatalogError, HarnessSkillCatalogEntry,
+    MAX_HARNESS_CATALOG_RESULTS,
 };
 use forge_workspace::{
-    ConfinedWorkspace, HarnessInstallPreview, HarnessMaterializationError, HarnessPreviewError,
-    materialize_harness_install, preview_harness_install,
+    ConfinedWorkspace, HarnessCompositionError, HarnessCompositionIdentity, HarnessInstallPreview,
+    HarnessLifecycleError, HarnessLifecyclePreview, HarnessMaterializationError,
+    HarnessPreviewError, InspectedHarnessBundle, inspect_harness_skill,
+    materialize_harness_install, materialize_harness_lifecycle, preview_harness_install,
+    preview_harness_lifecycle, save_harness_composition,
 };
 use forge_workspace::{HarnessBundleInspectionError, inspect_harness_bundle};
 use thiserror::Error;
@@ -49,14 +57,171 @@ pub struct HarnessPreviewRequest {
     pub expected_bundle: HarnessBundleDescriptor,
 }
 
+#[must_use]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HarnessLifecycleTarget {
+    Bundle {
+        source_root: PathBuf,
+        expected_bundle: HarnessBundleDescriptor,
+    },
+    Remove,
+}
+
+#[must_use]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HarnessLifecyclePreviewRequest {
+    pub scope: ResolvedWorkspaceScope,
+    pub target: HarnessLifecycleTarget,
+}
+
+#[must_use]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HarnessLifecyclePreviewProjection {
+    preview: HarnessLifecyclePreview,
+    current_revision: HarnessRevision,
+}
+
+impl HarnessLifecyclePreviewProjection {
+    pub const fn preview(&self) -> &HarnessLifecyclePreview {
+        &self.preview
+    }
+
+    pub const fn current_revision(&self) -> HarnessRevision {
+        self.current_revision
+    }
+}
+
+#[must_use]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HarnessLifecycleApplyRequest {
+    pub scope: ResolvedWorkspaceScope,
+    pub target: HarnessLifecycleTarget,
+    pub expected: HarnessLifecyclePreviewProjection,
+    pub observed_at: TimestampMillis,
+}
+
+/// Exact Skill catalog state captured by a composition selection.
+///
+/// A selection is intentionally stronger than an id-only reference: a source
+/// refresh must invalidate a pending Save-as-Bundle request even when the
+/// selected Skill keeps the same durable identity.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HarnessCompositionSkillSelection {
+    id: HarnessSkillId,
+    expected_revision: HarnessSkillRevision,
+    expected_content_hash: HarnessContentHash,
+}
+
+impl HarnessCompositionSkillSelection {
+    pub const fn new(
+        id: HarnessSkillId,
+        expected_revision: HarnessSkillRevision,
+        expected_content_hash: HarnessContentHash,
+    ) -> Self {
+        Self {
+            id,
+            expected_revision,
+            expected_content_hash,
+        }
+    }
+
+    pub const fn id(self) -> HarnessSkillId {
+        self.id
+    }
+
+    pub const fn expected_revision(self) -> HarnessSkillRevision {
+        self.expected_revision
+    }
+
+    pub const fn expected_content_hash(self) -> HarnessContentHash {
+        self.expected_content_hash
+    }
+}
+
+/// Typed Save-as-Bundle request bound to exact catalog snapshots.
+#[must_use]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HarnessCompositionRequest {
+    base_bundle_id: HarnessBundleId,
+    expected_base_revision: HarnessRevision,
+    selected_skills: Vec<HarnessCompositionSkillSelection>,
+    identity: HarnessCompositionIdentity,
+    observed_at: TimestampMillis,
+}
+
+impl HarnessCompositionRequest {
+    pub fn new(
+        base_bundle_id: HarnessBundleId,
+        expected_base_revision: HarnessRevision,
+        selected_skills: Vec<HarnessCompositionSkillSelection>,
+        identity: HarnessCompositionIdentity,
+        observed_at: TimestampMillis,
+    ) -> Result<Self, HarnessCompositionRequestError> {
+        if selected_skills.len() > usize::from(MAX_HARNESS_SKILLS) {
+            return Err(HarnessCompositionRequestError::SkillCapacity {
+                actual: selected_skills.len(),
+                maximum: MAX_HARNESS_SKILLS,
+            });
+        }
+        Ok(Self {
+            base_bundle_id,
+            expected_base_revision,
+            selected_skills,
+            identity,
+            observed_at,
+        })
+    }
+
+    pub const fn base_bundle_id(&self) -> HarnessBundleId {
+        self.base_bundle_id
+    }
+
+    pub const fn expected_base_revision(&self) -> HarnessRevision {
+        self.expected_base_revision
+    }
+
+    pub fn selected_skills(&self) -> &[HarnessCompositionSkillSelection] {
+        &self.selected_skills
+    }
+
+    pub const fn identity(&self) -> &HarnessCompositionIdentity {
+        &self.identity
+    }
+
+    pub const fn observed_at(&self) -> TimestampMillis {
+        self.observed_at
+    }
+}
+
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum HarnessCompositionRequestError {
+    #[error("Harness composition selected {actual} Skills, exceeding the maximum {maximum}")]
+    SkillCapacity { actual: usize, maximum: u16 },
+}
+
 #[derive(Debug)]
 pub struct HarnessLibrary {
     catalog: HarnessCatalog,
+    saved_harness_bundles_root: Option<PathBuf>,
 }
 
 impl HarnessLibrary {
     pub const fn new(catalog: HarnessCatalog) -> Self {
-        Self { catalog }
+        Self {
+            catalog,
+            saved_harness_bundles_root: None,
+        }
+    }
+
+    pub fn with_saved_harness_bundles_root(
+        catalog: HarnessCatalog,
+        saved_harness_bundles_root: PathBuf,
+    ) -> Self {
+        Self {
+            catalog,
+            saved_harness_bundles_root: Some(saved_harness_bundles_root),
+        }
     }
 
     pub fn register_path(
@@ -101,6 +266,117 @@ impl HarnessLibrary {
             .list(MAX_HARNESS_CATALOG_RESULTS)
             .map_err(HarnessLibraryError::from)
     }
+
+    pub fn register_skill_path(
+        &mut self,
+        source_root: &Path,
+        observed_at: TimestampMillis,
+    ) -> Result<HarnessSkillCatalogEntry, HarnessLibraryError> {
+        let id = HarnessSkillId::from_uuid(uuid::Uuid::now_v7());
+        let inspected = inspect_harness_skill(source_root, id)?;
+        self.catalog
+            .register_skill(&inspected, observed_at)
+            .map_err(HarnessLibraryError::from)
+    }
+
+    pub fn refresh_skill(
+        &mut self,
+        id: HarnessSkillId,
+        expected_revision: HarnessSkillRevision,
+        observed_at: TimestampMillis,
+    ) -> Result<HarnessSkillCatalogEntry, HarnessLibraryError> {
+        let registered = self
+            .catalog
+            .get_skill(id)?
+            .ok_or(HarnessLibraryError::SkillNotFound(id))?;
+        let inspected = inspect_harness_skill(registered.source_root(), id)?;
+        self.catalog
+            .refresh_skill(&inspected, expected_revision, observed_at)
+            .map_err(HarnessLibraryError::from)
+    }
+
+    pub fn list_skills(&self) -> Result<Vec<HarnessSkillCatalogEntry>, HarnessLibraryError> {
+        self.catalog
+            .list_skills(MAX_HARNESS_CATALOG_RESULTS)
+            .map_err(HarnessLibraryError::from)
+    }
+
+    /// Save a catalog-bound composition and register the resulting source as
+    /// an ordinary Harness Bundle. Every catalog row and source is re-read
+    /// before any destination filesystem effect is allowed.
+    pub fn save_composition(
+        &mut self,
+        request: &HarnessCompositionRequest,
+    ) -> Result<HarnessCatalogEntry, HarnessLibraryError> {
+        let base_entry = self.catalog.get(request.base_bundle_id())?.ok_or(
+            HarnessLibraryError::BundleNotFound(request.base_bundle_id()),
+        )?;
+        if base_entry.bundle().revision() != request.expected_base_revision() {
+            return Err(HarnessLibraryError::CompositionStale);
+        }
+        let inspected_base = inspect_harness_bundle(base_entry.source_root())?;
+        if inspected_base.descriptor() != base_entry.bundle().descriptor() {
+            return Err(HarnessLibraryError::CompositionStale);
+        }
+        if self.catalog.get(request.base_bundle_id())?.as_ref() != Some(&base_entry) {
+            return Err(HarnessLibraryError::CompositionStale);
+        }
+
+        let mut selected_skills = Vec::with_capacity(request.selected_skills().len());
+        let mut selected_ids = BTreeSet::new();
+        for selection in request.selected_skills() {
+            if !selected_ids.insert(selection.id()) {
+                return Err(HarnessLibraryError::DuplicateSkillSelection(selection.id()));
+            }
+            let entry = self
+                .catalog
+                .get_skill(selection.id())?
+                .ok_or(HarnessLibraryError::SkillNotFound(selection.id()))?;
+            if entry.skill().revision() != selection.expected_revision()
+                || entry.skill().descriptor().content_hash() != selection.expected_content_hash()
+            {
+                return Err(HarnessLibraryError::CompositionStale);
+            }
+            let inspected = inspect_harness_skill(entry.source_root(), selection.id())?;
+            if inspected.descriptor() != entry.skill().descriptor()
+                || inspected.descriptor().content_hash() != selection.expected_content_hash()
+            {
+                return Err(HarnessLibraryError::CompositionStale);
+            }
+            if self.catalog.get_skill(selection.id())?.as_ref() != Some(&entry) {
+                return Err(HarnessLibraryError::CompositionStale);
+            }
+            selected_skills.push(inspected);
+        }
+
+        if self.catalog.get(request.identity().id())?.is_some() {
+            return Err(HarnessLibraryError::Catalog(
+                HarnessCatalogError::BundleIdConflict(request.identity().id()),
+            ));
+        }
+
+        let Some(destination_root) = self.saved_harness_bundles_root.as_deref() else {
+            return Err(HarnessLibraryError::CompositionRootUnavailable);
+        };
+        ensure_saved_harness_bundles_root(destination_root)?;
+        let saved = save_harness_composition(
+            destination_root,
+            request.identity(),
+            &inspected_base,
+            &selected_skills,
+        )?;
+        match self.catalog.register(&saved, request.observed_at()) {
+            Ok(entry) => Ok(entry),
+            Err(error) => {
+                // The destination was created by this request and is not a
+                // usable Library entry unless registration succeeds. Best
+                // effort cleanup preserves that invariant without replacing
+                // the original catalog failure with a misleading error.
+                let _ignored = fs::remove_dir_all(saved.source_root());
+                Err(HarnessLibraryError::Catalog(error))
+            }
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -113,6 +389,48 @@ pub enum HarnessLibraryError {
     BundleNotFound(HarnessBundleId),
     #[error("registered Harness source now declares a different Bundle identity")]
     SourceIdentityMismatch,
+    #[error("Harness Skill source inspection failed")]
+    SkillInspection(#[from] forge_workspace::HarnessSkillInspectionError),
+    #[error("Harness Skill was not found: {0}")]
+    SkillNotFound(HarnessSkillId),
+    #[error("Harness composition request is stale")]
+    CompositionStale,
+    #[error("Harness composition request selected Skill more than once: {0}")]
+    DuplicateSkillSelection(HarnessSkillId),
+    #[error("Harness composition destination root is not configured")]
+    CompositionRootUnavailable,
+    #[error(transparent)]
+    Composition(#[from] HarnessCompositionError),
+}
+
+fn ensure_saved_harness_bundles_root(path: &Path) -> Result<(), HarnessLibraryError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
+        Ok(_) => Err(HarnessLibraryError::CompositionRootUnavailable),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let parent = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .ok_or(HarnessLibraryError::CompositionRootUnavailable)?;
+            let parent_metadata = fs::symlink_metadata(parent)
+                .map_err(HarnessCompositionError::Io)
+                .map_err(HarnessLibraryError::Composition)?;
+            if !parent_metadata.file_type().is_dir() {
+                return Err(HarnessLibraryError::CompositionRootUnavailable);
+            }
+            fs::create_dir(path)
+                .map_err(HarnessCompositionError::Io)
+                .map_err(HarnessLibraryError::Composition)?;
+            fs::File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .map_err(HarnessCompositionError::Io)
+                .map_err(HarnessLibraryError::Composition)?;
+            Ok(())
+        }
+        Err(error) => Err(HarnessLibraryError::Composition(
+            HarnessCompositionError::Io(error),
+        )),
+    }
 }
 
 impl ForgeControl {
@@ -273,6 +591,94 @@ impl ForgeControl {
         Ok(persisted)
     }
 
+    pub fn harness_lifecycle_preview(
+        &self,
+        request: &HarnessLifecyclePreviewRequest,
+    ) -> Result<HarnessLifecyclePreviewProjection, ControlError> {
+        let (fresh_scope, layout, store) = self.open_resolved_workspace_with_layout(
+            request.scope.locator().location_id(),
+            request.scope.locator().expected_revision(),
+            request.scope.locator(),
+        )?;
+        if fresh_scope != request.scope {
+            return Err(ControlError::new(
+                ControlErrorCode::WorkspaceRevisionConflict,
+            ));
+        }
+        let current = store
+            .get_applied_harness()
+            .map_err(map_harness_store_error)?
+            .ok_or_else(|| ControlError::new(ControlErrorCode::HarnessNotFound))?;
+        let target = inspect_lifecycle_target(&request.target)?;
+        let filesystem = ConfinedWorkspace::open(&layout)
+            .map_err(|error| ControlError::with_source(ControlErrorCode::HarnessConflict, error))?;
+        let preview = preview_harness_lifecycle(&filesystem, current.bundle(), target.as_ref())
+            .map_err(map_harness_lifecycle_error)?;
+        if !self.committed_scope_matches_with_store(&fresh_scope, &store) {
+            return Err(ControlError::new(ControlErrorCode::WorkspaceRootConflict));
+        }
+        Ok(HarnessLifecyclePreviewProjection {
+            preview,
+            current_revision: current.revision(),
+        })
+    }
+
+    pub fn harness_lifecycle_apply(
+        &self,
+        request: &HarnessLifecycleApplyRequest,
+    ) -> Result<Option<AppliedHarness>, ControlError> {
+        let (fresh_scope, layout, mut store) = self.open_resolved_workspace_with_layout(
+            request.scope.locator().location_id(),
+            request.scope.locator().expected_revision(),
+            request.scope.locator(),
+        )?;
+        if fresh_scope != request.scope {
+            return Err(ControlError::new(
+                ControlErrorCode::WorkspaceRevisionConflict,
+            ));
+        }
+        self.ensure_non_overlapping_effect_scope(&fresh_scope, layout.workspace_root())?;
+        let current = store
+            .get_applied_harness()
+            .map_err(map_harness_store_error)?
+            .ok_or_else(|| ControlError::new(ControlErrorCode::HarnessNotFound))?;
+        if current.revision() != request.expected.current_revision()
+            || current.bundle() != request.expected.preview().current_descriptor()
+        {
+            return Err(ControlError::new(ControlErrorCode::HarnessConflict));
+        }
+        let target = inspect_lifecycle_target(&request.target)?;
+        let filesystem = ConfinedWorkspace::open(&layout)
+            .map_err(|error| ControlError::with_source(ControlErrorCode::HarnessConflict, error))?;
+        let _receipt = materialize_harness_lifecycle(
+            &filesystem,
+            current.bundle(),
+            target.as_ref(),
+            request.expected.preview(),
+        )
+        .map_err(map_harness_lifecycle_error)?;
+        let revision = current.revision();
+        let persisted = if let Some(target) = target {
+            let next = current
+                .replace_bundle(target.descriptor().clone(), revision, request.observed_at)
+                .map_err(map_harness_transition_error)?;
+            Some(
+                store
+                    .persist_applied_harness(&next, Some(revision))
+                    .map_err(map_harness_store_error)?,
+            )
+        } else {
+            store
+                .delete_applied_harness(revision)
+                .map_err(map_harness_store_error)?;
+            None
+        };
+        if !self.committed_scope_matches_with_store(&fresh_scope, &store) {
+            return Err(ControlError::new(ControlErrorCode::CommittedButUnconfirmed));
+        }
+        Ok(persisted)
+    }
+
     pub fn harness_verify_source(
         &self,
         request: &HarnessVerifyRequest,
@@ -319,6 +725,24 @@ impl ForgeControl {
     }
 }
 
+fn inspect_lifecycle_target(
+    target: &HarnessLifecycleTarget,
+) -> Result<Option<InspectedHarnessBundle>, ControlError> {
+    let HarnessLifecycleTarget::Bundle {
+        source_root,
+        expected_bundle,
+    } = target
+    else {
+        return Ok(None);
+    };
+    let inspected = inspect_harness_bundle(source_root)
+        .map_err(|error| ControlError::with_source(ControlErrorCode::HarnessConflict, error))?;
+    if inspected.descriptor() != expected_bundle {
+        return Err(ControlError::new(ControlErrorCode::HarnessConflict));
+    }
+    Ok(Some(inspected))
+}
+
 fn map_harness_transition_error(error: AppliedHarnessError) -> ControlError {
     ControlError::with_source(ControlErrorCode::HarnessConflict, error)
 }
@@ -342,6 +766,10 @@ fn map_harness_preview_error(error: HarnessPreviewError) -> ControlError {
 }
 
 fn map_harness_materialization_error(error: HarnessMaterializationError) -> ControlError {
+    ControlError::with_source(ControlErrorCode::HarnessConflict, error)
+}
+
+fn map_harness_lifecycle_error(error: HarnessLifecycleError) -> ControlError {
     ControlError::with_source(ControlErrorCode::HarnessConflict, error)
 }
 
@@ -434,6 +862,35 @@ mod tests {
             ),
         )?;
         Ok(root)
+    }
+
+    fn skill_source() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+        let serial = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "heterarchy-forge-skill-library-{}-{serial}",
+            std::process::id()
+        ));
+        fs::create_dir_all(root.join("references"))?;
+        fs::write(root.join("SKILL.md"), b"# Optional Skill\n")?;
+        fs::write(root.join("references/guide.md"), b"# Guide\n")?;
+        Ok(root)
+    }
+
+    fn write_lifecycle_bundle(
+        source: &std::path::Path,
+        bundle_id: Uuid,
+        version: &str,
+        rules: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        fs::create_dir_all(source.join("rules"))?;
+        fs::write(source.join("rules/base.md"), rules)?;
+        fs::write(
+            source.join(forge_workspace::HARNESS_MANIFEST_FILE_NAME),
+            format!(
+                "[harness]\nid = \"{bundle_id}\"\nname = \"Lifecycle Harness\"\nversion = \"{version}\"\ninstall_root = \".agents/lifecycle_harness\"\nmanaged_files = [\"rules/base.md\"]\nskills = []\n"
+            ),
+        )?;
+        Ok(())
     }
 
     #[test]
@@ -532,6 +989,106 @@ mod tests {
         worker.shutdown()?;
         let restarted = ForgeControl::new(GlobalRegistry::open(&fixture.registry_path)?);
         assert_eq!(restarted.harness_get_applied(&fixture.scope)?, Some(failed));
+        fs::remove_dir_all(fixture.root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_harness_lifecycle_update_remove_is_revision_bound_and_durable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = control_fixture("lifecycle")?;
+        let source = fixture.root.join("lifecycle-bundle");
+        let bundle_id = Uuid::from_u128(0x4520);
+        write_lifecycle_bundle(&source, bundle_id, "1.0.0", b"# Rules v1\n")?;
+        let first = inspect_harness_bundle(&source)?.descriptor().clone();
+        let (client, mut worker) =
+            ForgeControl::new(GlobalRegistry::open(&fixture.registry_path)?).start_worker()?;
+        let install_preview = client.harness_preview(HarnessPreviewRequest {
+            scope: fixture.scope.clone(),
+            source_root: source.clone(),
+            expected_bundle: first,
+        })?;
+        let applied = client.harness_apply(HarnessApplyRequest {
+            scope: fixture.scope.clone(),
+            source_root: source.clone(),
+            expected_preview: install_preview,
+            observed_at: timestamp(10)?,
+        })?;
+        assert_eq!(applied.revision().get(), 1);
+
+        write_lifecycle_bundle(&source, bundle_id, "2.0.0", b"# Rules v2\n")?;
+        let second = inspect_harness_bundle(&source)?.descriptor().clone();
+        let target = HarnessLifecycleTarget::Bundle {
+            source_root: source.clone(),
+            expected_bundle: second.clone(),
+        };
+        let update_preview = client.harness_lifecycle_preview(HarnessLifecyclePreviewRequest {
+            scope: fixture.scope.clone(),
+            target: target.clone(),
+        })?;
+        assert_eq!(
+            update_preview.preview().mode(),
+            forge_workspace::HarnessLifecycleMode::Update
+        );
+        let updated = client
+            .harness_lifecycle_apply(HarnessLifecycleApplyRequest {
+                scope: fixture.scope.clone(),
+                target,
+                expected: update_preview,
+                observed_at: timestamp(11)?,
+            })?
+            .ok_or("updated applied Harness missing")?;
+        assert_eq!(updated.bundle(), &second);
+        assert_eq!(updated.revision().get(), 2);
+
+        let stale_remove = client.harness_lifecycle_preview(HarnessLifecyclePreviewRequest {
+            scope: fixture.scope.clone(),
+            target: HarnessLifecycleTarget::Remove,
+        })?;
+        let verified = client.harness_verify_source(HarnessVerifyRequest {
+            scope: fixture.scope.clone(),
+            source_root: source,
+            observed_at: timestamp(12)?,
+        })?;
+        assert_eq!(verified.revision().get(), 3);
+        let Err(stale_error) = client.harness_lifecycle_apply(HarnessLifecycleApplyRequest {
+            scope: fixture.scope.clone(),
+            target: HarnessLifecycleTarget::Remove,
+            expected: stale_remove,
+            observed_at: timestamp(13)?,
+        }) else {
+            return Err("stale lifecycle Preview unexpectedly removed Harness".into());
+        };
+        assert_eq!(stale_error.code(), ControlErrorCode::HarnessConflict);
+
+        let remove_preview = client.harness_lifecycle_preview(HarnessLifecyclePreviewRequest {
+            scope: fixture.scope.clone(),
+            target: HarnessLifecycleTarget::Remove,
+        })?;
+        assert!(
+            client
+                .harness_lifecycle_apply(HarnessLifecycleApplyRequest {
+                    scope: fixture.scope.clone(),
+                    target: HarnessLifecycleTarget::Remove,
+                    expected: remove_preview,
+                    observed_at: timestamp(14)?,
+                })?
+                .is_none()
+        );
+        assert_eq!(client.harness_get_applied(fixture.scope.clone())?, None);
+        let workspace_root = fixture.root.join("location/workspace-0");
+        assert!(
+            !workspace_root
+                .join(forge_workspace::HARNESS_MANAGED_STATE_PATH)
+                .exists()
+        );
+        assert!(
+            !workspace_root
+                .join(".agents/lifecycle_harness/rules/base.md")
+                .exists()
+        );
+
+        worker.shutdown()?;
         fs::remove_dir_all(fixture.root)?;
         Ok(())
     }
@@ -704,6 +1261,174 @@ mod tests {
         drop(library);
         fs::remove_dir_all(source)?;
         fs::remove_file(database)?;
+        Ok(())
+    }
+
+    struct CompositionLibraryFixture {
+        base_source: PathBuf,
+        skill_source: PathBuf,
+        database: PathBuf,
+        saved_root: PathBuf,
+        library: HarnessLibrary,
+        base: HarnessCatalogEntry,
+        skill: HarnessSkillCatalogEntry,
+    }
+
+    impl CompositionLibraryFixture {
+        fn new() -> Result<Self, Box<dyn std::error::Error>> {
+            let base_source = bundle_source()?;
+            let skill_source = skill_source()?;
+            let temp_dir = std::env::temp_dir();
+            let database = temp_dir.join(format!(
+                "composition-catalog-{}-{}.sqlite3",
+                std::process::id(),
+                NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
+            ));
+            let saved_root = temp_dir.join(format!(
+                "heterarchy-forge-saved-composition-{}-{}",
+                std::process::id(),
+                NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
+            ));
+            let mut library = HarnessLibrary::with_saved_harness_bundles_root(
+                HarnessCatalog::open(&database)?,
+                saved_root.clone(),
+            );
+            let base = library.register_path(&base_source, TimestampMillis::new(10)?)?;
+            let skill = library.register_skill_path(&skill_source, TimestampMillis::new(10)?)?;
+            Ok(Self {
+                base_source,
+                skill_source,
+                database,
+                saved_root,
+                library,
+                base,
+                skill,
+            })
+        }
+
+        fn request(
+            &self,
+            id: u128,
+            name: &str,
+            observed_at: i64,
+        ) -> Result<HarnessCompositionRequest, Box<dyn std::error::Error>> {
+            Ok(HarnessCompositionRequest::new(
+                self.base.bundle().descriptor().id(),
+                self.base.bundle().revision(),
+                vec![HarnessCompositionSkillSelection::new(
+                    self.skill.skill().descriptor().id(),
+                    self.skill.skill().revision(),
+                    self.skill.skill().descriptor().content_hash(),
+                )],
+                HarnessCompositionIdentity::new(
+                    HarnessBundleId::from_uuid(Uuid::from_u128(id)),
+                    forge_domain::HarnessName::new(name.to_owned())?,
+                    forge_domain::HarnessVersion::new("1.0.0".to_owned())?,
+                ),
+                TimestampMillis::new(observed_at)?,
+            )?)
+        }
+
+        fn cleanup(self) -> Result<(), Box<dyn std::error::Error>> {
+            let Self {
+                base_source,
+                skill_source,
+                database,
+                saved_root,
+                library,
+                ..
+            } = self;
+            drop(library);
+            fs::remove_dir_all(base_source)?;
+            fs::remove_dir_all(skill_source)?;
+            if saved_root.exists() {
+                fs::remove_dir_all(saved_root)?;
+            }
+            fs::remove_file(database)?;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn library_saves_and_registers_catalog_bound_composition()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut fixture = CompositionLibraryFixture::new()?;
+        let request = fixture.request(0x4650, "Saved Composition", 11)?;
+        let identity = request.identity().clone();
+        let saved = fixture.library.save_composition(&request)?;
+        assert_eq!(saved.bundle().descriptor().id(), identity.id());
+        assert_eq!(fixture.library.get(identity.id())?, Some(saved.clone()));
+        assert!(
+            saved
+                .source_root()
+                .starts_with(fs::canonicalize(&fixture.saved_root)?)
+        );
+        assert_eq!(
+            fs::read(
+                saved
+                    .source_root()
+                    .join("skills")
+                    .join(fixture.skill.skill().descriptor().name().as_str())
+                    .join("SKILL.md")
+            )?,
+            b"# Optional Skill\n"
+        );
+        fixture.cleanup()?;
+        Ok(())
+    }
+
+    #[test]
+    fn composition_request_rejects_oversized_skill_selection_at_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = CompositionLibraryFixture::new()?;
+        let request = fixture.request(0x4652, "Oversized Selection", 11)?;
+        let oversized_request = HarnessCompositionRequest::new(
+            fixture.base.bundle().descriptor().id(),
+            fixture.base.bundle().revision(),
+            vec![request.selected_skills()[0]; usize::from(forge_domain::MAX_HARNESS_SKILLS) + 1],
+            request.identity().clone(),
+            TimestampMillis::new(11)?,
+        );
+        assert!(matches!(
+            oversized_request,
+            Err(HarnessCompositionRequestError::SkillCapacity { .. })
+        ));
+        assert!(
+            !fixture
+                .saved_root
+                .join(request.identity().id().to_string())
+                .exists()
+        );
+        fixture.cleanup()?;
+        Ok(())
+    }
+
+    #[test]
+    fn library_fences_skill_source_drift_before_composition_write()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut fixture = CompositionLibraryFixture::new()?;
+        let stale_request = fixture.request(0x4651, "Stale Composition", 12)?;
+        fs::write(
+            fixture.skill_source.join("references/guide.md"),
+            b"# Drifted\n",
+        )?;
+        assert!(matches!(
+            fixture.library.save_composition(&stale_request),
+            Err(HarnessLibraryError::CompositionStale)
+        ));
+        assert!(
+            !fixture
+                .saved_root
+                .join(stale_request.identity().id().to_string())
+                .exists()
+        );
+        assert!(
+            !fixture
+                .saved_root
+                .join(format!("{}{}", stale_request.identity().id(), ".staging"))
+                .exists()
+        );
+        fixture.cleanup()?;
         Ok(())
     }
 }
