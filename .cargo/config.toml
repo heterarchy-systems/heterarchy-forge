@@ -1,2 +1,6 @@
 [alias]
 xtask = "run --locked -p xtask --"
+
+# Local Mac build cache: use the user-designated external 256 SSD.
+[build]
+target-dir = "/Volumes/256.SSD/RustBuild/forge"

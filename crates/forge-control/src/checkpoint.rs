@@ -12,7 +12,7 @@ use forge_workspace::{
 use thiserror::Error;
 
 use crate::error::{ControlError, ControlErrorCode};
-use crate::filesystem::{FileActivityScope, authorize_activity};
+use crate::filesystem::{FileActivityScope, authorize_owned_live_activity};
 use crate::service::ForgeControl;
 
 /// A PRE-retained mutation checkpoint awaiting its POST side.
@@ -139,7 +139,7 @@ impl ForgeControl {
         use forge_domain::{CheckpointRestoreFailureCode, RestoreEffect};
 
         let (scope, layout, mut store) = self.open_effect_workspace(&request.scope)?;
-        authorize_activity(
+        authorize_owned_live_activity(
             &store,
             FileActivityScope {
                 activity_id: request.activity_id,
@@ -295,18 +295,7 @@ fn current_observed_state(
     confined: &forge_workspace::ConfinedWorkspace,
     path: &WorkspaceRelativePath,
 ) -> Result<forge_domain::CheckpointObservedPathState, ControlError> {
-    use forge_domain::{CheckpointObservedPathState, FilePathState};
-    match confined.observe(path).map_err(map_confined)? {
-        FilePathState::Absent => Ok(CheckpointObservedPathState::Absent),
-        FilePathState::Regular { hash, size } => {
-            let read = confined.read(path).map_err(map_confined)?;
-            Ok(CheckpointObservedPathState::Regular {
-                hash,
-                size,
-                mode: read.mode(),
-            })
-        }
-    }
+    confined.observe_checkpoint(path).map_err(map_confined)
 }
 
 fn map_confined(error: forge_workspace::ConfinedFilesystemError) -> ControlError {

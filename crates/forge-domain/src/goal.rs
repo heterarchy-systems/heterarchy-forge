@@ -10,7 +10,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
-    ApprovalRequestId, ChangeSetId, CheckpointId, ExecutionId, ExecutionRequestDigest,
+    ActivityId, ApprovalRequestId, ChangeSetId, CheckpointId, ExecutionId, ExecutionRequestDigest,
     FileContentHash, TimestampMillis, WorkspaceId, WorkspaceRelativePath,
 };
 
@@ -580,6 +580,7 @@ impl GoalTimestamps {
 pub struct RegisteredGoal {
     id: GoalId,
     workspace_id: WorkspaceId,
+    activity_id: ActivityId,
     contract: GoalContract,
     status: GoalStatus,
     timestamps: GoalTimestamps,
@@ -590,12 +591,14 @@ impl RegisteredGoal {
     pub fn create(
         id: GoalId,
         workspace_id: WorkspaceId,
+        activity_id: ActivityId,
         contract: GoalContract,
         observed_at: TimestampMillis,
     ) -> Self {
         Self {
             id,
             workspace_id,
+            activity_id,
             contract,
             status: GoalStatus::Active,
             timestamps: GoalTimestamps::initial(observed_at),
@@ -606,6 +609,7 @@ impl RegisteredGoal {
     pub fn from_parts(
         id: GoalId,
         workspace_id: WorkspaceId,
+        activity_id: ActivityId,
         contract: GoalContract,
         status: GoalStatus,
         timestamps: GoalTimestamps,
@@ -620,6 +624,7 @@ impl RegisteredGoal {
         Ok(Self {
             id,
             workspace_id,
+            activity_id,
             contract,
             status,
             timestamps,
@@ -633,6 +638,10 @@ impl RegisteredGoal {
 
     pub const fn workspace_id(&self) -> WorkspaceId {
         self.workspace_id
+    }
+
+    pub const fn activity_id(&self) -> ActivityId {
+        self.activity_id
     }
 
     pub const fn contract(&self) -> &GoalContract {
@@ -721,6 +730,74 @@ impl RegisteredGoal {
         self.transition(expected, GoalStatus::Cancelled, observed_at)
     }
 
+    /// Replace the contract of a non-terminal Goal through the same revision
+    /// and timestamp fence used by lifecycle transitions.
+    pub fn revise_contract(
+        &self,
+        expected: GoalRevision,
+        contract: GoalContract,
+        observed_at: TimestampMillis,
+    ) -> Result<Self, GoalTransitionError> {
+        if self.status.is_terminal() {
+            return Err(self.invalid_transition());
+        }
+        if self.revision != expected {
+            return Err(GoalTransitionError::RevisionConflict);
+        }
+        if observed_at.get() < self.timestamps.updated_at().get() {
+            return Err(GoalTransitionError::TimestampOrder);
+        }
+        if self.contract == contract {
+            return Err(GoalTransitionError::AlreadyInRequestedState);
+        }
+        let revision = self
+            .revision
+            .checked_next()
+            .map_err(|_| GoalTransitionError::RevisionOverflow)?;
+        Ok(Self {
+            id: self.id,
+            workspace_id: self.workspace_id,
+            activity_id: self.activity_id,
+            contract,
+            status: self.status.clone(),
+            timestamps: GoalTimestamps::new(self.timestamps.created_at(), observed_at)?,
+            revision,
+        })
+    }
+
+    /// Record the permanent removal of every DAG revision while retaining the
+    /// Goal contract itself.
+    ///
+    /// A DAG deletion is a semantic Goal transition even though it does not
+    /// change the contract or lifecycle status.  Persistence must therefore
+    /// calculate this projection before applying its compare-and-set update;
+    /// it must not manufacture a revision with direct SQL arithmetic.
+    pub fn advance_after_dag_deletion(
+        &self,
+        expected: GoalRevision,
+        observed_at: TimestampMillis,
+    ) -> Result<Self, GoalTransitionError> {
+        if self.revision != expected {
+            return Err(GoalTransitionError::RevisionConflict);
+        }
+        if observed_at.get() < self.timestamps.updated_at().get() {
+            return Err(GoalTransitionError::TimestampOrder);
+        }
+        let revision = self
+            .revision
+            .checked_next()
+            .map_err(|_| GoalTransitionError::RevisionOverflow)?;
+        Ok(Self {
+            id: self.id,
+            workspace_id: self.workspace_id,
+            activity_id: self.activity_id,
+            contract: self.contract.clone(),
+            status: self.status.clone(),
+            timestamps: GoalTimestamps::new(self.timestamps.created_at(), observed_at)?,
+            revision,
+        })
+    }
+
     pub fn complete(
         &self,
         expected: GoalRevision,
@@ -758,6 +835,7 @@ impl RegisteredGoal {
         Ok(Self {
             id: self.id,
             workspace_id: self.workspace_id,
+            activity_id: self.activity_id,
             contract: self.contract.clone(),
             status,
             timestamps: GoalTimestamps::new(self.timestamps.created_at(), observed_at)?,
@@ -919,6 +997,7 @@ mod tests {
         Ok(RegisteredGoal::create(
             GoalId::from_uuid(Uuid::from_u128(1)),
             WorkspaceId::from_uuid(Uuid::from_u128(2)),
+            ActivityId::from_uuid(Uuid::from_u128(3)),
             contract()?,
             timestamp(10)?,
         ))
@@ -953,6 +1032,29 @@ mod tests {
             GoalObjective::new("x".repeat(MAX_GOAL_OBJECTIVE_BYTES + 1)),
             Err(GoalTextError::TooLarge { .. })
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn dag_deletion_is_a_fenced_goal_revision_transition() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let goal = goal()?;
+        let deleted = goal.advance_after_dag_deletion(goal.revision(), timestamp(11)?)?;
+        assert_eq!(deleted.id(), goal.id());
+        assert_eq!(deleted.workspace_id(), goal.workspace_id());
+        assert_eq!(deleted.activity_id(), goal.activity_id());
+        assert_eq!(deleted.contract(), goal.contract());
+        assert_eq!(deleted.status(), goal.status());
+        assert_eq!(
+            deleted.timestamps().created_at(),
+            goal.timestamps().created_at()
+        );
+        assert_eq!(deleted.timestamps().updated_at(), timestamp(11)?);
+        assert_eq!(deleted.revision().get(), goal.revision().get() + 1);
+        assert_eq!(
+            goal.advance_after_dag_deletion(GoalRevision::new(2)?, timestamp(11)?),
+            Err(GoalTransitionError::RevisionConflict)
+        );
         Ok(())
     }
 
@@ -1046,6 +1148,7 @@ mod tests {
             RegisteredGoal::from_parts(
                 same_tick.id(),
                 same_tick.workspace_id(),
+                same_tick.activity_id(),
                 same_tick.contract().clone(),
                 same_tick.status().clone(),
                 same_tick.timestamps(),
@@ -1138,6 +1241,7 @@ mod tests {
             RegisteredGoal::from_parts(
                 goal.id(),
                 goal.workspace_id(),
+                goal.activity_id(),
                 goal.contract().clone(),
                 GoalStatus::Paused,
                 GoalTimestamps::initial(timestamp(10)?),
@@ -1150,6 +1254,7 @@ mod tests {
         let reopened = RegisteredGoal::from_parts(
             paused.id(),
             paused.workspace_id(),
+            paused.activity_id(),
             paused.contract().clone(),
             paused.status().clone(),
             paused.timestamps(),

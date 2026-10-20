@@ -25,8 +25,7 @@ use forge_domain::{
     DiffArtifactInventoryEntry, DiffArtifactInventoryLimit, DiffEvidenceState, DiffId,
 };
 use forge_persistence::{
-    DiffDoctorArtifactReference, DiffDoctorLifecycle, DiffDoctorReference, WorkspaceDoctorReport,
-    WorkspaceStore,
+    DiffDoctorArtifactReference, DiffDoctorReference, WorkspaceDoctorReport, WorkspaceStore,
 };
 use forge_workspace::{
     ConfinedWorkspace, DiffArtifactExpectation, DiffArtifactStore, GitLocalStateDoctor,
@@ -297,7 +296,7 @@ fn aggregate_outcome(
 }
 
 impl ForgeControl {
-    /// Observe one exact Workspace without migration, reconciliation, or
+    /// Observe one exact Workspace without schema rewriting, reconciliation, or
     /// filesystem/database mutation.
     pub fn workspace_doctor(
         &self,
@@ -474,8 +473,25 @@ fn classify_database_reference(
     let id = reference.diff_id();
     let same_id_names: &[forge_domain::DiffArtifactInventoryName] =
         inventory_names_by_id.get(&id).map_or(&[], Vec::as_slice);
-    match reference.lifecycle() {
-        DiffDoctorLifecycle::Legacy { .. } => {
+    match reference.state() {
+        DiffEvidenceState::Intent => classify_intent(reference, artifacts, matched_names),
+        DiffEvidenceState::Ready => classify_final(
+            id,
+            reference.final_artifact(),
+            artifacts,
+            matched_names,
+            false,
+        ),
+        DiffEvidenceState::PurgePending => classify_final(
+            id,
+            reference.final_artifact(),
+            artifacts,
+            matched_names,
+            true,
+        ),
+        DiffEvidenceState::SummaryOnly
+        | DiffEvidenceState::Abandoned
+        | DiffEvidenceState::Tombstoned => {
             if same_id_names.is_empty() {
                 Ok(WorkspaceDiffArtifactStatus::NotApplicable)
             } else {
@@ -483,33 +499,6 @@ fn classify_database_reference(
                 Ok(WorkspaceDiffArtifactStatus::Conflicting)
             }
         }
-        DiffDoctorLifecycle::Evidence { state, .. } => match state {
-            DiffEvidenceState::Intent => classify_intent(reference, artifacts, matched_names),
-            DiffEvidenceState::Ready => classify_final(
-                id,
-                reference.final_artifact(),
-                artifacts,
-                matched_names,
-                false,
-            ),
-            DiffEvidenceState::PurgePending => classify_final(
-                id,
-                reference.final_artifact(),
-                artifacts,
-                matched_names,
-                true,
-            ),
-            DiffEvidenceState::SummaryOnly
-            | DiffEvidenceState::Abandoned
-            | DiffEvidenceState::Tombstoned => {
-                if same_id_names.is_empty() {
-                    Ok(WorkspaceDiffArtifactStatus::NotApplicable)
-                } else {
-                    matched_names.extend(same_id_names.iter().cloned());
-                    Ok(WorkspaceDiffArtifactStatus::Conflicting)
-                }
-            }
-        },
     }
 }
 
@@ -593,25 +582,30 @@ mod tests {
     use std::os::unix::fs::symlink;
     use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use forge_domain::{
-        ChangeSetId, CheckpointId, DagAcceptanceCriterion, DagNodeDefinition, DagNodeId,
-        DagNodeObjective, DagNodeOrdinal, DagNodeTitle, DagRevision, DagRevisionId,
-        DagRevisionNumber, DiffId, EstablishWorkspace, FileMutationId, FileMutationKind,
-        FileMutationPlan, FilePrecondition, GoalContract, GoalId, GoalObjective, GoalStatement,
-        LocationId, LocationRevision, RegisteredCheckpoint, RegisteredDagNode, RegisteredGoal,
-        RuntimeInstanceId, TimestampMillis, WorkspaceId, WorkspaceRelativePath, WorkspaceRevision,
-        WorkspaceRoot,
+        AgentSessionId, AgentSessionOpenRequestId, ChangeSetId, CheckpointId,
+        DagAcceptanceCriterion, DagNodeDefinition, DagNodeId, DagNodeObjective, DagNodeOrdinal,
+        DagNodeTitle, DagRevision, DagRevisionId, DagRevisionNumber, DiffId, EstablishWorkspace,
+        FileMutationId, FileMutationKind, FileMutationPlan, FilePrecondition, GoalContract, GoalId,
+        GoalObjective, GoalStatement, LocationId, LocationRevision, OpenAgentSession,
+        RegisteredCheckpoint, RegisteredDagNode, RegisteredGoal, RuntimeInstanceId,
+        TimestampMillis, WorkspaceId, WorkspaceRelativePath, WorkspaceRevision, WorkspaceRoot,
     };
     use forge_persistence::{DAG_DOCTOR_MAX_CURRENT_DAGS, GlobalRegistry};
     use forge_workspace::{
-        CheckpointSide, ExistingWorkspaceStateLayout, GitCheckpointRefInventoryLimit,
-        GitCheckpointStore, GitCheckpointStoreIntegrity, LocationService, WorkspaceStateLayout,
+        CheckpointSide, ExistingWorkspaceStateLayout, FORGE_GIT_PROGRAM,
+        GitCheckpointRefInventoryLimit, GitCheckpointStore, GitCheckpointStoreIntegrity,
+        LocationService, WorkspaceStateLayout,
     };
     use uuid::Uuid;
 
     use super::*;
-    use crate::filesystem::{FileActivityScope, FileMutationRequest, FileMutationStatus};
+    use crate::filesystem::{
+        FileActivityScope, FileMutationRequest, FileMutationStatus,
+        source_write_test_support::seed_source_write_authority,
+    };
 
     static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
 
@@ -624,6 +618,18 @@ mod tests {
 
     fn timestamp(value: i64) -> Result<TimestampMillis, Box<dyn std::error::Error>> {
         Ok(TimestampMillis::new(value)?)
+    }
+
+    fn timestamp_now() -> Result<TimestampMillis, Box<dyn std::error::Error>> {
+        let millis = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())?;
+        Ok(TimestampMillis::new(millis)?)
+    }
+
+    fn live_lease_window() -> Result<(TimestampMillis, TimestampMillis), Box<dyn std::error::Error>>
+    {
+        let observed_at = timestamp_now()?;
+        let lease_until = TimestampMillis::new(observed_at.get() + 60_000)?;
+        Ok((observed_at, lease_until))
     }
 
     fn fixture(label: &str) -> Result<Fixture, Box<dyn std::error::Error>> {
@@ -657,7 +663,7 @@ mod tests {
         drop(store);
         let control = ForgeControl::new(GlobalRegistry::open(&registry_path)?);
         let locator = control
-            .workspace_list(location.id(), LocationRevision::INITIAL)?
+            .workspace_discover(location.id(), LocationRevision::INITIAL)?
             .into_iter()
             .find(|entry| entry.display_name() == "workspace-0")
             .ok_or("workspace locator missing")?
@@ -676,7 +682,7 @@ mod tests {
     fn initialize_git_fixture(
         fixture: &Fixture,
     ) -> Result<WorkspaceStateLayout, Box<dyn std::error::Error>> {
-        let output = Command::new("/usr/bin/git")
+        let output = Command::new(FORGE_GIT_PROGRAM)
             .arg("-C")
             .arg(&fixture.workspace_root)
             .args(["init", "-q"])
@@ -700,25 +706,38 @@ mod tests {
         let _layout = initialize_git_fixture(fixture)?;
         let activity_id = forge_domain::ActivityId::from_uuid(Uuid::from_u128(0xF200 + seed));
         let runtime_id = RuntimeInstanceId::from_uuid(Uuid::from_u128(0xF300 + seed));
+        let (admitted_at, lease_until) = live_lease_window()?;
         let activity = fixture.control.bootstrap_activity(
             &fixture.scope,
             activity_id,
             runtime_id,
-            timestamp(10)?,
-            timestamp(1_000)?,
+            admitted_at,
+            lease_until,
         )?;
         if activity.activity().is_none() {
             return Err("checkpoint Doctor Activity missing".into());
         }
+        let mutation_at = timestamp(20)?;
+        let write_authority = seed_source_write_authority(
+            &fixture.control,
+            &fixture.scope,
+            &crate::filesystem::source_write_test_support::SourceWriteTestRequest::new(
+                activity_id,
+                mutation_at,
+                0xD0C7_0000_u128.wrapping_add(seed.wrapping_mul(0x10)),
+                &[name],
+            ),
+        )?;
         let change_set_id = ChangeSetId::from_uuid(Uuid::from_u128(0xF400 + seed));
         let request = FileMutationRequest {
             scope: fixture.scope.clone(),
             activity: FileActivityScope {
                 activity_id,
                 runtime_instance_id: runtime_id,
-                observed_at: timestamp(20)?,
+                observed_at: mutation_at,
             },
             goal: None,
+            write_authority,
             change_set_id,
             mutation_id: FileMutationId::from_uuid(Uuid::from_u128(0xF500 + seed)),
             plan: FileMutationPlan::new(
@@ -777,9 +796,64 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn workspace_doctor_marks_truncated_current_dag_observation_incomplete()
     -> Result<(), Box<dyn std::error::Error>> {
         let fixture = fixture("dag-truncated")?;
+        let activity_id = forge_domain::ActivityId::from_uuid(Uuid::from_u128(0xDAD0));
+        let (admitted_at, lease_until) = live_lease_window()?;
+        let _ = fixture.control.bootstrap_activity(
+            &fixture.scope,
+            activity_id,
+            RuntimeInstanceId::from_uuid(Uuid::from_u128(0xDAD1)),
+            admitted_at,
+            lease_until,
+        )?;
+        let coordinator_agent_id =
+            forge_domain::AgentInstanceId::from_uuid(Uuid::from_u128(0xDAD2));
+        let coordinator_session_id = AgentSessionId::from_uuid(coordinator_agent_id.into_uuid());
+        let _session = fixture.control.agent_session_open(&OpenAgentSession::new(
+            coordinator_session_id,
+            AgentSessionOpenRequestId::from_uuid(Uuid::from_u128(0xDAD3)),
+            forge_domain::AuthenticatedPrincipal::TrustedStdio,
+            timestamp(11)?,
+        ))?;
+        let coordinator_agent = forge_domain::RegisteredAgentInstance::create_bound(
+            coordinator_agent_id,
+            fixture.scope.workspace_id(),
+            activity_id,
+            coordinator_session_id,
+            forge_domain::AgentDisplayName::new("Doctor Coordinator".to_owned())?,
+            forge_domain::AgentDeclaredRole::new("coordinator".to_owned())?,
+            forge_domain::AgentTransportKind::Retired,
+            forge_domain::AuthenticatedPrincipal::TrustedStdio,
+            timestamp(11)?,
+        );
+        let _ = crate::legacy_agent_fixture::seed_agent(
+            &fixture.control,
+            &fixture.scope,
+            &coordinator_agent,
+            forge_domain::AgentEventId::from_uuid(Uuid::from_u128(0xDAD4)),
+        )?;
+        let binding = fixture.control.activity_coordinator_claim(
+            &crate::CoordinatorClaimRequest {
+                session_id: coordinator_session_id,
+                scope: fixture.scope.clone(),
+                activity_id,
+                agent_id: coordinator_agent.id(),
+                principal: forge_domain::AuthenticatedPrincipal::TrustedStdio,
+                observed_at: timestamp(12)?,
+            },
+            timestamp_now()?,
+        )?;
+        let actor = forge_domain::ActivityCoordinatorActor::new(
+            fixture.scope.workspace_id(),
+            activity_id,
+            binding.agent_id(),
+            binding.revision(),
+            forge_domain::AuthenticatedPrincipal::TrustedStdio,
+            coordinator_session_id,
+        );
         let existing = WorkspaceStateLayout::inspect_existing(&fixture.workspace_root)?
             .ok_or("Doctor Workspace layout missing")?;
         let mut store = WorkspaceStore::open_existing(&existing)?;
@@ -788,6 +862,7 @@ mod tests {
             let goal = RegisteredGoal::create(
                 GoalId::from_uuid(Uuid::from_u128(0xDA00 + seed)),
                 fixture.scope.workspace_id(),
+                activity_id,
                 GoalContract::new(
                     GoalObjective::new(format!("Doctor DAG {offset}"))?,
                     vec![GoalStatement::new(
@@ -800,7 +875,7 @@ mod tests {
                 )?,
                 timestamp(100 + i64::try_from(offset)?)?,
             );
-            let _ = store.insert_goal(&goal)?;
+            let _ = store.insert_goal(actor, &goal, timestamp_now()?)?;
             let definition = DagNodeDefinition::new(
                 DagNodeId::from_uuid(Uuid::from_u128(0xDB00 + seed)),
                 DagNodeOrdinal::new(0)?,
@@ -903,23 +978,35 @@ mod tests {
         let fixture = fixture("diff-join")?;
         let activity_id = forge_domain::ActivityId::from_uuid(Uuid::from_u128(0xF100));
         let runtime_id = RuntimeInstanceId::from_uuid(Uuid::from_u128(0xF101));
+        let (admitted_at, lease_until) = live_lease_window()?;
         let activity = fixture.control.bootstrap_activity(
             &fixture.scope,
             activity_id,
             runtime_id,
-            timestamp(10)?,
-            timestamp(1_000)?,
+            admitted_at,
+            lease_until,
         )?;
         let activity_scope = FileActivityScope {
             activity_id,
             runtime_instance_id: runtime_id,
             observed_at: timestamp(20)?,
         };
+        let write_authority = seed_source_write_authority(
+            &fixture.control,
+            &fixture.scope,
+            &crate::filesystem::source_write_test_support::SourceWriteTestRequest::new(
+                activity_id,
+                activity_scope.observed_at,
+                0xD0C7_F100,
+                &["doctor-diff.txt"],
+            ),
+        )?;
         let change_set_id = ChangeSetId::from_uuid(Uuid::from_u128(0xF102));
         let mutation = FileMutationRequest {
             scope: fixture.scope.clone(),
             activity: activity_scope,
             goal: None,
+            write_authority,
             change_set_id,
             mutation_id: FileMutationId::from_uuid(Uuid::from_u128(0xF103)),
             plan: FileMutationPlan::new(
@@ -979,7 +1066,7 @@ mod tests {
     fn workspace_doctor_projects_missing_git_local_exclude_without_repair()
     -> Result<(), Box<dyn std::error::Error>> {
         let fixture = fixture("git-missing")?;
-        let status = Command::new("git")
+        let status = Command::new(FORGE_GIT_PROGRAM)
             .args(["init", "--quiet"])
             .current_dir(&fixture.workspace_root)
             .status()?;

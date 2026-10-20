@@ -996,6 +996,7 @@ impl ReconcileExpiredActivities {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BootstrapActivityDecision {
     Create,
+    ResumeReleased,
     AlreadyOwned,
     AlreadyLive,
     ExpiredRecoveryRequired,
@@ -1046,6 +1047,11 @@ pub fn decide_bootstrap_activity(
                 }
             } else if activity.lease_until().is_some() {
                 BootstrapActivityDecision::ExpiredRecoveryRequired
+            } else if activity.lease_revision() != ActivityLeaseRevision::INITIAL {
+                // The initial unleased revision is also produced by raw Activity creation and
+                // remains recovery-required. Only a higher unleased revision can come from
+                // the explicit release transition while the Activity remains Open.
+                BootstrapActivityDecision::ResumeReleased
             } else {
                 BootstrapActivityDecision::UnleasedRecoveryRequired
             }

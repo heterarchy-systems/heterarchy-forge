@@ -1,6 +1,9 @@
 use forge_domain::{
-    DagAcceptanceCriterion, DagNodeObjective, DagNodeOrdinal, DagNodeTitle, GoalContract,
-    GoalObjective, GoalRevision, GoalStatement, RegisteredGoal, WorkspaceId,
+    ActivityId, AgentDeclaredRole, AgentDisplayName, AgentInstanceId, AgentSessionId,
+    AgentTransportKind, AuthenticatedPrincipal, DagAcceptanceCriterion, DagNodeObjective,
+    DagNodeOrdinal, DagNodeTitle, DirectTokenId, ExecutionId, GoalContract, GoalEvidenceRef,
+    GoalNodeAttribution, GoalObjective, GoalRevision, GoalStatement, RegisteredAgentInstance,
+    RegisteredGoal, WorkspaceId,
 };
 use uuid::Uuid;
 
@@ -10,22 +13,63 @@ fn timestamp(value: i64) -> Result<TimestampMillis, Box<dyn std::error::Error>> 
     Ok(TimestampMillis::new(value)?)
 }
 
+fn node_transition(
+    goal: &RegisteredGoal,
+    dag_revision: DagRevisionNumber,
+    node: &RegisteredDagNode,
+    observed_at: TimestampMillis,
+) -> DagNodeTransition {
+    DagNodeTransition::new(
+        DagTransitionScope::new(
+            goal.workspace_id(),
+            goal.activity_id(),
+            goal.id(),
+            goal.revision(),
+            dag_revision,
+        ),
+        node.id(),
+        node.revision(),
+        observed_at,
+    )
+}
+
 fn repository() -> Result<(Connection, RegisteredGoal), Box<dyn std::error::Error>> {
     let mut connection = Connection::open_in_memory()?;
     connection.execute_batch(
         "PRAGMA foreign_keys = ON;
-             CREATE TABLE workspace(workspace_id BLOB PRIMARY KEY);",
+             CREATE TABLE workspace(workspace_id BLOB PRIMARY KEY);
+             CREATE TABLE activities(
+                activity_id BLOB PRIMARY KEY NOT NULL,
+                workspace_id BLOB NOT NULL REFERENCES workspace(workspace_id),
+                state INTEGER NOT NULL,
+                lease_owner_id BLOB,
+                lease_until_ms INTEGER
+             );",
     )?;
     let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(1));
     connection.execute(
         "INSERT INTO workspace(workspace_id) VALUES (?1)",
         params![workspace_id.into_uuid().as_bytes()],
     )?;
+    let activity_id = ActivityId::from_uuid(Uuid::from_u128(3));
+    connection.execute(
+        "INSERT INTO activities(activity_id, workspace_id, state, lease_owner_id, lease_until_ms) VALUES (?1, ?2, 1, ?3, 100)",
+        params![
+            activity_id.into_uuid().as_bytes(),
+            workspace_id.into_uuid().as_bytes(),
+            Uuid::from_u128(0x7003).as_bytes(),
+        ],
+    )?;
     workspace_goals::create_schema(&connection)?;
     create_schema(&connection)?;
+    crate::workspace_semantic_events::create_schema(&connection)?;
+    crate::workspace_goal_creation_watermarks::create_schema(&connection)?;
+    crate::workspace_goal_deletion::create_schema(&connection)?;
+    crate::workspace_work_cuts::create_schema(&connection)?;
     let goal = RegisteredGoal::create(
         GoalId::from_uuid(Uuid::from_u128(2)),
         workspace_id,
+        activity_id,
         GoalContract::new(
             GoalObjective::new("Implement versioned DAG persistence".to_owned())?,
             vec![GoalStatement::new("DAG round-trips".to_owned())?],
@@ -38,6 +82,35 @@ fn repository() -> Result<(Connection, RegisteredGoal), Box<dyn std::error::Erro
     );
     let _ = workspace_goals::insert_goal(&mut connection, &goal)?;
     Ok((connection, goal))
+}
+
+fn authorized_repository()
+-> Result<(Connection, RegisteredGoal, RegisteredAgentInstance), Box<dyn std::error::Error>> {
+    let (connection, goal) = repository()?;
+    crate::workspace_agents::create_schema(&connection)?;
+    crate::workspace_agent_events::create_schema(&connection)?;
+    crate::workspace_coordinators::create_schema(&connection)?;
+    let agent = RegisteredAgentInstance::create_bound(
+        AgentInstanceId::from_uuid(Uuid::from_u128(0x7001)),
+        goal.workspace_id(),
+        goal.activity_id(),
+        AgentSessionId::from_uuid(Uuid::from_u128(0x7002)),
+        AgentDisplayName::new("DAG Agent".to_owned())?,
+        AgentDeclaredRole::new("worker".to_owned())?,
+        AgentTransportKind::Stdio,
+        AuthenticatedPrincipal::TrustedStdio,
+        timestamp(1)?,
+    );
+    crate::legacy_agent_seed::seed_agent(
+        &connection,
+        &agent,
+        Some(crate::workspace_agent_events::derived_event_id(
+            agent.id(),
+            agent.revision(),
+            forge_domain::AgentEventKind::Joined,
+        )),
+    )?;
+    Ok((connection, goal, agent))
 }
 
 fn definition(id: u128, ordinal: u16) -> Result<DagNodeDefinition, Box<dyn std::error::Error>> {
@@ -210,10 +283,7 @@ fn current_head_node_transitions_recompute_readiness_and_are_cas_guarded()
     assert!(matches!(
         start_node(
             &mut connection,
-            goal.id(),
-            b.id(),
-            DagNodeRevision::INITIAL,
-            timestamp(20)?
+            node_transition(&goal, revision.number(), &nodes[1], timestamp(20)?),
         ),
         Err(DagStoreError::Transition(
             forge_domain::DagNodeTransitionError::NotReady
@@ -221,10 +291,7 @@ fn current_head_node_transitions_recompute_readiness_and_are_cas_guarded()
     ));
     let active_a = start_node(
         &mut connection,
-        goal.id(),
-        a.id(),
-        DagNodeRevision::INITIAL,
-        timestamp(20)?,
+        node_transition(&goal, revision.number(), &nodes[0], timestamp(20)?),
     )?;
     let completed_a = active_a.complete(active_a.revision(), timestamp(21)?)?;
     assert_eq!(
@@ -233,16 +300,130 @@ fn current_head_node_transitions_recompute_readiness_and_are_cas_guarded()
     );
     let active_b = start_node(
         &mut connection,
-        goal.id(),
-        b.id(),
-        DagNodeRevision::INITIAL,
-        timestamp(22)?,
+        node_transition(&goal, revision.number(), &nodes[1], timestamp(22)?),
     )?;
     assert_eq!(active_b.lifecycle(), &DagNodeLifecycle::Active);
     assert!(matches!(
         update_node(&mut connection, &active_b, active_b.revision()),
         Err(DagStoreError::NodeConflict)
     ));
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "One regression covers session fences and atomic DAG-node transition rollback."
+)]
+#[test]
+fn authorized_node_transitions_require_current_attached_session_and_roll_back()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (mut connection, goal, agent) = authorized_repository()?;
+    let first = definition(60, 0)?;
+    let second = definition(61, 1)?;
+    let (revision, nodes) = revision(&goal, 1, vec![first, second], Vec::new())?;
+    let _ = insert_revision(&mut connection, &revision, &nodes, &[], None)?;
+
+    let unresolved_session = AgentSessionId::from_uuid(Uuid::from_u128(0x7003));
+    assert!(matches!(
+        start_node_authorized(
+            &mut connection,
+            node_transition(&goal, revision.number(), &nodes[0], timestamp(20)?),
+            unresolved_session,
+            agent.principal(),
+            timestamp(99)?,
+        ),
+        Err(DagStoreError::AgentAuthorizationConflict)
+    ));
+
+    let foreign_principal =
+        AuthenticatedPrincipal::DirectToken(DirectTokenId::from_uuid(Uuid::from_u128(0x7004)));
+    assert!(matches!(
+        start_node_authorized(
+            &mut connection,
+            node_transition(&goal, revision.number(), &nodes[0], timestamp(21)?),
+            agent.session_id().ok_or("agent session missing")?,
+            foreign_principal,
+            timestamp(99)?,
+        ),
+        Err(DagStoreError::AgentAuthorizationConflict)
+    ));
+
+    let stale = DagNodeTransition::new(
+        DagTransitionScope::new(
+            goal.workspace_id(),
+            goal.activity_id(),
+            goal.id(),
+            goal.revision(),
+            revision.number(),
+        ),
+        nodes[0].id(),
+        DagNodeRevision::new(2)?,
+        timestamp(22)?,
+    );
+    assert!(matches!(
+        start_node_authorized(
+            &mut connection,
+            stale,
+            agent.session_id().ok_or("agent session missing")?,
+            agent.principal(),
+            timestamp(99)?,
+        ),
+        Err(DagStoreError::Transition(
+            forge_domain::DagNodeTransitionError::RevisionConflict
+        ))
+    ));
+
+    let active = start_node_authorized(
+        &mut connection,
+        node_transition(&goal, revision.number(), &nodes[0], timestamp(23)?),
+        agent.session_id().ok_or("agent session missing")?,
+        agent.principal(),
+        timestamp(99)?,
+    )?;
+    assert_eq!(active.lifecycle(), &DagNodeLifecycle::Active);
+    let completed = complete_node_authorized(
+        &mut connection,
+        DagNodeTransition::new(
+            DagTransitionScope::new(
+                goal.workspace_id(),
+                goal.activity_id(),
+                goal.id(),
+                goal.revision(),
+                revision.number(),
+            ),
+            active.id(),
+            active.revision(),
+            timestamp(24)?,
+        ),
+        agent.session_id().ok_or("agent session missing")?,
+        agent.principal(),
+        timestamp(99)?,
+    )?;
+    assert_eq!(completed.lifecycle(), &DagNodeLifecycle::Completed);
+
+    connection.execute(
+        "UPDATE agent_instances SET attachment_state = 1, revision = 2 WHERE agent_id = ?1",
+        params![agent.id().into_uuid().as_bytes()],
+    )?;
+    assert!(matches!(
+        start_node_authorized(
+            &mut connection,
+            node_transition(&goal, revision.number(), &nodes[1], timestamp(25)?),
+            agent.session_id().ok_or("agent session missing")?,
+            agent.principal(),
+            timestamp(99)?,
+        ),
+        Err(DagStoreError::AgentAuthorizationConflict)
+    ));
+
+    let current = get_current(&connection, goal.id())?.ok_or("current DAG missing")?;
+    let second = current
+        .nodes()
+        .iter()
+        .find(|node| node.id() == nodes[1].id())
+        .ok_or("second node missing")?;
+    assert_eq!(second.lifecycle(), &DagNodeLifecycle::Pending);
+    assert_eq!(second.revision(), DagNodeRevision::INITIAL);
     Ok(())
 }
 
@@ -255,10 +436,7 @@ fn completed_node_evidence_is_carried_into_the_new_revision()
     let _ = insert_revision(&mut connection, &first, &first_nodes, &[], None)?;
     let active = start_node(
         &mut connection,
-        goal.id(),
-        a.id(),
-        DagNodeRevision::INITIAL,
-        timestamp(20)?,
+        node_transition(&goal, first.number(), &first_nodes[0], timestamp(20)?),
     )?;
     let completed = active.complete(active.revision(), timestamp(21)?)?;
     let completed = update_node(&mut connection, &completed, active.revision())?;
@@ -304,6 +482,85 @@ fn completed_node_evidence_is_carried_into_the_new_revision()
         |row| row.get(0),
     )?;
     assert_eq!(count, 1);
+    Ok(())
+}
+
+#[test]
+fn node_evidence_association_allows_goal_bound_refs_beyond_old_node_cap_and_exact_retry()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (mut connection, goal) = repository()?;
+    let node_definition = definition(0x4600, 0)?;
+    let (dag, nodes) = revision(&goal, 1, vec![node_definition], Vec::new())?;
+    let _ = insert_revision(&mut connection, &dag, &nodes, &[], None)?;
+    let active = start_node(
+        &mut connection,
+        node_transition(&goal, dag.number(), &nodes[0], timestamp(20)?),
+    )?;
+    let attribution = GoalNodeAttribution::new(
+        goal.id(),
+        goal.revision(),
+        dag.number(),
+        active.id(),
+        active.revision(),
+    );
+    let evidence: Vec<_> = (0..33_u128)
+        .map(|index| {
+            GoalEvidenceRef::Execution(ExecutionId::from_uuid(Uuid::from_u128(0x4700 + index)))
+        })
+        .collect();
+    for (index, evidence) in evidence.iter().copied().enumerate() {
+        let (kind, id) = workspace_goals::encode_evidence(evidence);
+        connection.execute(
+            "INSERT INTO goal_evidence_refs (
+                    goal_id, evidence_kind, evidence_id, associated_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                goal.id().into_uuid().as_bytes(),
+                kind,
+                id.as_slice(),
+                30 + i64::try_from(index)?
+            ],
+        )?;
+        let transaction = connection.transaction()?;
+        associate_node_evidence_in_transaction(
+            &transaction,
+            Some(attribution),
+            evidence,
+            timestamp(30 + i64::try_from(index)?)?,
+        )?;
+        transaction.commit()?;
+    }
+    let count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM goal_dag_node_evidence_refs
+         WHERE goal_id = ?1 AND dag_revision = ?2 AND node_id = ?3",
+        params![
+            goal.id().into_uuid().as_bytes(),
+            dag.number().get(),
+            active.id().into_uuid().as_bytes()
+        ],
+        |row| row.get(0),
+    )?;
+    assert_eq!(count, 33);
+
+    let transaction = connection.transaction()?;
+    associate_node_evidence_in_transaction(
+        &transaction,
+        Some(attribution),
+        evidence[0],
+        timestamp(100)?,
+    )?;
+    transaction.commit()?;
+    let retry_count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM goal_dag_node_evidence_refs
+         WHERE goal_id = ?1 AND dag_revision = ?2 AND node_id = ?3",
+        params![
+            goal.id().into_uuid().as_bytes(),
+            dag.number().get(),
+            active.id().into_uuid().as_bytes()
+        ],
+        |row| row.get(0),
+    )?;
+    assert_eq!(retry_count, 33);
     Ok(())
 }
 
@@ -385,10 +642,7 @@ fn completed_carry_requires_durable_parent_evidence() -> Result<(), Box<dyn std:
     let _ = insert_revision(&mut connection, &first, &first_nodes, &[], None)?;
     let active = start_node(
         &mut connection,
-        goal.id(),
-        a.id(),
-        DagNodeRevision::INITIAL,
-        timestamp(20)?,
+        node_transition(&goal, first.number(), &first_nodes[0], timestamp(20)?),
     )?;
     let completed = active.complete(active.revision(), timestamp(21)?)?;
     let _ = update_node(&mut connection, &completed, active.revision())?;
@@ -661,6 +915,7 @@ fn current_dag_doctor_is_bounded_and_deterministic() -> Result<(), Box<dyn std::
         let goal = RegisteredGoal::create(
             GoalId::from_uuid(Uuid::from_u128(0xE000 + seed)),
             first_goal.workspace_id(),
+            first_goal.activity_id(),
             GoalContract::new(
                 GoalObjective::new(format!("Doctor bounded Goal {offset}"))?,
                 vec![GoalStatement::new("DAG remains valid".to_owned())?],

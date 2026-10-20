@@ -5,11 +5,89 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
-    ActivityId, ExecutionId, ExecutionPermissions, ExecutionRequestDigest, TimestampMillis,
-    WorkspaceId,
+    ActivityId, AuthenticatedPrincipal, ExecutionAgentProvenance, ExecutionId,
+    ExecutionPermissions, ExecutionRequestDigest, TimestampMillis, WorkspaceId,
 };
 
 const MAX_AUTO_APPROVAL_USES: u16 = 1_000;
+pub const APPROVAL_AGENT_BINDING_DIGEST_BYTES: usize = 32;
+const APPROVAL_AGENT_BINDING_DOMAIN: &[u8] = b"heterarchy-forge:approval-agent-binding:v2\0";
+
+/// Stable, secret-free digest binding a durable approval to one exact Agent
+/// execution provenance.
+///
+/// The approval record already binds Workspace, Activity, execution request,
+/// action class, and permissions. This digest adds the exact Agent revision,
+/// stable authenticated principal, Goal/DAG/node fence, and discovered command
+/// identity so a retry cannot replace a pending approval's authority payload.
+#[must_use]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ApprovalAgentBindingDigest([u8; APPROVAL_AGENT_BINDING_DIGEST_BYTES]);
+
+impl ApprovalAgentBindingDigest {
+    pub fn from_provenance(provenance: &ExecutionAgentProvenance) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(APPROVAL_AGENT_BINDING_DOMAIN);
+        hasher.update(provenance.execution_id().into_uuid().as_bytes());
+        hasher.update(provenance.agent_id().into_uuid().as_bytes());
+        hasher.update(&provenance.agent_revision().get().to_le_bytes());
+        match provenance.session_id() {
+            Some(session_id) => {
+                hasher.update(&[1]);
+                hasher.update(session_id.into_uuid().as_bytes());
+            }
+            None => {
+                hasher.update(&[0]);
+            }
+        }
+        match provenance.principal() {
+            AuthenticatedPrincipal::TrustedStdio => {
+                hasher.update(&[0]);
+            }
+            AuthenticatedPrincipal::DirectToken(id) => {
+                hasher.update(&[1]);
+                hasher.update(id.into_uuid().as_bytes());
+            }
+            AuthenticatedPrincipal::OAuthGrant(id) => {
+                hasher.update(&[2]);
+                hasher.update(id.into_uuid().as_bytes());
+            }
+        }
+        let attribution = provenance.attribution();
+        hasher.update(attribution.goal_id().into_uuid().as_bytes());
+        hasher.update(&attribution.expected_goal_revision().get().to_le_bytes());
+        hasher.update(&attribution.dag_revision().get().to_le_bytes());
+        hasher.update(attribution.node_id().into_uuid().as_bytes());
+        hasher.update(&attribution.expected_node_revision().get().to_le_bytes());
+        let command = provenance.command_id().as_str().as_bytes();
+        hasher.update(command);
+        if let Some(evidence) = provenance.project_command() {
+            hasher.update(&[1]);
+            hasher.update(&[match evidence.class() {
+                crate::ProjectCommandClass::Verify => 0,
+                crate::ProjectCommandClass::GeneratedPackage => 1,
+            }]);
+            hasher.update(evidence.catalog_fingerprint().hash().as_bytes());
+        }
+        Self(*hasher.finalize().as_bytes())
+    }
+
+    pub const fn from_bytes(bytes: [u8; APPROVAL_AGENT_BINDING_DIGEST_BYTES]) -> Self {
+        Self(bytes)
+    }
+
+    pub const fn as_bytes(self) -> [u8; APPROVAL_AGENT_BINDING_DIGEST_BYTES] {
+        self.0
+    }
+}
+
+impl fmt::Debug for ApprovalAgentBindingDigest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ApprovalAgentBindingDigest")
+            .finish_non_exhaustive()
+    }
+}
 
 macro_rules! uuid_id {
     ($name:ident, $error:ident, $message:literal) => {
@@ -134,6 +212,10 @@ pub enum ExecutionActionClass {
     DirectStructured,
     DiscoveredProjectCommand,
     ShellEscape,
+    AnalyzedShell,
+    /// Sealed package command. It uses the `DirectStructured` policy rule so
+    /// every package still asks, while retaining separate durable identity.
+    GeneratedProjectCommand,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -236,8 +318,10 @@ impl WorkspacePolicy {
 
     pub const fn rule_for_action(&self, action: ExecutionActionClass) -> ExecutionPolicyRule {
         match action {
-            ExecutionActionClass::DirectStructured => self.direct_structured,
-            ExecutionActionClass::DiscoveredProjectCommand => self.discovered_command,
+            ExecutionActionClass::DirectStructured
+            | ExecutionActionClass::GeneratedProjectCommand => self.direct_structured,
+            ExecutionActionClass::DiscoveredProjectCommand
+            | ExecutionActionClass::AnalyzedShell => self.discovered_command,
             ExecutionActionClass::ShellEscape => self.shell_escape,
         }
     }
@@ -522,6 +606,50 @@ impl ExecutionGrant {
             ..self.clone()
         })
     }
+
+    pub fn revoke(
+        &self,
+        expected_revision: ExecutionGrantRevision,
+    ) -> Result<Self, ApprovalDomainError> {
+        if self.state != ExecutionGrantState::Active {
+            return Err(ApprovalDomainError::GrantUnavailable);
+        }
+        if self.revision != expected_revision {
+            return Err(ApprovalDomainError::RevisionConflict);
+        }
+        Ok(Self {
+            state: ExecutionGrantState::Revoked,
+            revision: self
+                .revision
+                .checked_next()
+                .map_err(|_| ApprovalDomainError::RevisionOverflow)?,
+            ..self.clone()
+        })
+    }
+
+    pub fn expire(
+        &self,
+        expected_revision: ExecutionGrantRevision,
+        observed_at: TimestampMillis,
+    ) -> Result<Self, ApprovalDomainError> {
+        if observed_at.get() < self.expires_at.get() {
+            return Err(ApprovalDomainError::NotExpired);
+        }
+        if self.state != ExecutionGrantState::Active {
+            return Err(ApprovalDomainError::GrantUnavailable);
+        }
+        if self.revision != expected_revision {
+            return Err(ApprovalDomainError::RevisionConflict);
+        }
+        Ok(Self {
+            state: ExecutionGrantState::Expired,
+            revision: self
+                .revision
+                .checked_next()
+                .map_err(|_| ApprovalDomainError::RevisionOverflow)?,
+            ..self.clone()
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -531,8 +659,10 @@ pub enum AutoApprovalScopeState {
     Expired,
 }
 
+/// A validated finite count, or an explicitly unlimited count. Absence is
+/// confined to this private representation; zero is never an unlimited sentinel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct AutoApprovalUseLimit(u16);
+pub struct AutoApprovalUseLimit(Option<u16>);
 
 impl AutoApprovalUseLimit {
     pub const fn new(value: u16) -> Result<Self, ApprovalDomainError> {
@@ -542,12 +672,25 @@ impl AutoApprovalUseLimit {
                 maximum: MAX_AUTO_APPROVAL_USES,
             })
         } else {
-            Ok(Self(value))
+            Ok(Self(Some(value)))
         }
     }
 
-    pub const fn get(self) -> u16 {
+    pub const fn unlimited() -> Self {
+        Self(None)
+    }
+
+    /// `None` means unlimited, not an omitted or unvalidated finite policy.
+    pub const fn get(self) -> Option<u16> {
         self.0
+    }
+
+    pub const fn is_unlimited(self) -> bool {
+        self.0.is_none()
+    }
+
+    pub fn permits(self, used_count: u64) -> bool {
+        self.0.is_none_or(|limit| used_count < u64::from(limit))
     }
 }
 
@@ -562,7 +705,7 @@ pub struct AutoApprovalScope {
     policy_revision: PolicyRevision,
     expires_at: TimestampMillis,
     max_uses: AutoApprovalUseLimit,
-    used_count: u16,
+    used_count: u32,
     state: AutoApprovalScopeState,
     revision: AutoApprovalScopeRevision,
 }
@@ -605,11 +748,14 @@ impl AutoApprovalScope {
         policy_revision: PolicyRevision,
         expires_at: TimestampMillis,
         max_uses: AutoApprovalUseLimit,
-        used_count: u16,
+        used_count: u32,
         state: AutoApprovalScopeState,
         revision: AutoApprovalScopeRevision,
     ) -> Result<Self, ApprovalDomainError> {
-        if used_count > max_uses.get() {
+        if max_uses
+            .get()
+            .is_some_and(|limit| used_count > u32::from(limit))
+        {
             return Err(ApprovalDomainError::UseCountOverflow);
         }
         Ok(Self {
@@ -659,7 +805,7 @@ impl AutoApprovalScope {
         self.max_uses
     }
 
-    pub const fn used_count(&self) -> u16 {
+    pub const fn used_count(&self) -> u32 {
         self.used_count
     }
 
@@ -683,7 +829,7 @@ impl AutoApprovalScope {
             && self.action == request.action()
             && self.permission_ceiling.contains(request.requested().get())
             && self.policy_revision == current_policy_revision
-            && self.used_count < self.max_uses.get()
+            && self.max_uses.permits(u64::from(self.used_count))
             && observed_at.get() < self.expires_at.get()
     }
 
@@ -733,6 +879,30 @@ impl AutoApprovalScope {
             ..self.clone()
         })
     }
+
+    pub fn expire(
+        &self,
+        expected_revision: AutoApprovalScopeRevision,
+        observed_at: TimestampMillis,
+    ) -> Result<Self, ApprovalDomainError> {
+        if observed_at.get() < self.expires_at.get() {
+            return Err(ApprovalDomainError::NotExpired);
+        }
+        if self.state != AutoApprovalScopeState::Active {
+            return Err(ApprovalDomainError::AutoScopeMismatch);
+        }
+        if self.revision != expected_revision {
+            return Err(ApprovalDomainError::RevisionConflict);
+        }
+        Ok(Self {
+            state: AutoApprovalScopeState::Expired,
+            revision: self
+                .revision
+                .checked_next()
+                .map_err(|_| ApprovalDomainError::RevisionOverflow)?,
+            ..self.clone()
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -767,6 +937,7 @@ pub struct RegisteredApprovalRequest {
     expires_at: TimestampMillis,
     decided_at: Option<TimestampMillis>,
     revision: ApprovalRevision,
+    agent_binding: Option<ApprovalAgentBindingDigest>,
 }
 
 impl RegisteredApprovalRequest {
@@ -817,7 +988,13 @@ impl RegisteredApprovalRequest {
             expires_at,
             decided_at,
             revision,
+            agent_binding: None,
         })
+    }
+
+    pub fn with_agent_binding(mut self, binding: ApprovalAgentBindingDigest) -> Self {
+        self.agent_binding = Some(binding);
+        self
     }
 
     pub const fn id(&self) -> ApprovalRequestId {
@@ -850,6 +1027,10 @@ impl RegisteredApprovalRequest {
 
     pub const fn revision(&self) -> ApprovalRevision {
         self.revision
+    }
+
+    pub const fn agent_binding(&self) -> Option<ApprovalAgentBindingDigest> {
+        self.agent_binding
     }
 
     pub fn decide(
@@ -966,6 +1147,8 @@ pub enum ApprovalDomainError {
     ApprovalTerminal,
     #[error("approval or grant expired")]
     Expired,
+    #[error("approval or grant has not expired")]
+    NotExpired,
     #[error("execution grant is unavailable")]
     GrantUnavailable,
     #[error("execution grant does not match the request")]
@@ -985,6 +1168,58 @@ pub enum ApprovalDomainError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn approval_provenance(
+        principal: AuthenticatedPrincipal,
+        command: &str,
+    ) -> Result<ExecutionAgentProvenance, Box<dyn std::error::Error>> {
+        Ok(ExecutionAgentProvenance::new(
+            ExecutionId::from_uuid(Uuid::from_u128(91)),
+            crate::AgentInstanceId::from_uuid(Uuid::from_u128(92)),
+            crate::AgentInstanceRevision::INITIAL,
+            principal,
+            crate::GoalNodeAttribution::new(
+                crate::GoalId::from_uuid(Uuid::from_u128(93)),
+                crate::GoalRevision::INITIAL,
+                crate::DagRevisionNumber::INITIAL,
+                crate::DagNodeId::from_uuid(Uuid::from_u128(94)),
+                crate::DagNodeRevision::INITIAL,
+            ),
+            crate::ExecutionCommandId::new(command.to_owned())?,
+            crate::AgentSessionId::from_uuid(Uuid::from_u128(95)),
+        ))
+    }
+
+    #[test]
+    fn approval_agent_binding_is_stable_and_covers_principal_and_command()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let direct = approval_provenance(
+            AuthenticatedPrincipal::DirectToken(crate::DirectTokenId::from_uuid(Uuid::from_u128(
+                95,
+            ))),
+            "make:ci",
+        )?;
+        let same = direct.clone();
+        let oauth = approval_provenance(
+            AuthenticatedPrincipal::OAuthGrant(crate::OAuthGrantId::from_uuid(Uuid::from_u128(95))),
+            "make:ci",
+        )?;
+        let other_command = approval_provenance(direct.principal(), "make:test")?;
+
+        assert_eq!(
+            ApprovalAgentBindingDigest::from_provenance(&direct),
+            ApprovalAgentBindingDigest::from_provenance(&same)
+        );
+        assert_ne!(
+            ApprovalAgentBindingDigest::from_provenance(&direct),
+            ApprovalAgentBindingDigest::from_provenance(&oauth)
+        );
+        assert_ne!(
+            ApprovalAgentBindingDigest::from_provenance(&direct),
+            ApprovalAgentBindingDigest::from_provenance(&other_command)
+        );
+        Ok(())
+    }
 
     fn request(
         workspace: u128,
@@ -1010,6 +1245,7 @@ mod tests {
             WorkspacePolicy::conservative_default(WorkspaceId::from_uuid(Uuid::from_u128(1)));
         for action in [
             ExecutionActionClass::DirectStructured,
+            ExecutionActionClass::GeneratedProjectCommand,
             ExecutionActionClass::ShellEscape,
         ] {
             assert_eq!(
@@ -1100,6 +1336,67 @@ mod tests {
             ),
             ExecutionAuthorizationDecision::ApprovalRequired
         );
+        Ok(())
+    }
+
+    #[test]
+    fn unlimited_count_preserves_expiry_revocation_and_permission_fences()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let original = request(
+            1,
+            2,
+            3,
+            4,
+            ExecutionActionClass::DiscoveredProjectCommand,
+            ExecutionPermissions::new(true, false, false),
+        );
+        let now = TimestampMillis::new(10)?;
+        let mut scope = AutoApprovalScope::active(
+            AutoApprovalScopeId::from_uuid(Uuid::from_u128(17)),
+            original.workspace_id(),
+            Some(original.activity_id()),
+            original.action(),
+            ExecutionPermissions::new(true, false, false),
+            PolicyRevision::INITIAL,
+            TimestampMillis::new(100)?,
+            AutoApprovalUseLimit::unlimited(),
+            AutoApprovalScopeRevision::INITIAL,
+        )?;
+        for _ in 0..32 {
+            scope = scope.consume(original, PolicyRevision::INITIAL, scope.revision(), now)?;
+        }
+        assert_eq!(scope.used_count(), 32);
+        assert_eq!(scope.max_uses().get(), None);
+        assert!(scope.covers(original, PolicyRevision::INITIAL, now));
+        assert!(!scope.covers(
+            original,
+            PolicyRevision::INITIAL,
+            TimestampMillis::new(100)?
+        ));
+        assert!(!scope.covers(original, PolicyRevision::new(2)?, now));
+        let outside = request(
+            9,
+            2,
+            3,
+            4,
+            original.action(),
+            ExecutionPermissions::new(true, false, false),
+        );
+        let network = request(
+            1,
+            2,
+            3,
+            4,
+            original.action(),
+            ExecutionPermissions::new(true, false, true),
+        );
+        assert!(!scope.covers(outside, PolicyRevision::INITIAL, now));
+        assert!(!scope.covers(network, PolicyRevision::INITIAL, now));
+        let revoked = scope.revoke(scope.revision())?;
+        assert!(!revoked.covers(original, PolicyRevision::INITIAL, now));
+        assert!(AutoApprovalUseLimit::new(0).is_err());
+        assert!(AutoApprovalUseLimit::new(10)?.permits(9));
+        assert!(!AutoApprovalUseLimit::new(10)?.permits(10));
         Ok(())
     }
 

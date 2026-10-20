@@ -68,6 +68,7 @@ fn fixture()
     )?;
     crate::workspace_approvals::create_schema(&connection)?;
     create_schema(&connection)?;
+    crate::workspace_goal_deletion::create_schema(&connection)?;
     Ok((connection, workspace_id, activity_id, change_set_id))
 }
 
@@ -139,16 +140,6 @@ fn persist_ready_checkpoint(
         &ready,
         CheckpointRevision::INITIAL,
     )?)
-}
-
-fn install_v11_restore_schema(connection: &Connection) -> Result<(), Box<dyn std::error::Error>> {
-    connection.execute_batch("DROP TABLE checkpoint_restores")?;
-    connection.execute_batch(schema::RESTORES_V11_TABLE_SQL)?;
-    connection.execute_batch(schema::RESTORES_WORKSPACE_INDEX_SQL)?;
-    connection.execute_batch(schema::RESTORES_STATE_INDEX_SQL)?;
-    connection.pragma_update(None, "user_version", 11_i64)?;
-    schema::validate_v11(connection)?;
-    Ok(())
 }
 
 #[test]
@@ -625,69 +616,6 @@ fn checkpoint_list_preload_rejects_cached_revision_attribution_mismatch()
     ));
     Ok(())
 }
-#[test]
-fn v11_restore_migration_rebuilds_exact_v12_when_journal_is_empty()
--> Result<(), Box<dyn std::error::Error>> {
-    let (mut connection, _, _, _) = fixture()?;
-    install_v11_restore_schema(&connection)?;
-
-    migrate_v11_to_v12(&mut connection, 12)?;
-
-    assert_eq!(
-        connection.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?,
-        12
-    );
-    validate_schema(&connection)?;
-    let actual: String = connection.query_row(
-        "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'checkpoint_restores'",
-        [],
-        |row| row.get(0),
-    )?;
-    assert_eq!(
-        schema::normalize_sql(&actual),
-        schema::normalize_sql(schema::RESTORES_V12_TABLE_SQL)
-    );
-    Ok(())
-}
-
-#[test]
-fn v11_restore_migration_fails_closed_when_legacy_restore_rows_exist()
--> Result<(), Box<dyn std::error::Error>> {
-    let (mut connection, workspace_id, activity_id, change_set_id) = fixture()?;
-    let ready =
-        persist_ready_checkpoint(&mut connection, workspace_id, activity_id, change_set_id)?;
-    install_v11_restore_schema(&connection)?;
-    connection.execute(
-        "INSERT INTO checkpoint_restores (
-            restore_id, checkpoint_id, workspace_id, expected_checkpoint_revision,
-            expected_post_state, expected_post_hash, expected_post_size, expected_post_mode,
-            inverse_kind, inverse_blob, inverse_hash, inverse_size, inverse_mode, state,
-            failure_code, created_at_ms, updated_at_ms, revision
-         ) VALUES (?1, ?2, ?3, ?4, 0, NULL, NULL, NULL, 1, ?5, ?6, ?7, ?8, 0, NULL, 12, 12, 1)",
-        params![
-            Uuid::from_u128(0xBEEF).as_bytes(),
-            ready.id().into_uuid().as_bytes(),
-            workspace_id.into_uuid().as_bytes(),
-            ready.revision().get(),
-            [1_u8; SHA1_BYTES].as_slice(),
-            [2_u8; HASH_BYTES].as_slice(),
-            3_i64,
-            i64::from(0o640),
-        ],
-    )?;
-
-    assert!(matches!(
-        migrate_v11_to_v12(&mut connection, 12),
-        Err(CheckpointStoreError::LegacyRestoreProvenanceUnavailable)
-    ));
-    assert_eq!(
-        connection.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?,
-        11
-    );
-    schema::validate_v11(&connection)?;
-    Ok(())
-}
-
 #[test]
 fn restore_fence_pair_and_attribution_are_fail_closed() -> Result<(), Box<dyn std::error::Error>> {
     let (mut connection, workspace_id, activity_id, change_set_id) = fixture()?;

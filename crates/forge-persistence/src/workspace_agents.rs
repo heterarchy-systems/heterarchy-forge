@@ -11,34 +11,33 @@ use forge_domain::{
     ActivityId, ActivityLeaseProjection, ActivityProjection, ActivityRevision, ActivityState,
     AgentAttachmentProjection, AgentAttachmentState, AgentContextProjection, AgentDeclaredRole,
     AgentDisplayName, AgentFocus, AgentFocusEvent, AgentFocusEventKind, AgentFocusEventSequence,
-    AgentFocusNode, AgentInstanceId, AgentInstanceRevision, AgentTransitionError,
+    AgentFocusNode, AgentInstanceId, AgentInstanceRevision, AgentSessionId, AgentTransitionError,
     AgentTransportKind, AgentWorkPhase, AgentWorkSummary, AgentWorkUpdate, AgentWorkUpdateId,
-    AgentWorkUpdateSequence, DagNodeId, DagNodeRevision, DagRevisionNumber, GoalAttribution,
-    GoalEvidenceRef, GoalRevision, McpTokenId, RegisteredActivity, RegisteredAgentInstance,
-    RuntimeInstanceId, TimestampMillis, WorkspaceId,
+    AgentWorkUpdateSequence, AuthenticatedPrincipal, BindExistingAgentSession, DagNodeId,
+    DagNodeRevision, DagRevisionNumber, GoalAttribution, GoalEvidenceRef, GoalRevision,
+    RegisteredActivity, RegisteredAgentInstance, RuntimeInstanceId, TimestampMillis, WorkspaceId,
 };
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::workspace_agent_events::AgentEventStoreError;
 const ID_BYTES: usize = 16;
 const ID_BYTES_I64: i64 = 16;
 const MAX_TEXT_BYTES: usize = forge_domain::MAX_AGENT_WORK_SUMMARY_BYTES;
 const MAX_METADATA_BYTES: usize = forge_domain::MAX_AGENT_ROLE_BYTES;
 
-/// Canonical v15 table/index DDL.  All creation and validation paths use this
-/// single authority; migration only invokes `create_schema`.
-const EXPECTED_AGENT_INSTANCES_TABLE_SQL: &str = "CREATE TABLE agent_instances (agent_id BLOB PRIMARY KEY NOT NULL CHECK(length(agent_id) = 16), workspace_id BLOB NOT NULL REFERENCES workspace(workspace_id) CHECK(length(workspace_id) = 16), activity_id BLOB NOT NULL REFERENCES activities(activity_id) CHECK(length(activity_id) = 16), display_name TEXT NOT NULL CHECK(length(CAST(display_name AS BLOB)) BETWEEN 1 AND 128), declared_role TEXT NOT NULL CHECK(length(CAST(declared_role AS BLOB)) BETWEEN 1 AND 128), transport_kind INTEGER NOT NULL CHECK(transport_kind IN (0, 1, 2, 3)), attachment_state INTEGER NOT NULL CHECK(attachment_state IN (0, 1)), focus_goal_id BLOB CHECK(focus_goal_id IS NULL OR length(focus_goal_id) = 16), focus_goal_revision INTEGER CHECK(focus_goal_revision IS NULL OR focus_goal_revision >= 1), focus_dag_revision INTEGER CHECK(focus_dag_revision IS NULL OR focus_dag_revision >= 1), focus_node_id BLOB CHECK(focus_node_id IS NULL OR length(focus_node_id) = 16), focus_node_revision INTEGER CHECK(focus_node_revision IS NULL OR focus_node_revision >= 1), created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0), updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= created_at_ms), revision INTEGER NOT NULL CHECK(revision >= 1), UNIQUE(agent_id, workspace_id, activity_id), FOREIGN KEY(focus_goal_id) REFERENCES goals(goal_id), FOREIGN KEY(focus_goal_id, focus_dag_revision) REFERENCES goal_dag_revisions(goal_id, dag_revision), FOREIGN KEY(focus_goal_id, focus_dag_revision, focus_node_id) REFERENCES goal_dag_nodes(goal_id, dag_revision, node_id), CHECK((focus_goal_id IS NULL AND focus_goal_revision IS NULL AND focus_dag_revision IS NULL AND focus_node_id IS NULL AND focus_node_revision IS NULL) OR (focus_goal_id IS NOT NULL AND focus_goal_revision IS NOT NULL AND focus_dag_revision IS NOT NULL AND ((focus_node_id IS NULL AND focus_node_revision IS NULL) OR (focus_node_id IS NOT NULL AND focus_node_revision IS NOT NULL)))), CHECK((attachment_state = 1 AND focus_goal_id IS NULL AND focus_goal_revision IS NULL AND focus_dag_revision IS NULL AND focus_node_id IS NULL AND focus_node_revision IS NULL) OR attachment_state = 0))";
+/// Canonical Agent table/index DDL. All creation and validation paths use this
+/// single authority.
+const EXPECTED_AGENT_INSTANCES_TABLE_SQL: &str = "CREATE TABLE agent_instances (agent_id BLOB PRIMARY KEY NOT NULL CHECK(length(agent_id) = 16), workspace_id BLOB NOT NULL REFERENCES workspace(workspace_id) CHECK(length(workspace_id) = 16), activity_id BLOB NOT NULL REFERENCES activities(activity_id) CHECK(length(activity_id) = 16), display_name TEXT NOT NULL CHECK(length(CAST(display_name AS BLOB)) BETWEEN 1 AND 128), declared_role TEXT NOT NULL CHECK(length(CAST(declared_role AS BLOB)) BETWEEN 1 AND 128), transport_kind INTEGER NOT NULL CHECK(transport_kind IN (0, 1, 2, 3)), principal_kind INTEGER NOT NULL CHECK(principal_kind IN (0, 1, 2)), principal_id BLOB CHECK(principal_id IS NULL OR length(principal_id) = 16), attachment_state INTEGER NOT NULL CHECK(attachment_state IN (0, 1)), focus_goal_id BLOB CHECK(focus_goal_id IS NULL OR length(focus_goal_id) = 16), focus_goal_revision INTEGER CHECK(focus_goal_revision IS NULL OR focus_goal_revision >= 1), focus_dag_revision INTEGER CHECK(focus_dag_revision IS NULL OR focus_dag_revision >= 1), focus_node_id BLOB CHECK(focus_node_id IS NULL OR length(focus_node_id) = 16), focus_node_revision INTEGER CHECK(focus_node_revision IS NULL OR focus_node_revision >= 1), created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0), updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= created_at_ms), revision INTEGER NOT NULL CHECK(revision >= 1), session_id BLOB CHECK(session_id IS NULL OR length(session_id) = 16), UNIQUE(agent_id, workspace_id, activity_id), FOREIGN KEY(focus_goal_id) REFERENCES goals(goal_id), FOREIGN KEY(focus_goal_id, focus_dag_revision) REFERENCES goal_dag_revisions(goal_id, dag_revision), FOREIGN KEY(focus_goal_id, focus_dag_revision, focus_node_id) REFERENCES goal_dag_nodes(goal_id, dag_revision, node_id), CHECK((principal_kind = 0 AND principal_id IS NULL) OR (principal_kind IN (1, 2) AND principal_id IS NOT NULL)), CHECK((focus_goal_id IS NULL AND focus_goal_revision IS NULL AND focus_dag_revision IS NULL AND focus_node_id IS NULL AND focus_node_revision IS NULL) OR (focus_goal_id IS NOT NULL AND focus_goal_revision IS NOT NULL AND focus_dag_revision IS NOT NULL AND ((focus_node_id IS NULL AND focus_node_revision IS NULL) OR (focus_node_id IS NOT NULL AND focus_node_revision IS NOT NULL)))), CHECK((attachment_state = 1 AND focus_goal_id IS NULL AND focus_goal_revision IS NULL AND focus_dag_revision IS NULL AND focus_node_id IS NULL AND focus_node_revision IS NULL) OR attachment_state = 0))";
 const EXPECTED_AGENT_FOCUS_EVENTS_TABLE_SQL: &str = "CREATE TABLE agent_focus_events (agent_id BLOB NOT NULL CHECK(length(agent_id) = 16), workspace_id BLOB NOT NULL REFERENCES workspace(workspace_id) CHECK(length(workspace_id) = 16), activity_id BLOB NOT NULL REFERENCES activities(activity_id) CHECK(length(activity_id) = 16), event_sequence INTEGER NOT NULL CHECK(event_sequence >= 1), event_kind INTEGER NOT NULL CHECK(event_kind IN (0, 1, 2)), focus_goal_id BLOB CHECK(focus_goal_id IS NULL OR length(focus_goal_id) = 16), focus_goal_revision INTEGER CHECK(focus_goal_revision IS NULL OR focus_goal_revision >= 1), focus_dag_revision INTEGER CHECK(focus_dag_revision IS NULL OR focus_dag_revision >= 1), focus_node_id BLOB CHECK(focus_node_id IS NULL OR length(focus_node_id) = 16), focus_node_revision INTEGER CHECK(focus_node_revision IS NULL OR focus_node_revision >= 1), observed_at_ms INTEGER NOT NULL CHECK(observed_at_ms >= 0), PRIMARY KEY(agent_id, event_sequence), FOREIGN KEY(agent_id, workspace_id, activity_id) REFERENCES agent_instances(agent_id, workspace_id, activity_id), FOREIGN KEY(focus_goal_id) REFERENCES goals(goal_id), FOREIGN KEY(focus_goal_id, focus_dag_revision) REFERENCES goal_dag_revisions(goal_id, dag_revision), FOREIGN KEY(focus_goal_id, focus_dag_revision, focus_node_id) REFERENCES goal_dag_nodes(goal_id, dag_revision, node_id), CHECK((focus_goal_id IS NULL AND focus_goal_revision IS NULL AND focus_dag_revision IS NULL AND focus_node_id IS NULL AND focus_node_revision IS NULL) OR (focus_goal_id IS NOT NULL AND focus_goal_revision IS NOT NULL AND focus_dag_revision IS NOT NULL AND ((focus_node_id IS NULL AND focus_node_revision IS NULL) OR (focus_node_id IS NOT NULL AND focus_node_revision IS NOT NULL)))), CHECK((event_kind = 2 AND focus_goal_id IS NULL AND focus_goal_revision IS NULL AND focus_dag_revision IS NULL AND focus_node_id IS NULL AND focus_node_revision IS NULL) OR event_kind IN (0, 1)))";
 const EXPECTED_AGENT_WORK_UPDATES_TABLE_SQL: &str = "CREATE TABLE agent_work_updates (update_id BLOB PRIMARY KEY NOT NULL CHECK(length(update_id) = 16), agent_id BLOB NOT NULL CHECK(length(agent_id) = 16), workspace_id BLOB NOT NULL REFERENCES workspace(workspace_id) CHECK(length(workspace_id) = 16), activity_id BLOB NOT NULL REFERENCES activities(activity_id) CHECK(length(activity_id) = 16), update_sequence INTEGER NOT NULL CHECK(update_sequence >= 1), phase INTEGER NOT NULL CHECK(phase IN (0, 1, 2, 3, 4, 5, 6)), summary TEXT NOT NULL CHECK(length(CAST(summary AS BLOB)) BETWEEN 1 AND 2048), evidence_count INTEGER NOT NULL CHECK(evidence_count BETWEEN 0 AND 32), observed_at_ms INTEGER NOT NULL CHECK(observed_at_ms >= 0), UNIQUE(agent_id, update_sequence), UNIQUE(update_id, agent_id, workspace_id), FOREIGN KEY(agent_id, workspace_id, activity_id) REFERENCES agent_instances(agent_id, workspace_id, activity_id))";
 const EXPECTED_AGENT_WORK_EVIDENCE_TABLE_SQL: &str = "CREATE TABLE agent_work_update_evidence_refs (update_id BLOB NOT NULL CHECK(length(update_id) = 16), agent_id BLOB NOT NULL CHECK(length(agent_id) = 16), workspace_id BLOB NOT NULL REFERENCES workspace(workspace_id) CHECK(length(workspace_id) = 16), evidence_kind INTEGER NOT NULL CHECK(evidence_kind IN (0, 1, 2, 3)), evidence_id BLOB NOT NULL CHECK(length(evidence_id) = 16), PRIMARY KEY(update_id, evidence_kind, evidence_id), FOREIGN KEY(update_id, agent_id, workspace_id) REFERENCES agent_work_updates(update_id, agent_id, workspace_id))";
 const EXPECTED_AGENT_INSTANCES_INDEX_SQL: &str = "CREATE INDEX agent_instances_workspace_activity_updated_idx ON agent_instances(workspace_id, activity_id, updated_at_ms DESC, agent_id DESC)";
+const EXPECTED_AGENT_INSTANCES_SESSION_INDEX_SQL: &str = "CREATE UNIQUE INDEX agent_instances_activity_session_uidx ON agent_instances(activity_id, session_id) WHERE session_id IS NOT NULL";
 const EXPECTED_AGENT_FOCUS_EVENTS_INDEX_SQL: &str = "CREATE INDEX agent_focus_events_agent_sequence_idx ON agent_focus_events(agent_id, event_sequence DESC)";
 const EXPECTED_AGENT_WORK_UPDATES_INDEX_SQL: &str = "CREATE INDEX agent_work_updates_agent_sequence_idx ON agent_work_updates(agent_id, update_sequence DESC)";
-const EXPECTED_AGENT_TRANSPORT_PRINCIPALS_TABLE_SQL: &str = "CREATE TABLE agent_transport_principals (agent_id BLOB PRIMARY KEY NOT NULL CHECK(length(agent_id) = 16), workspace_id BLOB NOT NULL REFERENCES workspace(workspace_id) CHECK(length(workspace_id) = 16), activity_id BLOB NOT NULL REFERENCES activities(activity_id) CHECK(length(activity_id) = 16), token_id BLOB NOT NULL CHECK(length(token_id) = 16), UNIQUE(agent_id, workspace_id, activity_id), FOREIGN KEY(agent_id, workspace_id, activity_id) REFERENCES agent_instances(agent_id, workspace_id, activity_id))";
-const EXPECTED_AGENT_TRANSPORT_PRINCIPALS_INDEX_SQL: &str = "CREATE INDEX agent_transport_principals_workspace_token_idx ON agent_transport_principals(workspace_id, token_id, agent_id)";
-
-const OBJECTS_V15: [(&str, &str, &str); 7] = [
+const AGENT_CORE_OBJECTS: [(&str, &str, &str); 8] = [
     (
         "table",
         "agent_instances",
@@ -66,6 +65,11 @@ const OBJECTS_V15: [(&str, &str, &str); 7] = [
     ),
     (
         "index",
+        "agent_instances_activity_session_uidx",
+        EXPECTED_AGENT_INSTANCES_SESSION_INDEX_SQL,
+    ),
+    (
+        "index",
         "agent_focus_events_agent_sequence_idx",
         EXPECTED_AGENT_FOCUS_EVENTS_INDEX_SQL,
     ),
@@ -76,76 +80,29 @@ const OBJECTS_V15: [(&str, &str, &str); 7] = [
     ),
 ];
 
-const OBJECTS: [(&str, &str, &str); 9] = [
-    OBJECTS_V15[0],
-    OBJECTS_V15[1],
-    OBJECTS_V15[2],
-    OBJECTS_V15[3],
-    OBJECTS_V15[4],
-    OBJECTS_V15[5],
-    OBJECTS_V15[6],
-    (
-        "table",
-        "agent_transport_principals",
-        EXPECTED_AGENT_TRANSPORT_PRINCIPALS_TABLE_SQL,
-    ),
-    (
-        "index",
-        "agent_transport_principals_workspace_token_idx",
-        EXPECTED_AGENT_TRANSPORT_PRINCIPALS_INDEX_SQL,
-    ),
-];
+const OBJECTS: [(&str, &str, &str); 8] = AGENT_CORE_OBJECTS;
 
 pub(crate) fn create_schema(connection: &Connection) -> Result<(), AgentStoreError> {
-    create_schema_v15(connection)?;
-    connection.execute_batch(EXPECTED_AGENT_TRANSPORT_PRINCIPALS_TABLE_SQL)?;
-    connection.execute_batch(EXPECTED_AGENT_TRANSPORT_PRINCIPALS_INDEX_SQL)?;
-    Ok(())
-}
-
-pub(crate) fn create_schema_v15(connection: &Connection) -> Result<(), AgentStoreError> {
-    for (_, _, sql) in OBJECTS_V15 {
+    for (_, _, sql) in AGENT_CORE_OBJECTS {
         connection.execute_batch(sql)?;
     }
     Ok(())
 }
 
-pub(crate) fn migrate_v14_to_v15(
-    connection: &mut Connection,
-    next_schema_version: i64,
-) -> Result<(), AgentStoreError> {
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    create_schema_v15(&transaction)?;
-    transaction.pragma_update(None, "user_version", next_schema_version)?;
-    transaction.commit()?;
-    Ok(())
-}
-
-pub(crate) fn migrate_v15_to_v16(
-    connection: &mut Connection,
-    next_schema_version: i64,
-) -> Result<(), AgentStoreError> {
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    transaction.execute_batch(EXPECTED_AGENT_TRANSPORT_PRINCIPALS_TABLE_SQL)?;
-    transaction.execute_batch(EXPECTED_AGENT_TRANSPORT_PRINCIPALS_INDEX_SQL)?;
-    transaction.pragma_update(None, "user_version", next_schema_version)?;
-    transaction.commit()?;
-    Ok(())
-}
-
-pub(crate) fn schema_objects_v15() -> [(&'static str, &'static str); 7] {
+pub(crate) fn schema_objects() -> [(&'static str, &'static str); 8] {
     [
         ("table", "agent_instances"),
         ("table", "agent_focus_events"),
         ("table", "agent_work_updates"),
         ("table", "agent_work_update_evidence_refs"),
         ("index", "agent_instances_workspace_activity_updated_idx"),
+        ("index", "agent_instances_activity_session_uidx"),
         ("index", "agent_focus_events_agent_sequence_idx"),
         ("index", "agent_work_updates_agent_sequence_idx"),
     ]
 }
 
-pub(crate) fn schema_objects() -> [(&'static str, &'static str); 9] {
+pub(crate) fn schema_objects_v29() -> [(&'static str, &'static str); 7] {
     [
         ("table", "agent_instances"),
         ("table", "agent_focus_events"),
@@ -154,27 +111,41 @@ pub(crate) fn schema_objects() -> [(&'static str, &'static str); 9] {
         ("index", "agent_instances_workspace_activity_updated_idx"),
         ("index", "agent_focus_events_agent_sequence_idx"),
         ("index", "agent_work_updates_agent_sequence_idx"),
-        ("table", "agent_transport_principals"),
-        ("index", "agent_transport_principals_workspace_token_idx"),
     ]
 }
 
 pub(crate) fn validate_schema(connection: &Connection) -> Result<(), AgentStoreError> {
-    validate_schema_for(connection, &OBJECTS, true)
+    validate_schema_objects(connection, &OBJECTS)?;
+    validate_schema_columns(connection, true)?;
+    validate_schema_foreign_keys(connection)
 }
 
-pub(crate) fn validate_schema_v15(connection: &Connection) -> Result<(), AgentStoreError> {
-    validate_schema_for(connection, &OBJECTS_V15, false)
-}
-
-fn validate_schema_for(
-    connection: &Connection,
-    objects: &[(&'static str, &'static str, &'static str)],
-    has_principal: bool,
-) -> Result<(), AgentStoreError> {
-    validate_schema_objects(connection, objects)?;
-    validate_schema_columns(connection, has_principal)?;
-    validate_schema_foreign_keys(connection, has_principal)
+/// Validate the previous schema without pretending that its nullable session
+/// binding already exists. This is used only as the fail-closed precondition
+/// for the v29 -> v30 migration.
+pub(crate) fn validate_schema_v29(connection: &Connection) -> Result<(), AgentStoreError> {
+    let expected_agent_table = EXPECTED_AGENT_INSTANCES_TABLE_SQL.replace(
+        ", session_id BLOB CHECK(session_id IS NULL OR length(session_id) = 16)",
+        "",
+    );
+    let actual_agent_table: Option<String> = connection
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'agent_instances'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if actual_agent_table.as_deref().map(normalize_sql)
+        != Some(normalize_sql(&expected_agent_table))
+    {
+        return Err(AgentStoreError::DamagedSchema("agent_instances"));
+    }
+    let objects = [
+        OBJECTS[1], OBJECTS[2], OBJECTS[3], OBJECTS[4], OBJECTS[6], OBJECTS[7],
+    ];
+    validate_schema_objects(connection, &objects)?;
+    validate_schema_columns(connection, false)?;
+    validate_schema_foreign_keys(connection)
 }
 
 fn validate_schema_objects(
@@ -198,28 +169,55 @@ fn validate_schema_objects(
 
 fn validate_schema_columns(
     connection: &Connection,
-    has_principal: bool,
+    include_session_id: bool,
 ) -> Result<(), AgentStoreError> {
+    let agent_columns_v29 = [
+        ("agent_id", "BLOB", 1, 1),
+        ("workspace_id", "BLOB", 1, 0),
+        ("activity_id", "BLOB", 1, 0),
+        ("display_name", "TEXT", 1, 0),
+        ("declared_role", "TEXT", 1, 0),
+        ("transport_kind", "INTEGER", 1, 0),
+        ("principal_kind", "INTEGER", 1, 0),
+        ("principal_id", "BLOB", 0, 0),
+        ("attachment_state", "INTEGER", 1, 0),
+        ("focus_goal_id", "BLOB", 0, 0),
+        ("focus_goal_revision", "INTEGER", 0, 0),
+        ("focus_dag_revision", "INTEGER", 0, 0),
+        ("focus_node_id", "BLOB", 0, 0),
+        ("focus_node_revision", "INTEGER", 0, 0),
+        ("created_at_ms", "INTEGER", 1, 0),
+        ("updated_at_ms", "INTEGER", 1, 0),
+        ("revision", "INTEGER", 1, 0),
+    ];
+    let agent_columns_v30 = [
+        ("agent_id", "BLOB", 1, 1),
+        ("workspace_id", "BLOB", 1, 0),
+        ("activity_id", "BLOB", 1, 0),
+        ("display_name", "TEXT", 1, 0),
+        ("declared_role", "TEXT", 1, 0),
+        ("transport_kind", "INTEGER", 1, 0),
+        ("principal_kind", "INTEGER", 1, 0),
+        ("principal_id", "BLOB", 0, 0),
+        ("attachment_state", "INTEGER", 1, 0),
+        ("focus_goal_id", "BLOB", 0, 0),
+        ("focus_goal_revision", "INTEGER", 0, 0),
+        ("focus_dag_revision", "INTEGER", 0, 0),
+        ("focus_node_id", "BLOB", 0, 0),
+        ("focus_node_revision", "INTEGER", 0, 0),
+        ("created_at_ms", "INTEGER", 1, 0),
+        ("updated_at_ms", "INTEGER", 1, 0),
+        ("revision", "INTEGER", 1, 0),
+        ("session_id", "BLOB", 0, 0),
+    ];
     validate_columns(
         connection,
         "agent_instances",
-        &[
-            ("agent_id", "BLOB", 1, 1),
-            ("workspace_id", "BLOB", 1, 0),
-            ("activity_id", "BLOB", 1, 0),
-            ("display_name", "TEXT", 1, 0),
-            ("declared_role", "TEXT", 1, 0),
-            ("transport_kind", "INTEGER", 1, 0),
-            ("attachment_state", "INTEGER", 1, 0),
-            ("focus_goal_id", "BLOB", 0, 0),
-            ("focus_goal_revision", "INTEGER", 0, 0),
-            ("focus_dag_revision", "INTEGER", 0, 0),
-            ("focus_node_id", "BLOB", 0, 0),
-            ("focus_node_revision", "INTEGER", 0, 0),
-            ("created_at_ms", "INTEGER", 1, 0),
-            ("updated_at_ms", "INTEGER", 1, 0),
-            ("revision", "INTEGER", 1, 0),
-        ],
+        if include_session_id {
+            &agent_columns_v30
+        } else {
+            &agent_columns_v29
+        },
     )?;
     validate_columns(
         connection,
@@ -264,25 +262,10 @@ fn validate_schema_columns(
             ("evidence_id", "BLOB", 1, 3),
         ],
     )?;
-    if has_principal {
-        validate_columns(
-            connection,
-            "agent_transport_principals",
-            &[
-                ("agent_id", "BLOB", 1, 1),
-                ("workspace_id", "BLOB", 1, 0),
-                ("activity_id", "BLOB", 1, 0),
-                ("token_id", "BLOB", 1, 0),
-            ],
-        )?;
-    }
     Ok(())
 }
 
-fn validate_schema_foreign_keys(
-    connection: &Connection,
-    has_principal: bool,
-) -> Result<(), AgentStoreError> {
+fn validate_schema_foreign_keys(connection: &Connection) -> Result<(), AgentStoreError> {
     validate_foreign_keys(
         connection,
         "agent_instances",
@@ -335,19 +318,6 @@ fn validate_schema_foreign_keys(
             ("workspace", "workspace_id", "workspace_id"),
         ],
     )?;
-    if has_principal {
-        validate_foreign_keys(
-            connection,
-            "agent_transport_principals",
-            &[
-                ("activities", "activity_id", "activity_id"),
-                ("agent_instances", "agent_id", "agent_id"),
-                ("agent_instances", "workspace_id", "workspace_id"),
-                ("agent_instances", "activity_id", "activity_id"),
-                ("workspace", "workspace_id", "workspace_id"),
-            ],
-        )?;
-    }
     Ok(())
 }
 
@@ -443,6 +413,72 @@ pub(crate) fn get_in_transaction(
     agent_by_id(connection, agent_id)
 }
 
+/// Read the complete Agent census for one Activity in stable Agent-ID order.
+/// The recovery owner uses a limit of 257 so the 256-row contract can reject
+/// overflow without materializing an unbounded result.
+pub(crate) fn list_for_activity_in_transaction(
+    connection: &Connection,
+    workspace_id: WorkspaceId,
+    activity_id: ActivityId,
+    limit: u32,
+) -> Result<Vec<RegisteredAgentInstance>, AgentStoreError> {
+    let mut statement = connection.prepare(
+        "SELECT ai.agent_id, ai.workspace_id, ai.activity_id, ai.display_name,
+                ai.declared_role, ai.transport_kind, ai.principal_kind,
+                ai.principal_id, ai.attachment_state, ai.focus_goal_id,
+                ai.focus_goal_revision, ai.focus_dag_revision, ai.focus_node_id,
+                ai.focus_node_revision, ai.created_at_ms, ai.updated_at_ms,
+                ai.revision, length(ai.agent_id), length(ai.workspace_id),
+                length(ai.activity_id), length(CAST(ai.display_name AS BLOB)),
+                length(CAST(ai.declared_role AS BLOB)), length(ai.principal_id),
+                length(ai.focus_goal_id), length(ai.focus_node_id), ai.session_id
+         FROM agent_instances AS ai
+         WHERE ai.workspace_id = ?1 AND ai.activity_id = ?2
+         ORDER BY ai.agent_id ASC
+         LIMIT ?3",
+    )?;
+    let mut rows = statement.query(params![
+        workspace_id.into_uuid().as_bytes(),
+        activity_id.into_uuid().as_bytes(),
+        limit,
+    ])?;
+    let mut agents = Vec::new();
+    while let Some(row) = rows.next()? {
+        agents.push(decode_agent(row)?);
+    }
+    Ok(agents)
+}
+
+/// Read the durable Agent participant rows for a frozen source in exact
+/// `agent_id` BLOB order.  This helper does not open a transaction; the export
+/// owner supplies one snapshot and owns its commit/rollback boundary.
+pub(crate) fn export_participants(
+    connection: &Connection,
+    workspace_id: WorkspaceId,
+    after: Option<AgentInstanceId>,
+    limit: u32,
+) -> Result<Vec<RegisteredAgentInstance>, AgentStoreError> {
+    let after_bytes = after.map(|value| value.into_uuid().into_bytes().to_vec());
+    let mut statement = connection.prepare(AGENTS_EXPORT_QUERY)?;
+    let mut rows = statement.query(params![
+        workspace_id.into_uuid().as_bytes(),
+        after_bytes,
+        limit,
+    ])?;
+    let mut participants = Vec::new();
+    while let Some(row) = rows.next()? {
+        let participant = decode_agent(row)?;
+        if participant.workspace_id() != workspace_id {
+            return Err(AgentStoreError::WorkspaceMismatch {
+                expected: workspace_id,
+                actual: participant.workspace_id(),
+            });
+        }
+        participants.push(participant);
+    }
+    Ok(participants)
+}
+
 fn agent_by_id(
     connection: &Connection,
     agent_id: AgentInstanceId,
@@ -490,8 +526,8 @@ pub(crate) fn list_attachments(
     ])?;
     let mut projections = Vec::new();
     while let Some(row) = rows.next()? {
-        let agent = decode_agent(row)?;
-        let activity = decode_activity_at(row, 24)?;
+        let agent = decode_agent_at(row, 35)?;
+        let activity = decode_activity_at(row, 25)?;
         if activity.workspace_id() != workspace_id {
             return Err(AgentStoreError::ActivityWorkspaceMismatch {
                 expected: workspace_id,
@@ -582,52 +618,117 @@ pub(crate) fn get_context(
     Ok(Some(context))
 }
 
-pub(crate) fn attach(
-    connection: &mut Connection,
-    agent: &RegisteredAgentInstance,
+/// Validate one exact session-bound attached Agent inside the caller's
+/// transaction. This is the shared admission fence for Coordinator, writer,
+/// execution, and DAG consumers; it performs no catalog I/O or recency check.
+pub(crate) fn ensure_bound_attached_agent(
+    connection: &Connection,
+    workspace_id: WorkspaceId,
+    activity_id: ActivityId,
+    agent_id: AgentInstanceId,
+    session_id: AgentSessionId,
+    principal: AuthenticatedPrincipal,
+    expected_revision: Option<AgentInstanceRevision>,
 ) -> Result<RegisteredAgentInstance, AgentStoreError> {
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    ensure_workspace(&transaction, agent.workspace_id())?;
-    ensure_activity(&transaction, agent.workspace_id(), agent.activity_id())?;
-    if let Some(existing) = agent_by_id(&transaction, agent.id())? {
-        if existing == *agent {
-            transaction.commit()?;
-            return Ok(existing);
-        }
-        return Err(AgentStoreError::IdentityConflict);
+    let agent =
+        agent_by_id(connection, agent_id)?.ok_or(AgentStoreError::AgentNotFound(agent_id))?;
+    if agent.workspace_id() != workspace_id {
+        return Err(AgentStoreError::WorkspaceMismatch {
+            expected: workspace_id,
+            actual: agent.workspace_id(),
+        });
     }
-    if agent.attachment_state() != AgentAttachmentState::Attached
-        || !agent.focus().is_unfocused()
-        || agent.revision() != AgentInstanceRevision::INITIAL
+    if agent.activity_id() != activity_id {
+        return Err(AgentStoreError::ActivityAgentMismatch {
+            expected: activity_id,
+            actual: agent.activity_id(),
+        });
+    }
+    if agent.session_id() != Some(session_id) {
+        return Err(AgentStoreError::SessionBindingConflict);
+    }
+    if agent.principal() != principal {
+        return Err(AgentStoreError::PrincipalConflict);
+    }
+    if agent.attachment_state() != AgentAttachmentState::Attached {
+        return Err(AgentStoreError::AgentDetached(agent_id));
+    }
+    if let Some(expected_revision) = expected_revision
+        && agent.revision() != expected_revision
     {
-        return Err(AgentStoreError::InvalidProjection("initial agent"));
+        return Err(AgentStoreError::RevisionConflict {
+            expected: expected_revision,
+        });
     }
-    insert_agent(&transaction, agent)?;
-    insert_transport_principal(&transaction, agent)?;
-    insert_focus_event(
-        &transaction,
-        &AgentFocusEvent::from_parts(
-            agent.id(),
-            agent.workspace_id(),
-            agent.activity_id(),
-            AgentFocusEventSequence::INITIAL,
-            AgentFocusEventKind::Attached,
-            agent.focus(),
-            agent.created_at(),
-        ),
-    )?;
-    let result = agent_by_id(&transaction, agent.id())?
-        .ok_or(AgentStoreError::CorruptRecord("agent.inserted"))?;
-    transaction.commit()?;
-    Ok(result)
+    Ok(agent)
 }
 
-pub(crate) fn set_focus(
-    connection: &mut Connection,
+/// Reconcile only the Forge-owned effect-session binding for one unresolved
+/// legacy Agent. The caller must establish migration/delegation authority
+/// before entering this helper. No presence, membership event, inbox, focus,
+/// Coordinator, or public-work evidence is written here.
+pub(crate) fn reconcile_session_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    command: BindExistingAgentSession,
+) -> Result<RegisteredAgentInstance, AgentStoreError> {
+    ensure_workspace(transaction, command.workspace_id())?;
+    ensure_open_activity(transaction, command.workspace_id(), command.activity_id())?;
+    let current = agent_by_id(transaction, command.agent_id())?
+        .ok_or(AgentStoreError::AgentNotFound(command.agent_id()))?;
+    if current.workspace_id() != command.workspace_id() {
+        return Err(AgentStoreError::WorkspaceMismatch {
+            expected: command.workspace_id(),
+            actual: current.workspace_id(),
+        });
+    }
+    if current.activity_id() != command.activity_id() {
+        return Err(AgentStoreError::ActivityAgentMismatch {
+            expected: command.activity_id(),
+            actual: current.activity_id(),
+        });
+    }
+    if current.principal() != command.principal() {
+        return Err(AgentStoreError::PrincipalConflict);
+    }
+    if agent_by_activity_session(transaction, command.activity_id(), command.session_id())?
+        .is_some()
+    {
+        return Err(AgentStoreError::SessionAttachmentConflict);
+    }
+    let updated = current
+        .bind_session(
+            command.expected_agent_revision(),
+            command.session_id(),
+            command.observed_at(),
+        )
+        .map_err(AgentStoreError::Transition)?;
+    update_agent(transaction, &current, &updated)?;
+    Ok(updated)
+}
+
+fn agent_by_activity_session(
+    connection: &Connection,
+    activity_id: ActivityId,
+    session_id: AgentSessionId,
+) -> Result<Option<RegisteredAgentInstance>, AgentStoreError> {
+    let mut statement = connection.prepare(
+        "SELECT ai.agent_id, ai.workspace_id, ai.activity_id, ai.display_name, ai.declared_role, ai.transport_kind, ai.principal_kind, ai.principal_id, ai.attachment_state, ai.focus_goal_id, ai.focus_goal_revision, ai.focus_dag_revision, ai.focus_node_id, ai.focus_node_revision, ai.created_at_ms, ai.updated_at_ms, ai.revision, length(ai.agent_id), length(ai.workspace_id), length(ai.activity_id), length(CAST(ai.display_name AS BLOB)), length(CAST(ai.declared_role AS BLOB)), length(ai.principal_id), length(ai.focus_goal_id), length(ai.focus_node_id), ai.session_id FROM agent_instances AS ai WHERE ai.activity_id = ?1 AND ai.session_id = ?2",
+    )?;
+    let mut rows = statement.query(params![
+        activity_id.into_uuid().as_bytes(),
+        session_id.into_uuid().as_bytes(),
+    ])?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    decode_agent_at(row, 25).map(Some)
+}
+
+pub(crate) fn set_focus_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
     command: &forge_domain::SetAgentFocus,
 ) -> Result<RegisteredAgentInstance, AgentStoreError> {
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let current = agent_by_id(&transaction, command.agent_id())?
+    let current = agent_by_id(transaction, command.agent_id())?
         .ok_or(AgentStoreError::AgentNotFound(command.agent_id()))?;
     if current.activity_id() != command.activity_id() {
         return Err(AgentStoreError::ActivityAgentMismatch {
@@ -635,7 +736,17 @@ pub(crate) fn set_focus(
             actual: current.activity_id(),
         });
     }
-    ensure_focus_is_current(&transaction, current.workspace_id(), command.focus())?;
+    if current.session_id().is_none() {
+        return Err(AgentStoreError::UnresolvedLegacy(current.id()));
+    }
+    ensure_focus_is_current(transaction, current.workspace_id(), command.focus())?;
+    crate::workspace_work_cuts::guards::ensure_focus_open(
+        transaction,
+        current.workspace_id(),
+        current.id(),
+        current.focus(),
+        command.focus(),
+    )?;
     let updated = current
         .set_focus(
             command.expected_revision(),
@@ -643,9 +754,9 @@ pub(crate) fn set_focus(
             command.observed_at(),
         )
         .map_err(AgentStoreError::Transition)?;
-    update_agent(&transaction, &current, &updated)?;
+    update_agent(transaction, &current, &updated)?;
     insert_focus_event(
-        &transaction,
+        transaction,
         &AgentFocusEvent::from_parts(
             updated.id(),
             updated.workspace_id(),
@@ -657,29 +768,28 @@ pub(crate) fn set_focus(
             updated.updated_at(),
         ),
     )?;
-    transaction.commit()?;
     Ok(updated)
 }
 
-pub(crate) fn detach(
-    connection: &mut Connection,
-    command: &forge_domain::DetachAgent,
+/// Detach an already validated bound Agent inside a caller-owned transaction.
+/// This is the departure-reconciliation seam: it writes the Agent row and its
+/// terminal `Detached` focus fact only. Membership `Left` events, presence,
+/// and inbox receipts are Orchestration-owned participation effects and are
+/// never written here.
+pub(crate) fn detach_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    current: &RegisteredAgentInstance,
+    observed_at: TimestampMillis,
 ) -> Result<RegisteredAgentInstance, AgentStoreError> {
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let current = agent_by_id(&transaction, command.agent_id())?
-        .ok_or(AgentStoreError::AgentNotFound(command.agent_id()))?;
-    if current.activity_id() != command.activity_id() {
-        return Err(AgentStoreError::ActivityAgentMismatch {
-            expected: command.activity_id(),
-            actual: current.activity_id(),
-        });
+    if current.session_id().is_none() {
+        return Err(AgentStoreError::UnresolvedLegacy(current.id()));
     }
     let updated = current
-        .detach(command.expected_revision(), command.observed_at())
+        .detach(current.revision(), observed_at)
         .map_err(AgentStoreError::Transition)?;
-    update_agent(&transaction, &current, &updated)?;
+    update_agent(transaction, current, &updated)?;
     insert_focus_event(
-        &transaction,
+        transaction,
         &AgentFocusEvent::from_parts(
             updated.id(),
             updated.workspace_id(),
@@ -691,16 +801,24 @@ pub(crate) fn detach(
             updated.updated_at(),
         ),
     )?;
-    transaction.commit()?;
     Ok(updated)
 }
 
 pub(crate) fn publish_work_update(
     connection: &mut Connection,
     update: &AgentWorkUpdate,
+    session_id: AgentSessionId,
+    principal: AuthenticatedPrincipal,
+    admitted_at: TimestampMillis,
 ) -> Result<AgentWorkUpdate, AgentStoreError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let result = publish_work_update_in_transaction(&transaction, update)?;
+    let result = publish_work_update_in_transaction_bound(
+        &transaction,
+        update,
+        session_id,
+        principal,
+        admitted_at,
+    )?;
     transaction.commit()?;
     Ok(result)
 }
@@ -708,24 +826,47 @@ pub(crate) fn publish_work_update(
 pub(crate) fn publish_work_update_in_transaction(
     transaction: &rusqlite::Transaction<'_>,
     update: &AgentWorkUpdate,
+    admitted_at: TimestampMillis,
 ) -> Result<AgentWorkUpdate, AgentStoreError> {
-    let current = agent_by_id(transaction, update.agent_id())?
+    let agent = agent_by_id(transaction, update.agent_id())?
         .ok_or(AgentStoreError::AgentNotFound(update.agent_id()))?;
-    if current.workspace_id() != update.workspace_id() {
-        return Err(AgentStoreError::WorkspaceMismatch {
-            expected: current.workspace_id(),
-            actual: update.workspace_id(),
-        });
-    }
-    if current.activity_id() != update.activity_id() {
-        return Err(AgentStoreError::ActivityAgentMismatch {
-            expected: current.activity_id(),
-            actual: update.activity_id(),
-        });
-    }
+    let session_id = agent
+        .session_id()
+        .ok_or(AgentStoreError::UnresolvedLegacy(agent.id()))?;
+    publish_work_update_in_transaction_bound(
+        transaction,
+        update,
+        session_id,
+        agent.principal(),
+        admitted_at,
+    )
+}
+
+pub(crate) fn publish_work_update_in_transaction_bound(
+    transaction: &rusqlite::Transaction<'_>,
+    update: &AgentWorkUpdate,
+    session_id: AgentSessionId,
+    principal: AuthenticatedPrincipal,
+    admitted_at: TimestampMillis,
+) -> Result<AgentWorkUpdate, AgentStoreError> {
+    let current = ensure_bound_attached_agent(
+        transaction,
+        update.workspace_id(),
+        update.activity_id(),
+        update.agent_id(),
+        session_id,
+        principal,
+        None,
+    )?;
     if current.attachment_state().is_detached() {
         return Err(AgentStoreError::AgentDetached(update.agent_id()));
     }
+    ensure_live_activity(
+        transaction,
+        update.workspace_id(),
+        update.activity_id(),
+        admitted_at,
+    )?;
     if let Some(existing) = work_update_by_id(transaction, update.id())? {
         if existing == *update {
             return Ok(existing);
@@ -771,6 +912,41 @@ pub(crate) fn publish_work_update_in_transaction(
     Ok(update.clone())
 }
 
+fn ensure_live_activity(
+    connection: &Connection,
+    workspace_id: WorkspaceId,
+    activity_id: ActivityId,
+    admitted_at: TimestampMillis,
+) -> Result<(), AgentStoreError> {
+    use crate::workspace_coordinators::CoordinatorStoreError;
+
+    match crate::workspace_coordinators::ensure_live_activity_in_transaction(
+        connection,
+        activity_id,
+        workspace_id,
+        admitted_at,
+    ) {
+        Ok(()) => Ok(()),
+        Err(CoordinatorStoreError::ActivityNotFound(activity_id)) => {
+            Err(AgentStoreError::ActivityNotFound(activity_id))
+        }
+        Err(CoordinatorStoreError::ActivityNotLive(activity_id)) => {
+            Err(AgentStoreError::ActivityNotLive(activity_id))
+        }
+        Err(CoordinatorStoreError::ActivityLeaseNotLive(activity_id)) => {
+            Err(AgentStoreError::ActivityLeaseNotLive(activity_id))
+        }
+        Err(CoordinatorStoreError::ActivityWorkspaceMismatch) => {
+            Err(AgentStoreError::CorruptRecord("activities.workspace_id"))
+        }
+        Err(CoordinatorStoreError::CorruptRecord(field)) => {
+            Err(AgentStoreError::CorruptRecord(field))
+        }
+        Err(CoordinatorStoreError::Sqlite(error)) => Err(AgentStoreError::from(error)),
+        Err(_) => Err(AgentStoreError::CorruptRecord("activities.liveness")),
+    }
+}
+
 fn ensure_workspace(
     connection: &Connection,
     workspace_id: WorkspaceId,
@@ -792,19 +968,19 @@ fn ensure_workspace(
     }
 }
 
-fn ensure_activity(
+fn ensure_open_activity(
     connection: &Connection,
     workspace_id: WorkspaceId,
     activity_id: ActivityId,
 ) -> Result<(), AgentStoreError> {
     let actual = connection
         .query_row(
-            "SELECT workspace_id FROM activities WHERE activity_id = ?1",
+            "SELECT workspace_id, state FROM activities WHERE activity_id = ?1",
             params![activity_id.into_uuid().as_bytes()],
-            |row| row.get::<_, Vec<u8>>(0),
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)),
         )
         .optional()?;
-    let Some(actual) = actual else {
+    let Some((actual, state)) = actual else {
         return Err(AgentStoreError::ActivityNotFound(activity_id));
     };
     let actual = decode_workspace_id(&actual)?;
@@ -813,6 +989,11 @@ fn ensure_activity(
             expected: workspace_id,
             actual,
         });
+    }
+    if state != 1 {
+        return Err(AgentStoreError::InvalidProjection(
+            "terminal Activity cannot accept Agent attachment",
+        ));
     }
     Ok(())
 }
@@ -921,14 +1102,73 @@ fn next_work_sequence(
     AgentWorkUpdateSequence::new(next).map_err(|_| AgentStoreError::IntegerOverflow)
 }
 
-fn insert_agent(
+/// Called only inside the activation transaction after its immutable receipt
+/// has been inserted. The receipt and source delegation authorize this exact
+/// initial work binding; neither legacy attachment nor operational membership
+/// is created by this helper.
+pub(crate) fn insert_reserved_binding(
+    connection: &Connection,
+    agent: &RegisteredAgentInstance,
+) -> Result<(), AgentStoreError> {
+    if connection.is_autocommit()
+        || agent.attachment_state() != AgentAttachmentState::Attached
+        || !agent.focus().is_unfocused()
+        || agent.revision() != AgentInstanceRevision::INITIAL
+        || agent.updated_at() != agent.created_at()
+    {
+        return Err(AgentStoreError::InvalidProjection(
+            "initial reserved binding",
+        ));
+    }
+    let delegation = crate::workspace_agent_migration::delegation(connection)?.ok_or(
+        AgentStoreError::InvalidProjection("binding delegation missing"),
+    )?;
+    let (principal_kind, principal_id) = encode_principal(agent.principal());
+    let admitted: bool = connection.query_row(
+        "SELECT EXISTS (SELECT 1 FROM agent_binding_activations a JOIN agent_binding_reservations r ON r.request_id=a.request_id WHERE r.migration_id=?1 AND r.workspace_id=?2 AND r.destination_id=?3 AND r.freeze_revision=?4 AND r.agent_id=?5 AND r.activity_id=?6 AND r.session_id=?7 AND r.principal_kind=?8 AND ((r.principal_kind=0 AND r.principal_id=zeroblob(16) AND ?9 IS NULL) OR r.principal_id=?9) AND a.display_name=?10 AND a.declared_role=?11 AND a.transport_kind=?12 AND a.activated_at_ms=?13)",
+        params![
+            delegation.migration_id().as_bytes(),
+            agent.workspace_id().into_uuid().as_bytes(),
+            delegation.destination_id().as_bytes(),
+            i64::try_from(delegation.freeze().revision()).map_err(|_| AgentStoreError::IntegerOverflow)?,
+            agent.id().into_uuid().as_bytes(),
+            agent.activity_id().into_uuid().as_bytes(),
+            agent.session_id().map(|id| id.into_uuid().as_bytes().to_vec()),
+            principal_kind, principal_id.as_deref(),
+            agent.display_name().as_str(), agent.declared_role().as_str(),
+            encode_transport(agent.transport_kind()), agent.created_at().get(),
+        ],
+        |row| row.get(0),
+    )?;
+    if !admitted || delegation.workspace_id() != agent.workspace_id() {
+        return Err(AgentStoreError::InvalidProjection(
+            "binding activation admission",
+        ));
+    }
+    insert_agent_row(connection, agent)?;
+    insert_focus_event(
+        connection,
+        &AgentFocusEvent::from_parts(
+            agent.id(),
+            agent.workspace_id(),
+            agent.activity_id(),
+            AgentFocusEventSequence::INITIAL,
+            AgentFocusEventKind::Attached,
+            agent.focus(),
+            agent.created_at(),
+        ),
+    )
+}
+
+fn insert_agent_row(
     connection: &Connection,
     agent: &RegisteredAgentInstance,
 ) -> Result<(), AgentStoreError> {
     let (goal_id, goal_revision, dag_revision, node_id, node_revision) =
         encode_focus(agent.focus());
+    let (principal_kind, principal_id) = encode_principal(agent.principal());
     connection.execute(
-        "INSERT INTO agent_instances (agent_id, workspace_id, activity_id, display_name, declared_role, transport_kind, attachment_state, focus_goal_id, focus_goal_revision, focus_dag_revision, focus_node_id, focus_node_revision, created_at_ms, updated_at_ms, revision) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+        "INSERT INTO agent_instances (agent_id, workspace_id, activity_id, display_name, declared_role, transport_kind, principal_kind, principal_id, attachment_state, focus_goal_id, focus_goal_revision, focus_dag_revision, focus_node_id, focus_node_revision, created_at_ms, updated_at_ms, revision, session_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
         params![
             agent.id().into_uuid().as_bytes(),
             agent.workspace_id().into_uuid().as_bytes(),
@@ -936,6 +1176,8 @@ fn insert_agent(
             agent.display_name().as_str(),
             agent.declared_role().as_str(),
             encode_transport(agent.transport_kind()),
+            principal_kind,
+            principal_id.as_deref(),
             encode_attachment_state(agent.attachment_state()),
             goal_id.as_deref(),
             goal_revision,
@@ -945,25 +1187,9 @@ fn insert_agent(
             agent.created_at().get(),
             agent.updated_at().get(),
             agent.revision().get(),
-        ],
-    )?;
-    Ok(())
-}
-
-fn insert_transport_principal(
-    connection: &Connection,
-    agent: &RegisteredAgentInstance,
-) -> Result<(), AgentStoreError> {
-    let Some(token_id) = agent.transport_principal() else {
-        return Ok(());
-    };
-    connection.execute(
-        "INSERT INTO agent_transport_principals (agent_id, workspace_id, activity_id, token_id) VALUES (?1, ?2, ?3, ?4)",
-        params![
-            agent.id().into_uuid().as_bytes(),
-            agent.workspace_id().into_uuid().as_bytes(),
-            agent.activity_id().into_uuid().as_bytes(),
-            token_id.into_uuid().as_bytes(),
+            agent
+                .session_id()
+                .map(|session| session.into_uuid().as_bytes().to_vec()),
         ],
     )?;
     Ok(())
@@ -974,10 +1200,11 @@ fn update_agent(
     current: &RegisteredAgentInstance,
     updated: &RegisteredAgentInstance,
 ) -> Result<(), AgentStoreError> {
+    crate::workspace_agent_migration::ensure_work_writes(connection)?;
     let (goal_id, goal_revision, dag_revision, node_id, node_revision) =
         encode_focus(updated.focus());
     let changed = connection.execute(
-        "UPDATE agent_instances SET attachment_state = ?1, focus_goal_id = ?2, focus_goal_revision = ?3, focus_dag_revision = ?4, focus_node_id = ?5, focus_node_revision = ?6, updated_at_ms = ?7, revision = ?8 WHERE agent_id = ?9 AND revision = ?10 AND workspace_id = ?11 AND activity_id = ?12",
+        "UPDATE agent_instances SET attachment_state = ?1, focus_goal_id = ?2, focus_goal_revision = ?3, focus_dag_revision = ?4, focus_node_id = ?5, focus_node_revision = ?6, updated_at_ms = ?7, revision = ?8, session_id = ?9 WHERE agent_id = ?10 AND revision = ?11 AND workspace_id = ?12 AND activity_id = ?13",
         params![
             encode_attachment_state(updated.attachment_state()),
             goal_id.as_deref(),
@@ -987,6 +1214,9 @@ fn update_agent(
             node_revision,
             updated.updated_at().get(),
             updated.revision().get(),
+            updated
+                .session_id()
+                .map(|session| session.into_uuid().as_bytes().to_vec()),
             updated.id().into_uuid().as_bytes(),
             current.revision().get(),
             current.workspace_id().into_uuid().as_bytes(),
@@ -1002,10 +1232,11 @@ fn update_agent(
     }
 }
 
-fn insert_focus_event(
+pub(crate) fn insert_focus_event(
     connection: &Connection,
     event: &AgentFocusEvent,
 ) -> Result<(), AgentStoreError> {
+    crate::workspace_agent_migration::ensure_work_writes(connection)?;
     let (goal_id, goal_revision, dag_revision, node_id, node_revision) =
         encode_focus(event.focus());
     connection.execute(
@@ -1024,7 +1255,8 @@ fn insert_focus_event(
             event.observed_at().get(),
         ],
     )?;
-    Ok(())
+    crate::workspace_agent_effect_outbox::append_focus(connection, event)
+        .map_err(|source| AgentStoreError::EffectOutbox(Box::new(source)))
 }
 
 type EncodedFocus = (
@@ -1034,6 +1266,16 @@ type EncodedFocus = (
     Option<Vec<u8>>,
     Option<i64>,
 );
+
+type EncodedPrincipal = (i64, Option<Vec<u8>>);
+
+fn encode_principal(value: AuthenticatedPrincipal) -> EncodedPrincipal {
+    match value {
+        AuthenticatedPrincipal::TrustedStdio => (0, None),
+        AuthenticatedPrincipal::DirectToken(id) => (1, Some(id.into_uuid().as_bytes().to_vec())),
+        AuthenticatedPrincipal::OAuthGrant(id) => (2, Some(id.into_uuid().as_bytes().to_vec())),
+    }
+}
 
 fn encode_focus(focus: AgentFocus) -> EncodedFocus {
     let Some(goal) = focus.goal() else {
@@ -1060,7 +1302,7 @@ fn encode_evidence(evidence: GoalEvidenceRef) -> (i64, [u8; ID_BYTES]) {
 
 fn encode_transport(value: AgentTransportKind) -> i64 {
     match value {
-        AgentTransportKind::Mcp => 0,
+        AgentTransportKind::Retired => 0,
         AgentTransportKind::Stdio => 1,
         AgentTransportKind::StreamableHttp => 2,
         AgentTransportKind::Other => 3,
@@ -1069,7 +1311,7 @@ fn encode_transport(value: AgentTransportKind) -> i64 {
 
 fn decode_transport(value: i64) -> Result<AgentTransportKind, AgentStoreError> {
     match value {
-        0 => Ok(AgentTransportKind::Mcp),
+        0 => Ok(AgentTransportKind::Retired),
         1 => Ok(AgentTransportKind::Stdio),
         2 => Ok(AgentTransportKind::StreamableHttp),
         3 => Ok(AgentTransportKind::Other),
@@ -1137,69 +1379,94 @@ fn decode_work_phase(value: i64) -> Result<AgentWorkPhase, AgentStoreError> {
 }
 
 fn decode_agent(row: &Row<'_>) -> Result<RegisteredAgentInstance, AgentStoreError> {
+    decode_agent_at(row, 25)
+}
+
+fn decode_agent_at(
+    row: &Row<'_>,
+    session_index: usize,
+) -> Result<RegisteredAgentInstance, AgentStoreError> {
     let id: Vec<u8> = row.get(0)?;
     let workspace_id: Vec<u8> = row.get(1)?;
     let activity_id: Vec<u8> = row.get(2)?;
-    validate_exact_length("agent_id", row.get(15)?, ID_BYTES_I64)?;
-    validate_exact_length("agent.workspace_id", row.get(16)?, ID_BYTES_I64)?;
-    validate_exact_length("agent.activity_id", row.get(17)?, ID_BYTES_I64)?;
+    validate_exact_length("agent_id", row.get(17)?, ID_BYTES_I64)?;
+    validate_exact_length("agent.workspace_id", row.get(18)?, ID_BYTES_I64)?;
+    validate_exact_length("agent.activity_id", row.get(19)?, ID_BYTES_I64)?;
     validate_text_length(
         "agent.display_name",
-        row.get(18)?,
+        row.get(20)?,
         forge_domain::MAX_AGENT_DISPLAY_NAME_BYTES,
     )?;
-    validate_text_length("agent.declared_role", row.get(19)?, MAX_METADATA_BYTES)?;
-    if let Some(length) = row.get::<_, Option<i64>>(20)? {
+    validate_text_length("agent.declared_role", row.get(21)?, MAX_METADATA_BYTES)?;
+    if let Some(length) = row.get::<_, Option<i64>>(22)? {
+        validate_exact_length("agent.principal_id", length, ID_BYTES_I64)?;
+    }
+    if let Some(length) = row.get::<_, Option<i64>>(23)? {
         validate_exact_length("agent.focus_goal_id", length, ID_BYTES_I64)?;
     }
-    if let Some(length) = row.get::<_, Option<i64>>(21)? {
+    if let Some(length) = row.get::<_, Option<i64>>(24)? {
         validate_exact_length("agent.focus_node_id", length, ID_BYTES_I64)?;
     }
-    let principal: Option<Vec<u8>> = row.get(22)?;
-    let principal_length: Option<i64> = row.get(23)?;
-    let transport_principal = match (principal, principal_length) {
-        (None, None) => None,
-        (Some(value), Some(length)) => {
-            validate_exact_length("agent_transport_principals.token_id", length, ID_BYTES_I64)?;
-            Some(McpTokenId::from_uuid(decode_uuid(
+    let session_id = row
+        .get::<_, Option<Vec<u8>>>(session_index)?
+        .map(|value| {
+            validate_exact_length(
+                "agent.session_id",
+                i64::try_from(value.len()).unwrap_or(i64::MAX),
+                ID_BYTES_I64,
+            )?;
+            Ok::<_, AgentStoreError>(forge_domain::AgentSessionId::from_uuid(decode_uuid(
                 &value,
-                "agent_transport_principals.token_id",
+                "agent.session_id",
             )?))
-        }
-        _ => {
-            return Err(AgentStoreError::CorruptRecord(
-                "agent_transport_principals.token_id",
-            ));
-        }
-    };
+        })
+        .transpose()?;
+    let principal = decode_principal(row.get(6)?, row.get(7)?)?;
     let focus = decode_focus(
-        row.get(7)?,
-        row.get(8)?,
         row.get(9)?,
         row.get(10)?,
         row.get(11)?,
+        row.get(12)?,
+        row.get(13)?,
     )?;
-    let created_at = decode_timestamp(row.get(12)?, "agent.created_at_ms")?;
-    let updated_at = decode_timestamp(row.get(13)?, "agent.updated_at_ms")?;
-    let revision = AgentInstanceRevision::new(row.get(14)?)
+    let created_at = decode_timestamp(row.get(14)?, "agent.created_at_ms")?;
+    let updated_at = decode_timestamp(row.get(15)?, "agent.updated_at_ms")?;
+    let revision = AgentInstanceRevision::new(row.get(16)?)
         .map_err(|_| AgentStoreError::CorruptRecord("agent.revision"))?;
-    RegisteredAgentInstance::from_parts_with_principal(
-        decode_agent_id(&id)?,
-        decode_workspace_id(&workspace_id)?,
-        decode_activity_id(&activity_id)?,
-        AgentDisplayName::new(row.get(3)?)
+    RegisteredAgentInstance::from_parts(forge_domain::AgentRecordParts {
+        id: decode_agent_id(&id)?,
+        workspace_id: decode_workspace_id(&workspace_id)?,
+        activity_id: decode_activity_id(&activity_id)?,
+        session_id,
+        display_name: AgentDisplayName::new(row.get(3)?)
             .map_err(|_| AgentStoreError::CorruptRecord("agent.display_name"))?,
-        AgentDeclaredRole::new(row.get(4)?)
+        declared_role: AgentDeclaredRole::new(row.get(4)?)
             .map_err(|_| AgentStoreError::CorruptRecord("agent.declared_role"))?,
-        decode_transport(row.get(5)?)?,
-        transport_principal,
-        decode_attachment_state(row.get(6)?)?,
+        transport_kind: decode_transport(row.get(5)?)?,
+        principal,
+        attachment_state: decode_attachment_state(row.get(8)?)?,
         focus,
         created_at,
         updated_at,
         revision,
-    )
+    })
     .map_err(|_| AgentStoreError::CorruptRecord("agent.projection"))
+}
+
+fn decode_principal(
+    kind: i64,
+    identifier: Option<Vec<u8>>,
+) -> Result<AuthenticatedPrincipal, AgentStoreError> {
+    match (kind, identifier) {
+        (0, None) => Ok(AuthenticatedPrincipal::TrustedStdio),
+        (1, Some(value)) => Ok(AuthenticatedPrincipal::DirectToken(
+            forge_domain::DirectTokenId::from_uuid(decode_uuid(&value, "agent.principal_id")?),
+        )),
+        (2, Some(value)) => Ok(AuthenticatedPrincipal::OAuthGrant(
+            forge_domain::OAuthGrantId::from_uuid(decode_uuid(&value, "agent.principal_id")?),
+        )),
+        _ => Err(AgentStoreError::CorruptRecord("agent.principal")),
+    }
 }
 
 fn decode_focus(
@@ -1581,8 +1848,9 @@ fn decode_node_id(value: &[u8]) -> Result<DagNodeId, AgentStoreError> {
     Ok(DagNodeId::from_uuid(decode_uuid(value, "dag_node_id")?))
 }
 
-const AGENT_BY_ID_QUERY: &str = "SELECT ai.agent_id, ai.workspace_id, ai.activity_id, ai.display_name, ai.declared_role, ai.transport_kind, ai.attachment_state, ai.focus_goal_id, ai.focus_goal_revision, ai.focus_dag_revision, ai.focus_node_id, ai.focus_node_revision, ai.created_at_ms, ai.updated_at_ms, ai.revision, length(ai.agent_id), length(ai.workspace_id), length(ai.activity_id), length(CAST(ai.display_name AS BLOB)), length(CAST(ai.declared_role AS BLOB)), length(ai.focus_goal_id), length(ai.focus_node_id), p.token_id, length(p.token_id) FROM agent_instances AS ai LEFT JOIN agent_transport_principals AS p ON p.agent_id = ai.agent_id AND p.workspace_id = ai.workspace_id AND p.activity_id = ai.activity_id WHERE ai.agent_id = ?1";
-const AGENTS_BY_WORKSPACE_QUERY: &str = "SELECT ai.agent_id, ai.workspace_id, ai.activity_id, ai.display_name, ai.declared_role, ai.transport_kind, ai.attachment_state, ai.focus_goal_id, ai.focus_goal_revision, ai.focus_dag_revision, ai.focus_node_id, ai.focus_node_revision, ai.created_at_ms, ai.updated_at_ms, ai.revision, length(ai.agent_id), length(ai.workspace_id), length(ai.activity_id), length(CAST(ai.display_name AS BLOB)), length(CAST(ai.declared_role AS BLOB)), length(ai.focus_goal_id), length(ai.focus_node_id), p.token_id, length(p.token_id), a.activity_id, a.workspace_id, a.state, a.created_at_ms, a.updated_at_ms, a.revision, a.lease_owner_id, a.lease_until_ms, a.lease_revision, length(a.lease_owner_id) FROM agent_instances AS ai LEFT JOIN agent_transport_principals AS p ON p.agent_id = ai.agent_id AND p.workspace_id = ai.workspace_id AND p.activity_id = ai.activity_id JOIN activities AS a ON a.activity_id = ai.activity_id WHERE ai.workspace_id = ?1 AND (?2 IS NULL OR ai.activity_id = ?2) ORDER BY ai.updated_at_ms DESC, ai.agent_id DESC LIMIT ?3";
+const AGENT_BY_ID_QUERY: &str = "SELECT ai.agent_id, ai.workspace_id, ai.activity_id, ai.display_name, ai.declared_role, ai.transport_kind, ai.principal_kind, ai.principal_id, ai.attachment_state, ai.focus_goal_id, ai.focus_goal_revision, ai.focus_dag_revision, ai.focus_node_id, ai.focus_node_revision, ai.created_at_ms, ai.updated_at_ms, ai.revision, length(ai.agent_id), length(ai.workspace_id), length(ai.activity_id), length(CAST(ai.display_name AS BLOB)), length(CAST(ai.declared_role AS BLOB)), length(ai.principal_id), length(ai.focus_goal_id), length(ai.focus_node_id), ai.session_id FROM agent_instances AS ai WHERE ai.agent_id = ?1";
+const AGENTS_EXPORT_QUERY: &str = "SELECT substr(ai.agent_id,1,17), substr(ai.workspace_id,1,17), substr(ai.activity_id,1,17), substr(ai.display_name,1,129), substr(ai.declared_role,1,129), ai.transport_kind, ai.principal_kind, substr(ai.principal_id,1,17), ai.attachment_state, substr(ai.focus_goal_id,1,17), ai.focus_goal_revision, ai.focus_dag_revision, substr(ai.focus_node_id,1,17), ai.focus_node_revision, ai.created_at_ms, ai.updated_at_ms, ai.revision, length(ai.agent_id), length(ai.workspace_id), length(ai.activity_id), length(CAST(ai.display_name AS BLOB)), length(CAST(ai.declared_role AS BLOB)), length(ai.principal_id), length(ai.focus_goal_id), length(ai.focus_node_id), substr(ai.session_id,1,17) FROM agent_instances AS ai WHERE ai.workspace_id = ?1 AND (?2 IS NULL OR ai.agent_id > ?2) ORDER BY ai.agent_id ASC LIMIT ?3";
+const AGENTS_BY_WORKSPACE_QUERY: &str = "SELECT ai.agent_id, ai.workspace_id, ai.activity_id, ai.display_name, ai.declared_role, ai.transport_kind, ai.principal_kind, ai.principal_id, ai.attachment_state, ai.focus_goal_id, ai.focus_goal_revision, ai.focus_dag_revision, ai.focus_node_id, ai.focus_node_revision, ai.created_at_ms, ai.updated_at_ms, ai.revision, length(ai.agent_id), length(ai.workspace_id), length(ai.activity_id), length(CAST(ai.display_name AS BLOB)), length(CAST(ai.declared_role AS BLOB)), length(ai.principal_id), length(ai.focus_goal_id), length(ai.focus_node_id), a.activity_id, a.workspace_id, a.state, a.created_at_ms, a.updated_at_ms, a.revision, a.lease_owner_id, a.lease_until_ms, a.lease_revision, length(a.lease_owner_id), ai.session_id FROM agent_instances AS ai JOIN activities AS a ON a.activity_id = ai.activity_id WHERE ai.workspace_id = ?1 AND (?2 IS NULL OR ai.activity_id = ?2) ORDER BY ai.updated_at_ms DESC, ai.agent_id DESC LIMIT ?3";
 const ACTIVITY_BY_ID_QUERY: &str = "SELECT activity_id, workspace_id, state, created_at_ms, updated_at_ms, revision, lease_owner_id, lease_until_ms, lease_revision, length(lease_owner_id) FROM activities WHERE activity_id = ?1";
 const FOCUS_EVENTS_QUERY: &str = "SELECT agent_id, workspace_id, activity_id, event_sequence, event_kind, focus_goal_id, length(focus_goal_id), focus_goal_revision, focus_dag_revision, focus_node_id, length(focus_node_id), focus_node_revision, observed_at_ms, length(agent_id), length(workspace_id), length(activity_id) FROM agent_focus_events WHERE agent_id = ?1 ORDER BY event_sequence DESC LIMIT ?2";
 const WORK_UPDATES_QUERY: &str = "SELECT update_id, agent_id, workspace_id, activity_id, update_sequence, phase, summary, length(CAST(summary AS BLOB)), evidence_count, observed_at_ms, length(update_id), length(agent_id), length(workspace_id), length(activity_id) FROM agent_work_updates WHERE agent_id = ?1 ORDER BY update_sequence DESC LIMIT ?2";
@@ -1593,15 +1861,43 @@ const WORK_UPDATE_EVIDENCE_FOR_AGENT_QUERY: &str = "SELECT e.update_id, e.eviden
 #[derive(Debug, Error)]
 pub enum AgentStoreError {
     #[error(transparent)]
+    WorkCut(#[from] Box<crate::WorkCutError>),
+    #[error("Agent work fact could not be recorded")]
+    EffectOutbox(#[source] Box<crate::AgentEffectOutboxError>),
+    #[error(transparent)]
+    OperationsMigration(#[from] crate::AgentOperationsMigrationError),
+    #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
+    #[error(transparent)]
+    Events(#[from] AgentEventStoreError),
     #[error("Agent instance identity conflicts with the existing row")]
     IdentityConflict,
+    #[error("Agent session is already attached to another instance in this Activity")]
+    SessionAttachmentConflict,
+    #[error("Agent session principal conflicts with the existing attachment")]
+    SessionPrincipalConflict,
+    #[error("Agent session binding is missing")]
+    SessionBindingConflict,
+    #[error("Authenticated principal conflicts with the Agent attachment")]
+    PrincipalConflict,
+    #[error("Unresolved legacy Agent {0} cannot use a session-bound mutation")]
+    UnresolvedLegacy(AgentInstanceId),
     #[error("Agent {0} was not found")]
     AgentNotFound(AgentInstanceId),
     #[error("Agent {0} is detached")]
     AgentDetached(AgentInstanceId),
+    #[error("Current Coordinator Agent {0} must use an explicit handoff before detaching")]
+    CurrentCoordinatorCannotDetach(AgentInstanceId),
+    #[error("Agent {0} has an active Writer Lease")]
+    ActiveWriterLease(AgentInstanceId),
+    #[error("Agent {0} has an active execution")]
+    ActiveExecution(AgentInstanceId),
     #[error("Activity {0} was not found")]
     ActivityNotFound(ActivityId),
+    #[error("Activity {0} is not Open")]
+    ActivityNotLive(ActivityId),
+    #[error("Activity {0} has no live owner lease")]
+    ActivityLeaseNotLive(ActivityId),
     #[error("Activity belongs to a different Workspace")]
     ActivityWorkspaceMismatch {
         expected: WorkspaceId,
@@ -1667,24 +1963,35 @@ pub enum AgentStoreError {
     DamagedSchema(&'static str),
 }
 
+impl From<crate::WorkCutError> for AgentStoreError {
+    fn from(error: crate::WorkCutError) -> Self {
+        Self::WorkCut(Box::new(error))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{WorkspaceStore, WorkspaceStoreError};
     use forge_domain::{
-        ActivityId, AgentDeclaredRole, AgentDisplayName, AgentInstanceId, AgentListLimit,
-        AgentTransportKind, AgentWorkPhase, AgentWorkSummary, AgentWorkUpdate, AgentWorkUpdateId,
-        AgentWorkUpdateSequence, CreateActivity, DetachAgent, EstablishWorkspace, LocationId,
-        RegisteredAgentInstance, SetAgentFocus, TimestampMillis, WorkspaceId, WorkspaceRevision,
-        WorkspaceRoot,
+        ActivityCoordinatorActor, ActivityId, ActivityState, AgentDeclaredRole, AgentDisplayName,
+        AgentEventKind, AgentInboxListLimit, AgentInstanceId, AgentListLimit, AgentParticipantRef,
+        AgentSessionId, AgentTransportKind, AgentWorkPhase, AgentWorkSummary, AgentWorkUpdate,
+        AgentWorkUpdateId, AgentWorkUpdateSequence, AuthenticatedPrincipal, BootstrapActivity,
+        ClaimActivityCoordinator, CreateActivity, DirectTokenId, EstablishWorkspace, LocationId,
+        RegisteredAgentInstance, ReleaseActivityLease, RuntimeInstanceId, SetActivityState,
+        SetAgentFocus, TimestampMillis, WorkspaceId, WorkspaceRevision, WorkspaceRoot,
     };
     use forge_workspace::WorkspaceStateLayout;
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    type PrincipalCase = (AuthenticatedPrincipal, EncodedPrincipal);
+
     #[test]
-    fn schema_has_all_v15_objects_without_agent_rows() -> Result<(), Box<dyn std::error::Error>> {
+    fn schema_has_current_agent_objects_and_required_principal_columns()
+    -> Result<(), Box<dyn std::error::Error>> {
         let connection = Connection::open_in_memory()?;
         connection.execute_batch("PRAGMA foreign_keys = ON; CREATE TABLE workspace (workspace_id BLOB PRIMARY KEY); CREATE TABLE activities (activity_id BLOB PRIMARY KEY, workspace_id BLOB); CREATE TABLE goals (goal_id BLOB PRIMARY KEY); CREATE TABLE goal_dag_revisions (goal_id BLOB, dag_revision INTEGER, PRIMARY KEY(goal_id, dag_revision)); CREATE TABLE goal_dag_nodes (goal_id BLOB, dag_revision INTEGER, node_id BLOB, PRIMARY KEY(goal_id, dag_revision, node_id));")?;
         create_schema(&connection)?;
@@ -1692,6 +1999,28 @@ mod tests {
         let count: i64 =
             connection.query_row("SELECT count(*) FROM agent_instances", [], |row| row.get(0))?;
         assert_eq!(count, 0);
+        let columns: Vec<String> = connection
+            .prepare("PRAGMA table_info(agent_instances)")?
+            .query_map([], |row| row.get(1))?
+            .collect::<Result<_, _>>()?;
+        assert!(columns.contains(&"principal_kind".to_owned()));
+        assert!(columns.contains(&"principal_id".to_owned()));
+        assert!(columns.contains(&"session_id".to_owned()));
+        let session_index: String = connection.query_row(
+            "SELECT sql FROM sqlite_schema WHERE type = 'index' AND name = 'agent_instances_activity_session_uidx'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert!(session_index.contains("UNIQUE"));
+        assert!(session_index.contains("session_id IS NOT NULL"));
+        let legacy_table: Option<String> = connection
+            .query_row(
+                "SELECT name FROM sqlite_schema WHERE type = 'table' AND name = 'agent_transport_principals'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        assert!(legacy_table.is_none());
         Ok(())
     }
 
@@ -1700,6 +2029,35 @@ mod tests {
         assert_eq!(encode_focus_event_kind(AgentFocusEventKind::Attached), 0);
         assert_eq!(encode_focus_event_kind(AgentFocusEventKind::Changed), 1);
         assert_eq!(encode_focus_event_kind(AgentFocusEventKind::Detached), 2);
+    }
+
+    #[test]
+    fn authenticated_principal_encoding_is_complete_and_fail_closed() {
+        let token = DirectTokenId::from_uuid(Uuid::from_u128(0xA301));
+        let grant = forge_domain::OAuthGrantId::from_uuid(Uuid::from_u128(0xA302));
+        let cases: [PrincipalCase; 3] = [
+            (AuthenticatedPrincipal::TrustedStdio, (0, None)),
+            (
+                AuthenticatedPrincipal::DirectToken(token),
+                (1, Some(token.into_uuid().as_bytes().to_vec())),
+            ),
+            (
+                AuthenticatedPrincipal::OAuthGrant(grant),
+                (2, Some(grant.into_uuid().as_bytes().to_vec())),
+            ),
+        ];
+        for (principal, (kind, identifier)) in cases {
+            let encoded = encode_principal(principal);
+            assert_eq!(encoded, (kind, identifier));
+            assert!(matches!(
+                decode_principal(encoded.0, encoded.1),
+                Ok(actual) if actual == principal
+            ));
+        }
+        assert!(decode_principal(0, Some(vec![0; ID_BYTES])).is_err());
+        assert!(decode_principal(1, None).is_err());
+        assert!(decode_principal(2, Some(vec![0; ID_BYTES - 1])).is_err());
+        assert!(decode_principal(3, Some(vec![0; ID_BYTES])).is_err());
     }
 
     fn fixture_root(label: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -1715,13 +2073,15 @@ mod tests {
         activity_id: ActivityId,
         observed_at: i64,
     ) -> Result<RegisteredAgentInstance, Box<dyn std::error::Error>> {
-        Ok(RegisteredAgentInstance::create(
+        Ok(RegisteredAgentInstance::create_bound(
             AgentInstanceId::from_uuid(Uuid::from_u128(value)),
             workspace_id,
             activity_id,
+            AgentSessionId::from_uuid(Uuid::from_u128(value + 0x5000)),
             AgentDisplayName::new(format!("Agent {value}"))?,
             AgentDeclaredRole::new("planner".to_owned())?,
-            AgentTransportKind::Mcp,
+            AgentTransportKind::Retired,
+            AuthenticatedPrincipal::TrustedStdio,
             TimestampMillis::new(observed_at)?,
         ))
     }
@@ -1730,19 +2090,30 @@ mod tests {
         value: u128,
         workspace_id: WorkspaceId,
         activity_id: ActivityId,
-        token_id: McpTokenId,
+        principal: AuthenticatedPrincipal,
         observed_at: i64,
     ) -> Result<RegisteredAgentInstance, Box<dyn std::error::Error>> {
-        Ok(RegisteredAgentInstance::create_with_principal(
+        Ok(RegisteredAgentInstance::create_bound(
             AgentInstanceId::from_uuid(Uuid::from_u128(value)),
             workspace_id,
             activity_id,
+            AgentSessionId::from_uuid(Uuid::from_u128(value + 0x5000)),
             AgentDisplayName::new(format!("Agent {value}"))?,
             AgentDeclaredRole::new("planner".to_owned())?,
             AgentTransportKind::StreamableHttp,
-            Some(token_id),
+            principal,
             TimestampMillis::new(observed_at)?,
         ))
+    }
+
+    fn seed_agent(
+        layout: &WorkspaceStateLayout,
+        agent: &RegisteredAgentInstance,
+        event_id: Option<forge_domain::AgentEventId>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let connection = Connection::open(layout.database_path())?;
+        connection.pragma_update(None, "foreign_keys", true)?;
+        crate::legacy_agent_seed::seed_agent(&connection, agent, event_id)
     }
 
     #[test]
@@ -1763,31 +2134,41 @@ mod tests {
         );
         let activity_id = ActivityId::from_uuid(Uuid::from_u128(0xA003));
         let mut store = WorkspaceStore::open(&layout, &command)?;
-        let _activity = store.create_activity(&CreateActivity::new(
+        let _activity = store.bootstrap_activity(&BootstrapActivity::new(
             activity_id,
             workspace_id,
             WorkspaceRevision::INITIAL,
+            RuntimeInstanceId::from_uuid(Uuid::from_u128(0xA004)),
+            TimestampMillis::new(7)?,
             TimestampMillis::new(2)?,
         ))?;
-        let token_id = McpTokenId::from_uuid(Uuid::from_u128(0xA012));
-        let first = agent_with_principal(0xA010, workspace_id, activity_id, token_id, 3)?;
-        let second = agent(0xA011, workspace_id, activity_id, 4)?;
-        assert_eq!(store.attach_agent(&first)?, first);
-        assert_eq!(store.attach_agent(&second)?, second);
-        assert_eq!(store.attach_agent(&first)?, first);
-        let conflicting_principal = agent_with_principal(
+        let token_id = DirectTokenId::from_uuid(Uuid::from_u128(0xA012));
+        let first = agent_with_principal(
             0xA010,
             workspace_id,
             activity_id,
-            McpTokenId::from_uuid(Uuid::from_u128(0xA013)),
+            AuthenticatedPrincipal::DirectToken(token_id),
             3,
         )?;
-        assert!(matches!(
-            store.attach_agent(&conflicting_principal),
-            Err(WorkspaceStoreError::Agent(
-                AgentStoreError::IdentityConflict
-            ))
-        ));
+        let second = agent(0xA011, workspace_id, activity_id, 4)?;
+        seed_agent(
+            &layout,
+            &first,
+            Some(crate::workspace_agent_events::derived_event_id(
+                first.id(),
+                first.revision(),
+                AgentEventKind::Joined,
+            )),
+        )?;
+        seed_agent(
+            &layout,
+            &second,
+            Some(crate::workspace_agent_events::derived_event_id(
+                second.id(),
+                second.revision(),
+                AgentEventKind::Joined,
+            )),
+        )?;
 
         let listed = store.list_agent_attachments(
             None,
@@ -1797,7 +2178,10 @@ mod tests {
         assert_eq!(listed.len(), 2);
         assert_eq!(listed[0].agent().id(), second.id());
         assert_eq!(listed[1].agent().id(), first.id());
-        assert_eq!(listed[1].agent().transport_principal(), Some(token_id));
+        assert_eq!(
+            listed[1].agent().principal(),
+            AuthenticatedPrincipal::DirectToken(token_id)
+        );
         let filtered = store.list_agent_attachments(
             Some(activity_id),
             TimestampMillis::new(5)?,
@@ -1817,13 +2201,55 @@ mod tests {
             Vec::new(),
             TimestampMillis::new(6)?,
         )?;
-        assert_eq!(store.publish_agent_work_update(&update)?, update);
-        let detached = store.detach_agent(&DetachAgent::new(
+        assert_eq!(
+            store.publish_agent_work_update(
+                &update,
+                first.session_id().ok_or("session missing")?,
+                first.principal(),
+                TimestampMillis::new(6)?,
+            )?,
+            update
+        );
+        let expired_update = AgentWorkUpdate::new(
+            AgentWorkUpdateId::from_uuid(Uuid::from_u128(0xA021)),
             first.id(),
+            workspace_id,
             activity_id,
-            first.revision(),
-            TimestampMillis::new(7)?,
-        ))?;
+            AgentWorkUpdateSequence::new(2)?,
+            AgentWorkPhase::Planning,
+            AgentWorkSummary::new("Stale audit time cannot bypass expiry".to_owned())?,
+            Vec::new(),
+            TimestampMillis::new(6)?,
+        )?;
+        assert!(matches!(
+            store.publish_agent_work_update(
+                &expired_update,
+                first.session_id().ok_or("session missing")?,
+                first.principal(),
+                TimestampMillis::new(7)?,
+            ),
+            Err(crate::WorkspaceStoreError::Agent(
+                AgentStoreError::ActivityLeaseNotLive(actual_activity_id)
+            )) if actual_activity_id == activity_id
+        ));
+        let connection = Connection::open(layout.database_path())?;
+        let expired_rows: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM agent_work_updates WHERE update_id = ?1",
+            params![expired_update.id().into_uuid().as_bytes()],
+            |row| row.get(0),
+        )?;
+        assert_eq!(expired_rows, 0);
+        drop(connection);
+        let current = store
+            .get_agent(first.id())?
+            .ok_or("attached principal Agent missing")?;
+        let mut direct = Connection::open(layout.database_path())?;
+        direct.pragma_update(None, "foreign_keys", true)?;
+        direct.busy_timeout(std::time::Duration::from_secs(5))?;
+        let transaction = direct.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let detached = detach_in_transaction(&transaction, &current, TimestampMillis::new(7)?)?;
+        transaction.commit()?;
+        drop(direct);
         assert!(detached.attachment_state().is_detached());
         let context = store
             .get_agent_context(
@@ -1853,8 +2279,8 @@ mod tests {
             reopened
                 .get_agent(first.id())?
                 .ok_or("reopened principal Agent missing")?
-                .transport_principal(),
-            Some(token_id)
+                .principal(),
+            AuthenticatedPrincipal::DirectToken(token_id)
         );
         assert_eq!(
             reopened
@@ -1868,6 +2294,194 @@ mod tests {
                 .ok_or("reopened context missing")?
                 .work_updates(),
             &[update]
+        );
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn bound_participation_and_inbox_receipts_are_restartable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = fixture_root("participation")?;
+        let layout = WorkspaceStateLayout::initialize(&root)?;
+        let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(0xA401));
+        let location_id = LocationId::from_uuid(Uuid::from_u128(0xA402));
+        let command = EstablishWorkspace::new(
+            workspace_id,
+            location_id,
+            WorkspaceRoot::from_canonical(layout.workspace_root().to_path_buf())?,
+            layout.root_fingerprint()?,
+            TimestampMillis::new(1)?,
+        );
+        let activity_id = ActivityId::from_uuid(Uuid::from_u128(0xA403));
+        let runtime_id = RuntimeInstanceId::from_uuid(Uuid::from_u128(0xA404));
+        let mut store = WorkspaceStore::open(&layout, &command)?;
+        store.bootstrap_activity(&BootstrapActivity::new(
+            activity_id,
+            workspace_id,
+            WorkspaceRevision::INITIAL,
+            runtime_id,
+            TimestampMillis::new(100)?,
+            TimestampMillis::new(2)?,
+        ))?;
+        let first = agent_with_principal(
+            0xA410,
+            workspace_id,
+            activity_id,
+            AuthenticatedPrincipal::DirectToken(DirectTokenId::from_uuid(Uuid::from_u128(0xA411))),
+            3,
+        )?;
+        let second = agent(0xA420, workspace_id, activity_id, 4)?;
+        seed_agent(
+            &layout,
+            &first,
+            Some(crate::workspace_agent_events::derived_event_id(
+                first.id(),
+                first.revision(),
+                AgentEventKind::Joined,
+            )),
+        )?;
+        let _binding = store.claim_activity_coordinator(
+            ClaimActivityCoordinator::new(
+                workspace_id,
+                activity_id,
+                first.id(),
+                first.principal(),
+                TimestampMillis::new(5)?,
+                first.session_id().ok_or("first session missing")?,
+            ),
+            TimestampMillis::new(6)?,
+        )?;
+        seed_agent(
+            &layout,
+            &second,
+            Some(crate::workspace_agent_events::derived_event_id(
+                second.id(),
+                second.revision(),
+                AgentEventKind::Joined,
+            )),
+        )?;
+
+        let events =
+            store.list_agent_events(activity_id, forge_domain::AgentEventListLimit::DEFAULT)?;
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].kind(), AgentEventKind::Joined);
+        assert_eq!(events[0].membership_revision().get(), 3);
+        assert_eq!(events[1].kind(), AgentEventKind::RoleChanged);
+        let inbox = store.list_agent_inbox(
+            first.id(),
+            first.session_id().ok_or("first session missing")?,
+            AgentInboxListLimit::DEFAULT,
+        )?;
+        assert_eq!(inbox.len(), 1);
+        assert!(!inbox[0].is_acknowledged());
+
+        let current_second = store
+            .get_agent(second.id())?
+            .ok_or("attached second Agent missing")?;
+        let mut direct = Connection::open(layout.database_path())?;
+        direct.pragma_update(None, "foreign_keys", true)?;
+        direct.busy_timeout(std::time::Duration::from_secs(5))?;
+        let transaction = direct.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let detached =
+            detach_in_transaction(&transaction, &current_second, TimestampMillis::new(7)?)?;
+        transaction.commit()?;
+        drop(direct);
+        assert!(detached.attachment_state().is_detached());
+        let events_after_detach =
+            store.list_agent_events(activity_id, forge_domain::AgentEventListLimit::DEFAULT)?;
+        // The legacy operational `Left` writer is retired; detached membership
+        // transitions are now recorded by Orchestration, so the durable event
+        // count keeps the pre-departure history only.
+        assert_eq!(events_after_detach.len(), 3);
+        let presence = store.list_agent_presence(activity_id)?;
+        assert_eq!(presence.counts().current_coordinator(), 1);
+        assert_eq!(presence.counts().detached(), 1);
+        assert_eq!(presence.counts().unresolved_legacy(), 0);
+
+        for offset in 0_i64..64 {
+            let participant = agent(
+                0xA500 + u128::try_from(offset)?,
+                workspace_id,
+                activity_id,
+                10 + offset,
+            )?;
+            seed_agent(
+                &layout,
+                &participant,
+                Some(crate::workspace_agent_events::derived_event_id(
+                    participant.id(),
+                    participant.revision(),
+                    AgentEventKind::Joined,
+                )),
+            )?;
+            let inbox = store.list_agent_inbox(
+                first.id(),
+                first.session_id().ok_or("first session missing")?,
+                AgentInboxListLimit::DEFAULT,
+            )?;
+            // Every new participant join durably appends one receipt for the
+            // current Coordinator; reads stay bounded by the list limit.
+            let expected = usize::try_from(offset + 2)?.min(usize::try_from(
+                forge_domain::AgentInboxListLimit::DEFAULT.get(),
+            )?);
+            assert_eq!(
+                inbox.len(),
+                expected,
+                "receipt count must grow with each joined participant until the read cap"
+            );
+        }
+        let final_participant = agent(0xA600, workspace_id, activity_id, 200)?;
+        seed_agent(
+            &layout,
+            &final_participant,
+            Some(crate::workspace_agent_events::derived_event_id(
+                final_participant.id(),
+                final_participant.revision(),
+                AgentEventKind::Joined,
+            )),
+        )?;
+        let inbox = store.list_agent_inbox(
+            first.id(),
+            first.session_id().ok_or("first session missing")?,
+            AgentInboxListLimit::DEFAULT,
+        )?;
+        assert_eq!(inbox.len(), 64);
+        assert_eq!(
+            inbox[0].event().to().map(AgentParticipantRef::agent_id),
+            Some(final_participant.id())
+        );
+        assert!(!inbox[0].is_acknowledged());
+
+        let activity = store
+            .get_activity(activity_id)?
+            .ok_or("activity missing before close")?;
+        let _released = store.release_activity_lease(&ReleaseActivityLease::new(
+            activity_id,
+            runtime_id,
+            activity.lease_revision(),
+            TimestampMillis::new(74)?,
+        ))?;
+        let _closed = store.set_activity_state(&SetActivityState::new(
+            activity_id,
+            activity.revision(),
+            ActivityState::Closed,
+            TimestampMillis::new(75)?,
+        ))?;
+        drop(store);
+        let existing = WorkspaceStateLayout::inspect_existing(&root)?.ok_or("layout missing")?;
+        let reopened = WorkspaceStore::open_existing(&existing)?;
+        let retained = reopened.list_agent_inbox(
+            first.id(),
+            first.session_id().ok_or("first session missing")?,
+            AgentInboxListLimit::DEFAULT,
+        )?;
+        assert_eq!(retained.len(), 64);
+        assert!(!retained[0].is_acknowledged());
+        assert!(
+            retained.iter().all(|entry| !entry.is_acknowledged()),
+            "unacknowledged receipts must restart unchanged"
         );
         fs::remove_dir_all(root)?;
         Ok(())
@@ -1889,14 +2503,43 @@ mod tests {
         );
         let activity_id = ActivityId::from_uuid(Uuid::from_u128(0xA103));
         let mut store = WorkspaceStore::open(&layout, &command)?;
-        store.create_activity(&CreateActivity::new(
+        let _ = store.bootstrap_activity(&BootstrapActivity::new(
             activity_id,
             workspace_id,
             WorkspaceRevision::INITIAL,
+            RuntimeInstanceId::from_uuid(Uuid::from_u128(0xA104)),
+            TimestampMillis::new(100)?,
             TimestampMillis::new(2)?,
         ))?;
         let instance = agent(0xA110, workspace_id, activity_id, 3)?;
-        let _ = store.attach_agent(&instance)?;
+        seed_agent(
+            &layout,
+            &instance,
+            Some(crate::workspace_agent_events::derived_event_id(
+                instance.id(),
+                instance.revision(),
+                AgentEventKind::Joined,
+            )),
+        )?;
+        let coordinator = store.claim_activity_coordinator(
+            ClaimActivityCoordinator::new(
+                workspace_id,
+                activity_id,
+                instance.id(),
+                AuthenticatedPrincipal::TrustedStdio,
+                TimestampMillis::new(4)?,
+                instance.session_id().ok_or("session missing")?,
+            ),
+            TimestampMillis::new(5)?,
+        )?;
+        let actor = ActivityCoordinatorActor::new(
+            workspace_id,
+            activity_id,
+            instance.id(),
+            coordinator.revision(),
+            AuthenticatedPrincipal::TrustedStdio,
+            instance.session_id().ok_or("session missing")?,
+        );
         let focus = AgentFocus::new(
             Some(GoalAttribution::new(
                 forge_domain::GoalId::from_uuid(Uuid::from_u128(0xA111)),
@@ -1905,13 +2548,17 @@ mod tests {
             Some(DagRevisionNumber::INITIAL),
             None,
         )?;
-        let Err(error) = store.set_agent_focus(&SetAgentFocus::new(
-            instance.id(),
-            activity_id,
-            instance.revision(),
-            focus,
-            TimestampMillis::new(4)?,
-        )) else {
+        let Err(error) = store.set_agent_focus(
+            actor,
+            &SetAgentFocus::new(
+                instance.id(),
+                activity_id,
+                instance.revision(),
+                focus,
+                TimestampMillis::new(5)?,
+            ),
+            TimestampMillis::new(6)?,
+        ) else {
             return Err("missing Goal unexpectedly accepted focus".into());
         };
         assert!(matches!(
@@ -1919,47 +2566,6 @@ mod tests {
             crate::WorkspaceStoreError::Agent(AgentStoreError::FocusGoalMissing(_))
         ));
         assert_eq!(store.get_agent(instance.id())?, Some(instance));
-        fs::remove_dir_all(root)?;
-        Ok(())
-    }
-
-    #[test]
-    fn v14_to_current_migration_adds_empty_agent_authority_without_rows()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let root = fixture_root("migration")?;
-        let layout = WorkspaceStateLayout::initialize(&root)?;
-        let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(0xA201));
-        let location_id = LocationId::from_uuid(Uuid::from_u128(0xA202));
-        let command = EstablishWorkspace::new(
-            workspace_id,
-            location_id,
-            WorkspaceRoot::from_canonical(layout.workspace_root().to_path_buf())?,
-            layout.root_fingerprint()?,
-            TimestampMillis::new(1)?,
-        );
-        let store = WorkspaceStore::open(&layout, &command)?;
-        drop(store);
-        let database = layout.database_path();
-        let connection = Connection::open(database)?;
-        connection.execute_batch(
-            "PRAGMA wal_checkpoint(TRUNCATE);
-             PRAGMA journal_mode = DELETE;
-             DROP TABLE agent_work_update_evidence_refs;
-             DROP TABLE agent_work_updates;
-             DROP TABLE agent_focus_events;
-             DROP TABLE agent_instances;
-             PRAGMA user_version = 14;",
-        )?;
-        drop(connection);
-        let existing = WorkspaceStateLayout::inspect_existing(&root)?.ok_or("layout missing")?;
-        let migrated = WorkspaceStore::open_existing(&existing)?;
-        assert_eq!(migrated.health()?.schema_version(), 16);
-        drop(migrated);
-        let reopened_connection = Connection::open(existing.database_path())?;
-        let agent_count: i64 =
-            reopened_connection
-                .query_row("SELECT count(*) FROM agent_instances", [], |row| row.get(0))?;
-        assert_eq!(agent_count, 0);
         fs::remove_dir_all(root)?;
         Ok(())
     }
@@ -1987,7 +2593,15 @@ mod tests {
             TimestampMillis::new(2)?,
         ))?;
         let instance = agent(0xA310, workspace_id, activity_id, 3)?;
-        let _ = store.attach_agent(&instance)?;
+        seed_agent(
+            &layout,
+            &instance,
+            Some(crate::workspace_agent_events::derived_event_id(
+                instance.id(),
+                instance.revision(),
+                AgentEventKind::Joined,
+            )),
+        )?;
         drop(store);
         let connection = Connection::open(layout.database_path())?;
         connection.execute_batch(
@@ -2007,4 +2621,59 @@ mod tests {
         fs::remove_dir_all(root)?;
         Ok(())
     }
+
+    #[test]
+    fn corrupted_authenticated_principal_fails_closed_on_projection_read()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = fixture_root("principal-corruption")?;
+        let layout = WorkspaceStateLayout::initialize(&root)?;
+        let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(0xA401));
+        let location_id = LocationId::from_uuid(Uuid::from_u128(0xA402));
+        let command = EstablishWorkspace::new(
+            workspace_id,
+            location_id,
+            WorkspaceRoot::from_canonical(layout.workspace_root().to_path_buf())?,
+            layout.root_fingerprint()?,
+            TimestampMillis::new(1)?,
+        );
+        let activity_id = ActivityId::from_uuid(Uuid::from_u128(0xA403));
+        let mut store = WorkspaceStore::open(&layout, &command)?;
+        store.create_activity(&CreateActivity::new(
+            activity_id,
+            workspace_id,
+            WorkspaceRevision::INITIAL,
+            TimestampMillis::new(2)?,
+        ))?;
+        let instance = agent(0xA410, workspace_id, activity_id, 3)?;
+        seed_agent(
+            &layout,
+            &instance,
+            Some(crate::workspace_agent_events::derived_event_id(
+                instance.id(),
+                instance.revision(),
+                AgentEventKind::Joined,
+            )),
+        )?;
+        drop(store);
+        let connection = Connection::open(layout.database_path())?;
+        connection.execute_batch(
+            "PRAGMA ignore_check_constraints = ON;
+             UPDATE agent_instances SET principal_kind = 1, principal_id = NULL;
+             PRAGMA ignore_check_constraints = OFF;",
+        )?;
+        drop(connection);
+        let existing = WorkspaceStateLayout::inspect_existing(&root)?.ok_or("layout missing")?;
+        let reopened = WorkspaceStore::open_existing(&existing)?;
+        assert!(matches!(
+            reopened.get_agent(instance.id()),
+            Err(WorkspaceStoreError::Agent(AgentStoreError::CorruptRecord(
+                "agent.principal"
+            )))
+        ));
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
 }
+
+#[cfg(test)]
+mod delegation_tests;

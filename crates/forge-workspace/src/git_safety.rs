@@ -16,6 +16,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus, Stdio};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -32,12 +33,26 @@ use crate::{
     ConfinedFilesystemError, ConfinedWorkspace, ExistingWorkspaceStateLayout, WorkspaceStateLayout,
 };
 
-const GIT_PROGRAM: &str = "/usr/bin/git";
+#[path = "worker_worktree.rs"]
+pub(crate) mod worker_worktree;
+#[path = "worker_worktree_linux.rs"]
+pub(crate) mod worker_worktree_linux;
+
+/// Pinned Git executable used for all Forge-owned Git operations.
+///
+/// macOS uses the Command Line Tools binary directly, avoiding the xcrun shim.
+/// Linux uses the system Git binary provisioned in the execution image.
+/// Neither platform resolves Git through the caller's PATH; every call keeps
+/// its environment explicitly bounded.
+#[cfg(not(target_os = "linux"))]
+pub const FORGE_GIT_PROGRAM: &str = "/Library/Developer/CommandLineTools/usr/bin/git";
+#[cfg(target_os = "linux")]
+pub const FORGE_GIT_PROGRAM: &str = "/usr/bin/git";
 const STATE_DIRECTORY_NAME: &[u8] = b".heterarchy-forge";
 const CHECKPOINT_DIRECTORY_NAME: &[u8] = b"checkpoints";
 const GIT_REF_PREFIX: &str = "refs/heterarchy-forge/checkpoints/";
 const MAX_GIT_OUTPUT_BYTES: usize = 64 * 1024;
-const MAX_CHECKPOINT_FILE_BYTES: usize = 1024 * 1024;
+const MAX_CHECKPOINT_FILE_BYTES: usize = crate::MAX_HASHED_FILE_BYTES;
 const MAX_GIT_STDIN_BYTES: usize = MAX_CHECKPOINT_FILE_BYTES;
 const GIT_PROCESS_TIMEOUT: Duration = Duration::from_secs(10);
 const GIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -291,6 +306,8 @@ pub enum GitSafetyError {
     },
     #[error("Git operation {operation} exceeded the bounded timeout")]
     GitTimeout { operation: String },
+    #[error("Git operation {operation} was cancelled after dispatch")]
+    GitCancelled { operation: String },
     #[error("Git process group could not be terminated")]
     GitProcessCleanupFailed,
     #[error("Git {stream} exceeded the {maximum}-byte capture bound")]
@@ -774,7 +791,7 @@ impl GitCheckpointStore {
                     source,
                 })?;
         if !head_exists {
-            let output = Command::new(GIT_PROGRAM)
+            let output = Command::new(FORGE_GIT_PROGRAM)
                 .arg("init")
                 .arg("-q")
                 .arg("--bare")
@@ -1379,62 +1396,6 @@ impl GitCheckpointStore {
         self.run_git_with_limit(operation, arguments, stdin, extra_env, MAX_GIT_OUTPUT_BYTES)
     }
 
-    fn spawn_git(
-        &self,
-        operation: &str,
-        arguments: &[OsString],
-        stdin: Option<&[u8]>,
-        extra_env: &[(&str, OsString)],
-    ) -> Result<Child, GitSafetyError> {
-        if stdin.is_some_and(|bytes| bytes.len() > MAX_GIT_STDIN_BYTES) {
-            return Err(GitSafetyError::GitInputTooLarge {
-                maximum: MAX_GIT_STDIN_BYTES,
-            });
-        }
-        self.confined
-            .ensure_for_git(false)
-            .map_err(GitSafetyError::Confined)?;
-        let observed_store =
-            directory_identity_by_path(&self.store).map_err(GitSafetyError::Confined)?;
-        if observed_store != self.store_identity {
-            return Err(GitSafetyError::Confined(
-                ConfinedFilesystemError::CommittedPathChanged,
-            ));
-        }
-        let mut command = Command::new(GIT_PROGRAM);
-        command
-            .current_dir(&self.checkpoints)
-            .args(arguments)
-            .env_clear()
-            .env("LANG", "C")
-            .env("LC_ALL", "C")
-            .env("PATH", "/usr/bin:/bin")
-            .env("HOME", "/nonexistent")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .process_group(0)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .stdin(if stdin.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            });
-        for (key, value) in extra_env {
-            command.env(key, value);
-        }
-        command
-            .env("GIT_DIR", &self.store)
-            .env("GIT_NO_REPLACE_OBJECTS", "1")
-            .env("GIT_NO_LAZY_FETCH", "1")
-            .env("GIT_OPTIONAL_LOCKS", "0")
-            .env("GIT_TERMINAL_PROMPT", "0");
-        command.spawn().map_err(|source| GitSafetyError::StartGit {
-            operation: operation.to_owned(),
-            source,
-        })
-    }
-
     fn run_git_with_limit(
         &self,
         operation: &str,
@@ -1443,82 +1404,47 @@ impl GitCheckpointStore {
         extra_env: &[(&str, OsString)],
         output_limit: usize,
     ) -> Result<GitOutput, GitSafetyError> {
-        let mut child = self.spawn_git(operation, arguments, stdin, extra_env)?;
-        let Some(stdout) = child.stdout.take() else {
-            let cleanup_ok = terminate_git_process_group_and_reap(&mut child);
-            if !cleanup_ok {
-                return Err(GitSafetyError::GitProcessCleanupFailed);
-            }
-            return Err(GitSafetyError::GitOutputPipeUnavailable { stream: "stdout" });
+        let mut environment = extra_env.to_vec();
+        environment.push(("GIT_DIR", self.store.clone().into_os_string()));
+        let specification = GitProcessSpec {
+            operation,
+            current_dir: &self.checkpoints,
+            arguments,
+            stdin,
+            extra_env: &environment,
+            output_limit,
+            sandbox_profile: None,
+            cancellation: None,
         };
-        let Some(stderr) = child.stderr.take() else {
-            let cleanup_ok = terminate_git_process_group_and_reap(&mut child);
-            if !cleanup_ok {
-                return Err(GitSafetyError::GitProcessCleanupFailed);
-            }
-            return Err(GitSafetyError::GitOutputPipeUnavailable { stream: "stderr" });
-        };
-        // Git producers such as `hash-object --stdin` must receive input
-        // while their output pipes are being drained; writing synchronously
-        // before starting the readers can deadlock once a pipe fills.
-        let input_thread = if let Some(bytes) = stdin {
-            let Some(mut input) = child.stdin.take() else {
-                let cleanup_ok = terminate_git_process_group_and_reap(&mut child);
-                if !cleanup_ok {
-                    return Err(GitSafetyError::GitProcessCleanupFailed);
+        run_bounded_git_process(
+            &specification,
+            || {
+                self.confined
+                    .ensure_for_git(false)
+                    .map_err(GitSafetyError::Confined)?;
+                let observed_store =
+                    directory_identity_by_path(&self.store).map_err(GitSafetyError::Confined)?;
+                if observed_store != self.store_identity {
+                    return Err(GitSafetyError::Confined(
+                        ConfinedFilesystemError::CommittedPathChanged,
+                    ));
                 }
-                return Err(GitSafetyError::GitOutputPipeUnavailable { stream: "stdin" });
-            };
-            let bytes = bytes.to_vec();
-            Some(thread::spawn(move || input.write_all(&bytes)))
-        } else {
-            None
-        };
-        let (stdout_result, stderr_result, timed_out, mut cleanup_failed) =
-            capture_git_streams(&mut child, stdout, stderr, output_limit);
-        let input_error = input_thread.and_then(|thread| match thread.join() {
-            Ok(Ok(())) => None,
-            Ok(Err(source)) => Some(GitSafetyError::GitInputWrite {
-                operation: operation.to_owned(),
-                source,
-            }),
-            Err(_) => Some(GitSafetyError::GitOutputReaderPanicked { stream: "stdin" }),
-        });
-        if input_error.is_some() {
-            cleanup_failed |= !terminate_git_process_group(&mut child);
-        }
-        let status = child.wait().map_err(|source| GitSafetyError::WaitGit {
-            operation: operation.to_owned(),
-            source,
-        })?;
-        if let Err(source) = self.confined.ensure_for_git(true) {
-            return Err(GitSafetyError::GitPathChangedAfter(source));
-        }
-        if directory_identity_by_path(&self.store).map_err(GitSafetyError::Confined)?
-            != self.store_identity
-        {
-            return Err(GitSafetyError::GitPathChangedAfter(
-                ConfinedFilesystemError::CommittedPathChanged,
-            ));
-        }
-        if cleanup_failed {
-            return Err(GitSafetyError::GitProcessCleanupFailed);
-        }
-        if timed_out {
-            return Err(GitSafetyError::GitTimeout {
-                operation: operation.to_owned(),
-            });
-        }
-        let stdout = map_capture_result(stdout_result, "stdout", output_limit)?;
-        let stderr = map_capture_result(stderr_result, "stderr", output_limit)?;
-        if let Some(error) = input_error {
-            return Err(error);
-        }
-        Ok(GitOutput {
-            status,
-            stdout: stdout.bytes,
-            stderr: stderr.bytes,
-        })
+                Ok(())
+            },
+            || {
+                self.confined
+                    .ensure_for_git(true)
+                    .map_err(GitSafetyError::GitPathChangedAfter)?;
+                if directory_identity_by_path(&self.store).map_err(GitSafetyError::Confined)?
+                    != self.store_identity
+                {
+                    return Err(GitSafetyError::GitPathChangedAfter(
+                        ConfinedFilesystemError::CommittedPathChanged,
+                    ));
+                }
+                Ok(())
+            },
+        )
     }
 }
 
@@ -1665,10 +1591,196 @@ fn checkpoint_commit_message(
 }
 
 #[derive(Debug)]
-struct GitOutput {
-    status: ExitStatus,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
+pub(crate) struct GitOutput {
+    pub(crate) status: ExitStatus,
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
+}
+
+/// Closed platform-owned process confinement profile.
+///
+/// The profile is kept typed through process construction so a Linux
+/// bubblewrap invocation cannot accidentally reinterpret a text profile as
+/// newline-separated argv.  Paths in the Linux arm therefore retain their
+/// native Unix bytes all the way to `Command`.
+#[derive(Debug, Clone)]
+pub(crate) enum GitSandboxProfile {
+    Seatbelt(String),
+    Linux(Vec<OsString>),
+}
+
+/// Bounded Git invocation specification shared by product-owned Git adapters.
+/// The caller owns the source/worktree identity fences; this helper owns only
+/// process isolation, bounded pipes, timeout, cancellation, and joining.
+#[derive(Debug)]
+pub(crate) struct GitProcessSpec<'a> {
+    pub(crate) operation: &'a str,
+    pub(crate) current_dir: &'a Path,
+    pub(crate) arguments: &'a [OsString],
+    pub(crate) stdin: Option<&'a [u8]>,
+    pub(crate) extra_env: &'a [(&'a str, OsString)],
+    pub(crate) output_limit: usize,
+    /// Optional worker confinement profile. `None` preserves the checkpoint
+    /// adapter's existing product-owned bare-store process boundary.
+    pub(crate) sandbox_profile: Option<&'a GitSandboxProfile>,
+    /// A caller-owned cancellation flag. Checkpoint callers deliberately pass
+    /// `None`; worker worktree callers pass their bounded operation flag.
+    pub(crate) cancellation: Option<&'a AtomicBool>,
+}
+
+/// Run one bounded Git process with caller-supplied before/after identity
+/// fences. Errors after process dispatch remain typed so callers can retain
+/// an unknown outcome and perform exact read-back instead of retrying blindly.
+pub(crate) fn run_bounded_git_process<Before, After>(
+    spec: &GitProcessSpec<'_>,
+    before: Before,
+    after: After,
+) -> Result<GitOutput, GitSafetyError>
+where
+    Before: FnOnce() -> Result<(), GitSafetyError>,
+    After: FnOnce() -> Result<(), GitSafetyError>,
+{
+    before()?;
+    if spec
+        .cancellation
+        .is_some_and(|flag| flag.load(Ordering::Acquire))
+    {
+        return Err(GitSafetyError::GitCancelled {
+            operation: spec.operation.to_owned(),
+        });
+    }
+    let mut child = spawn_bounded_git_process(spec)?;
+    let Some(stdout) = child.stdout.take() else {
+        let cleanup_ok = terminate_git_process_group_and_reap(&mut child);
+        if !cleanup_ok {
+            return Err(GitSafetyError::GitProcessCleanupFailed);
+        }
+        return Err(GitSafetyError::GitOutputPipeUnavailable { stream: "stdout" });
+    };
+    let Some(stderr) = child.stderr.take() else {
+        let cleanup_ok = terminate_git_process_group_and_reap(&mut child);
+        if !cleanup_ok {
+            return Err(GitSafetyError::GitProcessCleanupFailed);
+        }
+        return Err(GitSafetyError::GitOutputPipeUnavailable { stream: "stderr" });
+    };
+    let input_thread = if let Some(bytes) = spec.stdin {
+        let Some(mut input) = child.stdin.take() else {
+            let cleanup_ok = terminate_git_process_group_and_reap(&mut child);
+            if !cleanup_ok {
+                return Err(GitSafetyError::GitProcessCleanupFailed);
+            }
+            return Err(GitSafetyError::GitOutputPipeUnavailable { stream: "stdin" });
+        };
+        let bytes = bytes.to_vec();
+        Some(thread::spawn(move || input.write_all(&bytes)))
+    } else {
+        None
+    };
+    let (stdout_result, stderr_result, timed_out, cancelled, mut cleanup_failed) =
+        capture_git_streams(
+            &mut child,
+            stdout,
+            stderr,
+            spec.output_limit,
+            spec.cancellation,
+        );
+    let input_error = input_thread.and_then(|thread| match thread.join() {
+        Ok(Ok(())) => None,
+        Ok(Err(source)) => Some(GitSafetyError::GitInputWrite {
+            operation: spec.operation.to_owned(),
+            source,
+        }),
+        Err(_) => Some(GitSafetyError::GitOutputReaderPanicked { stream: "stdin" }),
+    });
+    if input_error.is_some() {
+        cleanup_failed |= !terminate_git_process_group(&mut child);
+    }
+    let status = child.wait().map_err(|source| GitSafetyError::WaitGit {
+        operation: spec.operation.to_owned(),
+        source,
+    })?;
+    after()?;
+    if cleanup_failed {
+        return Err(GitSafetyError::GitProcessCleanupFailed);
+    }
+    if timed_out {
+        return Err(GitSafetyError::GitTimeout {
+            operation: spec.operation.to_owned(),
+        });
+    }
+    if cancelled {
+        return Err(GitSafetyError::GitCancelled {
+            operation: spec.operation.to_owned(),
+        });
+    }
+    let stdout = map_capture_result(stdout_result, "stdout", spec.output_limit)?;
+    let stderr = map_capture_result(stderr_result, "stderr", spec.output_limit)?;
+    if let Some(error) = input_error {
+        return Err(error);
+    }
+    Ok(GitOutput {
+        status,
+        stdout: stdout.bytes,
+        stderr: stderr.bytes,
+    })
+}
+
+fn spawn_bounded_git_process(spec: &GitProcessSpec<'_>) -> Result<Child, GitSafetyError> {
+    if spec
+        .stdin
+        .is_some_and(|bytes| bytes.len() > MAX_GIT_STDIN_BYTES)
+    {
+        return Err(GitSafetyError::GitInputTooLarge {
+            maximum: MAX_GIT_STDIN_BYTES,
+        });
+    }
+    let mut command = match spec.sandbox_profile {
+        Some(GitSandboxProfile::Seatbelt(profile)) => {
+            let mut command = Command::new("/usr/bin/sandbox-exec");
+            command.arg("-p").arg(profile).arg(FORGE_GIT_PROGRAM);
+            command
+        }
+        Some(GitSandboxProfile::Linux(arguments)) => {
+            let mut command = Command::new(worker_worktree_linux::WORKER_BWRAP);
+            command.args(arguments).arg("--").arg(FORGE_GIT_PROGRAM);
+            command
+        }
+        None => Command::new(FORGE_GIT_PROGRAM),
+    };
+    command
+        .current_dir(spec.current_dir)
+        .args(spec.arguments)
+        .env_clear()
+        .env("LANG", "C")
+        .env("LC_ALL", "C")
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", "/nonexistent")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_PROTOCOL_FROM_USER", "0")
+        .env("GIT_ALLOW_PROTOCOL", "")
+        .process_group(0)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(if spec.stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
+    for (key, value) in spec.extra_env {
+        command.env(key, value);
+    }
+    command
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_TERMINAL_PROMPT", "0");
+    command.spawn().map_err(|source| GitSafetyError::StartGit {
+        operation: spec.operation.to_owned(),
+        source,
+    })
 }
 
 #[derive(Debug)]
@@ -1873,9 +1985,11 @@ fn capture_git_streams(
     stdout: ChildStdout,
     stderr: ChildStderr,
     maximum: usize,
+    cancellation: Option<&AtomicBool>,
 ) -> (
     Result<BoundedCapture, BoundedReadError>,
     Result<BoundedCapture, BoundedReadError>,
+    bool,
     bool,
     bool,
 ) {
@@ -1885,6 +1999,7 @@ fn capture_git_streams(
         stderr,
         maximum,
         Instant::now() + GIT_PROCESS_TIMEOUT,
+        cancellation,
     )
 }
 
@@ -1894,9 +2009,11 @@ fn capture_git_streams_until(
     stderr: ChildStderr,
     maximum: usize,
     deadline: Instant,
+    cancellation: Option<&AtomicBool>,
 ) -> (
     Result<BoundedCapture, BoundedReadError>,
     Result<BoundedCapture, BoundedReadError>,
+    bool,
     bool,
     bool,
 ) {
@@ -1914,10 +2031,15 @@ fn capture_git_streams_until(
         let mut stderr_result = None;
         let mut terminated = false;
         let mut timed_out = false;
+        let mut cancelled = false;
         let mut cleanup_failed = false;
         while stdout_result.is_none() || stderr_result.is_none() {
             let now = Instant::now();
-            if now >= deadline && !terminated {
+            if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) && !terminated {
+                cleanup_failed |= !terminate_git_process_group(child);
+                terminated = true;
+                cancelled = true;
+            } else if now >= deadline && !terminated {
                 cleanup_failed |= !terminate_git_process_group(child);
                 terminated = true;
                 timed_out = true;
@@ -1965,6 +2087,7 @@ fn capture_git_streams_until(
             stderr_result
                 .unwrap_or_else(|| Err(BoundedReadError::Io(io::Error::other("reader missing")))),
             timed_out,
+            cancelled,
             cleanup_failed,
         )
     })
@@ -2169,7 +2292,7 @@ fn parse_git_object_id(operation: &str, output: &[u8]) -> Result<GitObjectId, Gi
         });
     }
     let mut bytes = [0_u8; GitObjectId::BYTE_LEN];
-    for (index, pair) in value.chunks_exact(2).enumerate() {
+    for (index, pair) in value.as_chunks::<2>().0.iter().enumerate() {
         bytes[index] = (hex(pair[0]) << 4) | hex(pair[1]);
     }
     Ok(GitObjectId::from_sha1_bytes(bytes))
@@ -2240,6 +2363,16 @@ mod tests {
 
     use super::*;
 
+    const RUST_CI_SANDBOX_MARKER_ENV: &str = "HETERARCHY_FORGE_RUST_CI_SANDBOX";
+    const RUST_CI_SANDBOX_MARKER_VALUE: &str = "v1";
+    const RUST_CI_TEST_POLICY_ENV: &str = "HETERARCHY_FORGE_RUST_CI_TEST_POLICY";
+    const RUST_CI_TEST_POLICY_VALUE: &str = "outer-rust-ci-v1";
+
+    fn nested_sandbox_process_tests_are_unavailable() -> bool {
+        env::var(RUST_CI_SANDBOX_MARKER_ENV).as_deref() == Ok(RUST_CI_SANDBOX_MARKER_VALUE)
+            && env::var(RUST_CI_TEST_POLICY_ENV).as_deref() == Ok(RUST_CI_TEST_POLICY_VALUE)
+    }
+
     struct TestRepo {
         root: PathBuf,
     }
@@ -2273,7 +2406,7 @@ mod tests {
     }
 
     fn run_git_test(root: &Path, args: &[&str]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-        let output = Command::new(GIT_PROGRAM)
+        let output = Command::new(FORGE_GIT_PROGRAM)
             .arg("-C")
             .arg(root)
             .args(args)
@@ -2300,7 +2433,7 @@ mod tests {
 
     /// Run plumbing against the product-owned bare store.
     fn run_git_store(store: &Path, args: &[&str]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-        let output = Command::new(GIT_PROGRAM)
+        let output = Command::new(FORGE_GIT_PROGRAM)
             .arg("--git-dir")
             .arg(store)
             .args([
@@ -2351,6 +2484,17 @@ mod tests {
             WorkspaceRevision::INITIAL,
             ActivityId::from_uuid(Uuid::from_u128(5)),
         )
+    }
+
+    #[test]
+    fn forge_git_program_is_pinned_to_the_platform_binary() {
+        #[cfg(target_os = "linux")]
+        assert_eq!(FORGE_GIT_PROGRAM, "/usr/bin/git");
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(
+            FORGE_GIT_PROGRAM,
+            "/Library/Developer/CommandLineTools/usr/bin/git"
+        );
     }
 
     #[test]
@@ -2674,6 +2818,9 @@ mod tests {
     #[test]
     fn bounded_git_capture_kills_and_reaps_a_hanging_child()
     -> Result<(), Box<dyn std::error::Error>> {
+        if nested_sandbox_process_tests_are_unavailable() {
+            return Ok(());
+        }
         let mut child = Command::new("/bin/sleep")
             .arg("30")
             .process_group(0)
@@ -2683,12 +2830,13 @@ mod tests {
         let stdout = child.stdout.take().ok_or("missing stdout")?;
         let stderr = child.stderr.take().ok_or("missing stderr")?;
         let started = std::time::Instant::now();
-        let (_, _, timed_out, cleanup_failed) = capture_git_streams_until(
+        let (_, _, timed_out, _cancelled, cleanup_failed) = capture_git_streams_until(
             &mut child,
             stdout,
             stderr,
             MAX_GIT_OUTPUT_BYTES,
             std::time::Instant::now() + Duration::from_millis(50),
+            None,
         );
         let _status = child.wait()?;
         assert!(timed_out);
@@ -2698,8 +2846,55 @@ mod tests {
     }
 
     #[test]
+    fn bounded_git_capture_cancellation_kills_and_reaps_running_group()
+    -> Result<(), Box<dyn std::error::Error>> {
+        if nested_sandbox_process_tests_are_unavailable() {
+            return Ok(());
+        }
+        let marker =
+            env::temp_dir().join(format!("forge-git-cancel-marker-{}", std::process::id()));
+        let _ignored = fs::remove_file(&marker);
+        let command = format!("touch {}; sleep 30", marker.display());
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(command)
+            .process_group(0)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !marker.exists() && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert!(
+            marker.exists(),
+            "test child did not reach its running state"
+        );
+        let stdout = child.stdout.take().ok_or("missing stdout")?;
+        let stderr = child.stderr.take().ok_or("missing stderr")?;
+        let cancellation = AtomicBool::new(true);
+        let (_, _, timed_out, cancelled, cleanup_failed) = capture_git_streams_until(
+            &mut child,
+            stdout,
+            stderr,
+            MAX_GIT_OUTPUT_BYTES,
+            Instant::now() + Duration::from_secs(2),
+            Some(&cancellation),
+        );
+        let _status = child.wait()?;
+        assert!(!timed_out);
+        assert!(cancelled);
+        assert!(!cleanup_failed);
+        let _ignored = fs::remove_file(marker);
+        Ok(())
+    }
+
+    #[test]
     fn process_group_cleanup_kills_pipe_holding_shell_descendant()
     -> Result<(), Box<dyn std::error::Error>> {
+        if nested_sandbox_process_tests_are_unavailable() {
+            return Ok(());
+        }
         let mut child = Command::new("/bin/sh")
             .arg("-c")
             .arg("/bin/sleep 30 &")
@@ -2711,12 +2906,13 @@ mod tests {
         let stdout = child.stdout.take().ok_or("missing stdout")?;
         let stderr = child.stderr.take().ok_or("missing stderr")?;
         let started = std::time::Instant::now();
-        let (_, _, timed_out, cleanup_failed) = capture_git_streams_until(
+        let (_, _, timed_out, _cancelled, cleanup_failed) = capture_git_streams_until(
             &mut child,
             stdout,
             stderr,
             MAX_GIT_OUTPUT_BYTES,
             std::time::Instant::now() + Duration::from_millis(50),
+            None,
         );
         let _status = child.wait()?;
         assert!(timed_out);
@@ -2731,7 +2927,7 @@ mod tests {
         let root = env::temp_dir().join(format!("heterarchy-forge-sha256-{}", std::process::id()));
         let _ignored = fs::remove_dir_all(&root);
         fs::create_dir_all(&root)?;
-        let init = Command::new(GIT_PROGRAM)
+        let init = Command::new(FORGE_GIT_PROGRAM)
             .arg("-C")
             .arg(&root)
             .args(["init", "-q", "--object-format=sha256"])
@@ -3044,7 +3240,7 @@ mod macos_capability_tests {
         ));
         let _ignored = fs::remove_dir_all(&root);
         fs::create_dir_all(&root)?;
-        let init = std::process::Command::new(GIT_PROGRAM)
+        let init = std::process::Command::new(FORGE_GIT_PROGRAM)
             .arg("-C")
             .arg(&root)
             .args(["init", "-q"])

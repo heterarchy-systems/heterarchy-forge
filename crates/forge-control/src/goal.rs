@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 
 use forge_domain::{
-    FilePathState, GoalBlocker, GoalCompletionBlocker, GoalFailure, GoalHardCheck, GoalId,
-    GoalListLimit, GoalReview, GoalRevision, GoalStatusKind, GoalVerificationRequirement,
-    RegisteredGoal, TimestampMillis,
+    ActivityCoordinatorActor, ActivityId, FilePathState, GoalCompletionBlocker, GoalContract,
+    GoalHardCheck, GoalId, GoalListLimit, GoalReview, GoalRevision, GoalStatusKind,
+    GoalVerificationRequirement, RegisteredGoal, TimestampMillis,
 };
 use forge_persistence::{
     GoalCompletionReceipt, GoalStoreError, WorkspaceStore, WorkspaceStoreError,
@@ -17,19 +17,14 @@ use crate::service::{ForgeControl, ResolvedWorkspaceScope};
 
 pub const MAX_GOAL_EVIDENCE_RESULTS: usize = 1_024;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum GoalLifecycleAction {
-    Pause,
-    Resume,
-    Block(GoalBlocker),
-    Fail(GoalFailure),
-    Cancel,
-}
+pub use forge_domain::GoalLifecycleAction;
 
 #[must_use]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GoalLifecycleRequest {
     pub scope: ResolvedWorkspaceScope,
+    pub activity_id: ActivityId,
+    pub actor: ActivityCoordinatorActor,
     pub goal_id: GoalId,
     pub expected_revision: GoalRevision,
     pub observed_at: TimestampMillis,
@@ -38,8 +33,22 @@ pub struct GoalLifecycleRequest {
 
 #[must_use]
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoalContractRevisionRequest {
+    pub scope: ResolvedWorkspaceScope,
+    pub activity_id: ActivityId,
+    pub actor: ActivityCoordinatorActor,
+    pub goal_id: GoalId,
+    pub expected_revision: GoalRevision,
+    pub contract: GoalContract,
+    pub observed_at: TimestampMillis,
+}
+
+#[must_use]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GoalCompletionRequest {
     pub scope: ResolvedWorkspaceScope,
+    pub activity_id: ActivityId,
+    pub actor: ActivityCoordinatorActor,
     pub goal_id: GoalId,
     pub expected_revision: GoalRevision,
     pub review_id: Uuid,
@@ -47,23 +56,30 @@ pub struct GoalCompletionRequest {
 }
 
 impl ForgeControl {
-    pub fn goal_create(
+    pub(crate) fn goal_create(
         &self,
         scope: &ResolvedWorkspaceScope,
+        actor: ActivityCoordinatorActor,
         goal: &RegisteredGoal,
+        admitted_at: TimestampMillis,
     ) -> Result<RegisteredGoal, ControlError> {
+        let _session = self.agent_session_resolve(crate::AgentSessionResolveRequest {
+            session_id: actor.session_id(),
+            principal: actor.principal(),
+        })?;
         if goal.workspace_id() != scope.workspace_id()
             || goal.status().kind() != GoalStatusKind::Active
             || goal.revision() != GoalRevision::INITIAL
         {
             return Err(ControlError::new(ControlErrorCode::GoalConflict));
         }
-        self.update_goal_store(scope, |store| store.insert_goal(goal))
+        self.update_goal_store(scope, |store| store.insert_goal(actor, goal, admitted_at))
     }
 
     pub fn goal_get(
         &self,
         scope: &ResolvedWorkspaceScope,
+        activity_id: ActivityId,
         goal_id: GoalId,
     ) -> Result<Option<RegisteredGoal>, ControlError> {
         let (fresh_scope, store) = self.open_goal_workspace(scope)?;
@@ -76,6 +92,12 @@ impl ForgeControl {
                 ControlErrorCode::WorkspaceIdentityConflict,
             ));
         }
+        if goal
+            .as_ref()
+            .is_some_and(|goal| goal.activity_id() != activity_id)
+        {
+            return Err(ControlError::new(ControlErrorCode::GoalConflict));
+        }
         if !self.committed_scope_matches_with_store(&fresh_scope, &store) {
             return Err(ControlError::new(ControlErrorCode::WorkspaceRootConflict));
         }
@@ -85,11 +107,12 @@ impl ForgeControl {
     pub fn goal_list(
         &self,
         scope: &ResolvedWorkspaceScope,
+        activity_id: ActivityId,
         limit: GoalListLimit,
     ) -> Result<Vec<RegisteredGoal>, ControlError> {
         let (fresh_scope, store) = self.open_goal_workspace(scope)?;
         let goals = store
-            .list_goals(fresh_scope.workspace_id(), limit)
+            .list_goals(fresh_scope.workspace_id(), activity_id, limit)
             .map_err(map_goal_store_error)?;
         if !self.committed_scope_matches_with_store(&fresh_scope, &store) {
             return Err(ControlError::new(ControlErrorCode::WorkspaceRootConflict));
@@ -97,12 +120,59 @@ impl ForgeControl {
         Ok(goals)
     }
 
-    pub fn goal_transition(
+    pub(crate) fn goal_revise_contract(
+        &self,
+        request: &GoalContractRevisionRequest,
+        admitted_at: TimestampMillis,
+    ) -> Result<RegisteredGoal, ControlError> {
+        let _session = self.agent_session_resolve(crate::AgentSessionResolveRequest {
+            session_id: request.actor.session_id(),
+            principal: request.actor.principal(),
+        })?;
+        let (fresh_scope, mut store) = self.open_goal_workspace(&request.scope)?;
+        let current = goal_from_store(
+            &store,
+            request.goal_id,
+            fresh_scope.workspace_id(),
+            request.activity_id,
+        )?;
+        let revised = current
+            .revise_contract(
+                request.expected_revision,
+                request.contract.clone(),
+                request.observed_at,
+            )
+            .map_err(|error| ControlError::with_source(ControlErrorCode::GoalConflict, error))?;
+        let revised = store
+            .revise_goal_contract(
+                request.actor,
+                &revised,
+                request.expected_revision,
+                admitted_at,
+            )
+            .map_err(map_goal_store_error)?;
+        if !self.committed_scope_matches_with_store(&fresh_scope, &store) {
+            return Err(ControlError::committed());
+        }
+        Ok(revised)
+    }
+
+    pub(crate) fn goal_transition(
         &self,
         request: &GoalLifecycleRequest,
+        admitted_at: TimestampMillis,
     ) -> Result<RegisteredGoal, ControlError> {
+        let _session = self.agent_session_resolve(crate::AgentSessionResolveRequest {
+            session_id: request.actor.session_id(),
+            principal: request.actor.principal(),
+        })?;
         let (fresh_scope, mut store) = self.open_goal_workspace(&request.scope)?;
-        let current = goal_from_store(&store, request.goal_id, fresh_scope.workspace_id())?;
+        let current = goal_from_store(
+            &store,
+            request.goal_id,
+            fresh_scope.workspace_id(),
+            request.activity_id,
+        )?;
         let updated = match &request.action {
             GoalLifecycleAction::Pause => {
                 current.pause(request.expected_revision, request.observed_at)
@@ -126,7 +196,12 @@ impl ForgeControl {
         }
         .map_err(|error| ControlError::with_source(ControlErrorCode::GoalConflict, error))?;
         let updated = store
-            .update_goal(&updated, request.expected_revision)
+            .update_goal(
+                request.actor,
+                &updated,
+                request.expected_revision,
+                admitted_at,
+            )
             .map_err(map_goal_store_error)?;
         if !self.committed_scope_matches_with_store(&fresh_scope, &store) {
             return Err(ControlError::committed());
@@ -137,10 +212,11 @@ impl ForgeControl {
     pub fn goal_review(
         &self,
         scope: &ResolvedWorkspaceScope,
+        activity_id: ActivityId,
         goal_id: GoalId,
     ) -> Result<GoalReview, ControlError> {
         let (fresh_scope, layout, store) = self.open_goal_workspace_with_layout(scope)?;
-        let goal = goal_from_store(&store, goal_id, fresh_scope.workspace_id())?;
+        let goal = goal_from_store(&store, goal_id, fresh_scope.workspace_id(), activity_id)?;
         let review = review_goal_with_files(&store, &layout, &goal)?;
         if !self.committed_scope_matches_with_store(&fresh_scope, &store) {
             return Err(ControlError::new(ControlErrorCode::WorkspaceRootConflict));
@@ -148,13 +224,23 @@ impl ForgeControl {
         Ok(review)
     }
 
-    pub fn goal_complete(
+    pub(crate) fn goal_complete(
         &self,
         request: &GoalCompletionRequest,
+        admitted_at: TimestampMillis,
     ) -> Result<RegisteredGoal, ControlError> {
+        let _session = self.agent_session_resolve(crate::AgentSessionResolveRequest {
+            session_id: request.actor.session_id(),
+            principal: request.actor.principal(),
+        })?;
         let (fresh_scope, layout, mut store) =
             self.open_goal_workspace_with_layout(&request.scope)?;
-        let current = goal_from_store(&store, request.goal_id, fresh_scope.workspace_id())?;
+        let current = goal_from_store(
+            &store,
+            request.goal_id,
+            fresh_scope.workspace_id(),
+            request.activity_id,
+        )?;
         let review = review_goal_with_files(&store, &layout, &current)?;
         if !review.can_complete() {
             return Err(ControlError::new(ControlErrorCode::GoalCompletionBlocked));
@@ -179,7 +265,14 @@ impl ForgeControl {
                 .map_err(|_| ControlError::new(ControlErrorCode::CapacityExceeded))?,
         );
         let completed = store
-            .complete_goal(&completed, request.expected_revision, &review, &receipt)
+            .complete_goal(
+                request.actor,
+                &completed,
+                request.expected_revision,
+                &review,
+                &receipt,
+                admitted_at,
+            )
             .map_err(map_goal_store_error)?;
         if !self.committed_scope_matches_with_store(&fresh_scope, &store) {
             return Err(ControlError::committed());
@@ -200,7 +293,7 @@ impl ForgeControl {
         Ok(goal)
     }
 
-    fn open_goal_workspace(
+    pub(crate) fn open_goal_workspace(
         &self,
         scope: &ResolvedWorkspaceScope,
     ) -> Result<(ResolvedWorkspaceScope, WorkspaceStore), ControlError> {
@@ -217,7 +310,7 @@ impl ForgeControl {
         Ok((fresh_scope, store))
     }
 
-    fn open_goal_workspace_with_layout(
+    pub(crate) fn open_goal_workspace_with_layout(
         &self,
         scope: &ResolvedWorkspaceScope,
     ) -> Result<
@@ -242,16 +335,17 @@ impl ForgeControl {
     }
 }
 
-fn goal_from_store(
+pub(crate) fn goal_from_store(
     store: &WorkspaceStore,
     goal_id: GoalId,
     workspace_id: forge_domain::WorkspaceId,
+    activity_id: ActivityId,
 ) -> Result<RegisteredGoal, ControlError> {
     let goal = store
         .get_goal(goal_id)
         .map_err(map_goal_store_error)?
         .ok_or_else(|| ControlError::new(ControlErrorCode::GoalNotFound))?;
-    if goal.workspace_id() != workspace_id {
+    if goal.workspace_id() != workspace_id || goal.activity_id() != activity_id {
         return Err(ControlError::new(
             ControlErrorCode::WorkspaceIdentityConflict,
         ));
@@ -259,7 +353,7 @@ fn goal_from_store(
     Ok(goal)
 }
 
-fn review_goal_with_files(
+pub(crate) fn review_goal_with_files(
     store: &WorkspaceStore,
     layout: &ExistingWorkspaceStateLayout,
     goal: &RegisteredGoal,
@@ -361,10 +455,21 @@ fn review_goal_with_files(
 }
 
 pub(crate) fn map_goal_store_error(error: WorkspaceStoreError) -> ControlError {
+    if matches!(
+        &error,
+        WorkspaceStoreError::PlanningCommittedUnconfirmed { .. }
+    ) {
+        return ControlError::committed();
+    }
+    if matches!(&error, WorkspaceStoreError::Coordinator(_)) {
+        return crate::coordinator::map_coordinator_store_error(error);
+    }
     let code = match &error {
         WorkspaceStoreError::Goal(GoalStoreError::RecordMissing) => ControlErrorCode::GoalNotFound,
         WorkspaceStoreError::Goal(
             GoalStoreError::IdentityConflict
+            | GoalStoreError::CreationTimestampNotIncreasing { .. }
+            | GoalStoreError::CleanupJournalPending { .. }
             | GoalStoreError::RevisionConflict
             | GoalStoreError::RevisionOverflow
             | GoalStoreError::InvalidTransition
@@ -384,9 +489,9 @@ pub(crate) fn map_goal_store_error(error: WorkspaceStoreError) -> ControlError {
             | GoalStoreError::EvidenceTimestamp
             | GoalStoreError::EvidenceLimit { .. },
         ) => ControlErrorCode::GoalEvidenceConflict,
-        WorkspaceStoreError::Goal(GoalStoreError::WorkspaceMismatch) => {
-            ControlErrorCode::WorkspaceIdentityConflict
-        }
+        WorkspaceStoreError::Goal(
+            GoalStoreError::WorkspaceMismatch | GoalStoreError::ActivityMismatch,
+        ) => ControlErrorCode::WorkspaceIdentityConflict,
         WorkspaceStoreError::WorkspaceRevisionConflict { .. } => {
             ControlErrorCode::WorkspaceRevisionConflict
         }
@@ -403,13 +508,19 @@ pub(crate) fn map_goal_store_error(error: WorkspaceStoreError) -> ControlError {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     use forge_domain::{
+        ActivityCoordinatorActor, ActivityId, AgentDeclaredRole, AgentDisplayName, AgentInstanceId,
+        AgentSessionId, AgentSessionOpenRequestId, AgentTransportKind, AuthenticatedPrincipal,
         EstablishWorkspace, GoalContract, GoalObjective, GoalStatement, LocationId,
-        LocationRevision, WorkspaceId, WorkspaceRelativePath, WorkspaceRoot,
+        LocationRevision, OpenAgentSession, RegisteredAgentInstance, RuntimeInstanceId,
+        WorkspaceId, WorkspaceRelativePath, WorkspaceRoot,
     };
     use forge_persistence::{GlobalRegistry, WorkspaceStore};
     use forge_workspace::{LocationService, WorkspaceStateLayout};
@@ -424,10 +535,70 @@ mod tests {
         root: PathBuf,
         workspace_root: PathBuf,
         scope: ResolvedWorkspaceScope,
+        activity_id: ActivityId,
+        actor: ActivityCoordinatorActor,
     }
 
     fn timestamp(value: i64) -> Result<TimestampMillis, Box<dyn std::error::Error>> {
         Ok(TimestampMillis::new(value)?)
+    }
+
+    fn timestamp_now() -> Result<TimestampMillis, Box<dyn std::error::Error>> {
+        let millis = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())?;
+        Ok(TimestampMillis::new(millis)?)
+    }
+
+    fn seed_coordinator_actor(
+        control: &ForgeControl,
+        scope: &ResolvedWorkspaceScope,
+        activity_id: ActivityId,
+        serial: u64,
+    ) -> Result<ActivityCoordinatorActor, Box<dyn std::error::Error>> {
+        let principal = AuthenticatedPrincipal::TrustedStdio;
+        let agent_id = AgentInstanceId::from_uuid(Uuid::from_u128(0xD200 + u128::from(serial)));
+        let session_id = AgentSessionId::from_uuid(agent_id.into_uuid());
+        let _session = control.agent_session_open(&OpenAgentSession::new(
+            session_id,
+            AgentSessionOpenRequestId::from_uuid(Uuid::from_u128(0xD300 + u128::from(serial))),
+            principal,
+            timestamp(4)?,
+        ))?;
+        let coordinator_agent = RegisteredAgentInstance::create_bound(
+            agent_id,
+            scope.workspace_id(),
+            activity_id,
+            session_id,
+            AgentDisplayName::new("Goal Coordinator".to_owned())?,
+            AgentDeclaredRole::new("coordinator".to_owned())?,
+            AgentTransportKind::Retired,
+            principal,
+            timestamp(4)?,
+        );
+        let _ = crate::legacy_agent_fixture::seed_agent(
+            control,
+            scope,
+            &coordinator_agent,
+            forge_domain::AgentEventId::from_uuid(Uuid::from_u128(0xD400 + u128::from(serial))),
+        )?;
+        let binding = control.activity_coordinator_claim(
+            &crate::CoordinatorClaimRequest {
+                session_id,
+                scope: scope.clone(),
+                activity_id,
+                agent_id,
+                principal,
+                observed_at: timestamp(5)?,
+            },
+            timestamp_now()?,
+        )?;
+        Ok(ActivityCoordinatorActor::new(
+            scope.workspace_id(),
+            activity_id,
+            agent_id,
+            binding.revision(),
+            principal,
+            session_id,
+        ))
     }
 
     fn fixture(label: &str) -> Result<GoalFixture, Box<dyn std::error::Error>> {
@@ -461,7 +632,7 @@ mod tests {
         drop(store);
         let control = ForgeControl::new(GlobalRegistry::open(&registry_path)?);
         let locator = control
-            .workspace_list(location.id(), LocationRevision::INITIAL)?
+            .workspace_discover(location.id(), LocationRevision::INITIAL)?
             .into_iter()
             .find(|entry| entry.display_name() == "workspace-0")
             .ok_or("workspace locator missing")?
@@ -469,23 +640,38 @@ mod tests {
             .clone();
         let scope =
             control.resolve_workspace(location.id(), LocationRevision::INITIAL, &locator)?;
+        let activity_id = ActivityId::from_uuid(Uuid::from_u128(0xD000 + u128::from(serial)));
+        let admitted_at = timestamp_now()?;
+        let lease_until = TimestampMillis::new(admitted_at.get() + 60_000)?;
+        let _ = control.bootstrap_activity(
+            &scope,
+            activity_id,
+            RuntimeInstanceId::from_uuid(Uuid::from_u128(0xD100 + u128::from(serial))),
+            admitted_at,
+            lease_until,
+        )?;
+        let actor = seed_coordinator_actor(&control, &scope, activity_id, serial)?;
         Ok(GoalFixture {
             control,
             registry_path,
             root,
             workspace_root,
             scope,
+            activity_id,
+            actor,
         })
     }
 
     fn goal(
         scope: &ResolvedWorkspaceScope,
+        activity_id: ActivityId,
         id: u128,
         path: &str,
     ) -> Result<RegisteredGoal, Box<dyn std::error::Error>> {
         Ok(RegisteredGoal::create(
             GoalId::from_uuid(Uuid::from_u128(id)),
             scope.workspace_id(),
+            activity_id,
             GoalContract::new(
                 GoalObjective::new("Verify one durable Workspace artifact".to_owned())?,
                 vec![GoalStatement::new("The required file exists".to_owned())?],
@@ -509,29 +695,71 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let fixture = fixture("lifecycle")?;
         fs::write(fixture.workspace_root.join("proof.txt"), b"durable proof")?;
-        let goal = goal(&fixture.scope, 0xC001, "proof.txt")?;
-        assert_eq!(fixture.control.goal_create(&fixture.scope, &goal)?, goal);
+        let goal = goal(&fixture.scope, fixture.activity_id, 0xC001, "proof.txt")?;
         assert_eq!(
             fixture
                 .control
-                .goal_list(&fixture.scope, GoalListLimit::DEFAULT)?,
+                .goal_create(&fixture.scope, fixture.actor, &goal, timestamp_now()?)?,
+            goal
+        );
+        assert_eq!(
+            fixture.control.goal_list(
+                &fixture.scope,
+                fixture.activity_id,
+                GoalListLimit::DEFAULT
+            )?,
             vec![goal.clone()]
         );
-        let review = fixture.control.goal_review(&fixture.scope, goal.id())?;
+        let review = fixture
+            .control
+            .goal_review(&fixture.scope, fixture.activity_id, goal.id())?;
         assert!(review.can_complete());
-        let completed = fixture.control.goal_complete(&GoalCompletionRequest {
-            scope: fixture.scope.clone(),
-            goal_id: goal.id(),
-            expected_revision: goal.revision(),
-            review_id: Uuid::from_u128(0xC002),
-            observed_at: timestamp(20)?,
-        })?;
+        let completed = fixture.control.goal_complete(
+            &GoalCompletionRequest {
+                scope: fixture.scope.clone(),
+                activity_id: fixture.activity_id,
+                actor: fixture.actor,
+                goal_id: goal.id(),
+                expected_revision: goal.revision(),
+                review_id: Uuid::from_u128(0xC002),
+                observed_at: timestamp(20)?,
+            },
+            timestamp_now()?,
+        )?;
         assert_eq!(completed.status().kind(), GoalStatusKind::Completed);
 
         let restarted = ForgeControl::new(GlobalRegistry::open(&fixture.registry_path)?);
         assert_eq!(
-            restarted.goal_get(&fixture.scope, goal.id())?,
+            restarted.goal_get(&fixture.scope, fixture.activity_id, goal.id())?,
             Some(completed)
+        );
+        fs::remove_dir_all(fixture.root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn goal_read_rejects_cross_activity_identity_as_goal_conflict()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = fixture("cross-activity-read")?;
+        let goal = goal(&fixture.scope, fixture.activity_id, 0xC011, "proof.txt")?;
+        let _ =
+            fixture
+                .control
+                .goal_create(&fixture.scope, fixture.actor, &goal, timestamp_now()?)?;
+
+        let other_activity = ActivityId::from_uuid(Uuid::from_u128(0xC012));
+        let Err(error) = fixture
+            .control
+            .goal_get(&fixture.scope, other_activity, goal.id())
+        else {
+            return Err("cross-Activity Goal read unexpectedly succeeded".into());
+        };
+        assert_eq!(error.code(), ControlErrorCode::GoalConflict);
+        assert_eq!(
+            fixture
+                .control
+                .goal_get(&fixture.scope, fixture.activity_id, goal.id())?,
+            Some(goal)
         );
         fs::remove_dir_all(fixture.root)?;
         Ok(())
@@ -541,38 +769,58 @@ mod tests {
     fn missing_file_and_stale_lifecycle_revision_fail_closed()
     -> Result<(), Box<dyn std::error::Error>> {
         let fixture = fixture("blocked")?;
-        let goal = goal(&fixture.scope, 0xC101, "missing.txt")?;
-        let _ = fixture.control.goal_create(&fixture.scope, &goal)?;
-        let review = fixture.control.goal_review(&fixture.scope, goal.id())?;
+        let goal = goal(&fixture.scope, fixture.activity_id, 0xC101, "missing.txt")?;
+        let _ =
+            fixture
+                .control
+                .goal_create(&fixture.scope, fixture.actor, &goal, timestamp_now()?)?;
+        let review = fixture
+            .control
+            .goal_review(&fixture.scope, fixture.activity_id, goal.id())?;
         assert!(!review.can_complete());
-        let Err(completion_error) = fixture.control.goal_complete(&GoalCompletionRequest {
-            scope: fixture.scope.clone(),
-            goal_id: goal.id(),
-            expected_revision: goal.revision(),
-            review_id: Uuid::from_u128(0xC102),
-            observed_at: timestamp(20)?,
-        }) else {
+        let Err(completion_error) = fixture.control.goal_complete(
+            &GoalCompletionRequest {
+                scope: fixture.scope.clone(),
+                activity_id: fixture.activity_id,
+                actor: fixture.actor,
+                goal_id: goal.id(),
+                expected_revision: goal.revision(),
+                review_id: Uuid::from_u128(0xC102),
+                observed_at: timestamp(20)?,
+            },
+            timestamp_now()?,
+        ) else {
             return Err("missing file unexpectedly completed Goal".into());
         };
         assert_eq!(
             completion_error.code(),
             ControlErrorCode::GoalCompletionBlocked
         );
-        let paused = fixture.control.goal_transition(&GoalLifecycleRequest {
-            scope: fixture.scope.clone(),
-            goal_id: goal.id(),
-            expected_revision: goal.revision(),
-            observed_at: timestamp(21)?,
-            action: GoalLifecycleAction::Pause,
-        })?;
+        let paused = fixture.control.goal_transition(
+            &GoalLifecycleRequest {
+                scope: fixture.scope.clone(),
+                activity_id: fixture.activity_id,
+                actor: fixture.actor,
+                goal_id: goal.id(),
+                expected_revision: goal.revision(),
+                observed_at: timestamp(21)?,
+                action: GoalLifecycleAction::Pause,
+            },
+            timestamp_now()?,
+        )?;
         assert_eq!(paused.status().kind(), GoalStatusKind::Paused);
-        let Err(stale_error) = fixture.control.goal_transition(&GoalLifecycleRequest {
-            scope: fixture.scope.clone(),
-            goal_id: goal.id(),
-            expected_revision: goal.revision(),
-            observed_at: timestamp(22)?,
-            action: GoalLifecycleAction::Resume,
-        }) else {
+        let Err(stale_error) = fixture.control.goal_transition(
+            &GoalLifecycleRequest {
+                scope: fixture.scope.clone(),
+                activity_id: fixture.activity_id,
+                actor: fixture.actor,
+                goal_id: goal.id(),
+                expected_revision: goal.revision(),
+                observed_at: timestamp(22)?,
+                action: GoalLifecycleAction::Resume,
+            },
+            timestamp_now()?,
+        ) else {
             return Err("stale Goal revision unexpectedly succeeded".into());
         };
         assert_eq!(stale_error.code(), ControlErrorCode::GoalConflict);
@@ -585,19 +833,33 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let fixture = fixture("worker")?;
         fs::write(fixture.workspace_root.join("worker-proof.txt"), b"proof")?;
-        let goal = goal(&fixture.scope, 0xC201, "worker-proof.txt")?;
+        let goal = goal(
+            &fixture.scope,
+            fixture.activity_id,
+            0xC201,
+            "worker-proof.txt",
+        )?;
         let scope = fixture.scope.clone();
         let root = fixture.root.clone();
         let (client, mut worker) = fixture.control.start_worker()?;
 
-        assert_eq!(client.goal_create(scope.clone(), goal.clone())?, goal);
         assert_eq!(
-            client.goal_list(scope.clone(), GoalListLimit::DEFAULT)?,
+            client.goal_create(scope.clone(), fixture.actor, goal.clone())?,
+            goal
+        );
+        assert_eq!(
+            client.goal_list(scope.clone(), fixture.activity_id, GoalListLimit::DEFAULT)?,
             vec![goal.clone()]
         );
-        assert!(client.goal_review(scope.clone(), goal.id())?.can_complete());
+        assert!(
+            client
+                .goal_review(scope.clone(), fixture.activity_id, goal.id())?
+                .can_complete()
+        );
         let completed = client.goal_complete(GoalCompletionRequest {
             scope,
+            activity_id: fixture.activity_id,
+            actor: fixture.actor,
             goal_id: goal.id(),
             expected_revision: goal.revision(),
             review_id: Uuid::from_u128(0xC202),

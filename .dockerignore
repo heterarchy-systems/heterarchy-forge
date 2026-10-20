@@ -1,0 +1,14 @@
+target
+dist
+docs
+ui-qa
+ui-qa-final
+.git
+.github
+.env
+docker/smoke/secrets
+docker/smoke/workspace
+**/.agents
+**/.codegraph
+**/node_modules
+packaging

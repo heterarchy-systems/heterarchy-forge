@@ -155,20 +155,6 @@ pub(crate) fn create_schema(connection: &Connection) -> Result<(), CheckpointSto
     schema::create_schema(connection)
 }
 
-pub(crate) fn migrate_v11_to_v12(
-    connection: &mut Connection,
-    next_schema_version: i64,
-) -> Result<(), CheckpointStoreError> {
-    schema::migrate_v11_to_v12(connection, next_schema_version)
-}
-
-pub(crate) fn migrate_v7_to_v8(
-    connection: &mut Connection,
-    next_schema_version: i64,
-) -> Result<(), CheckpointStoreError> {
-    schema::migrate_v7_to_v8(connection, next_schema_version)
-}
-
 pub(crate) fn schema_objects() -> [(&'static str, &'static str); 6] {
     schema::objects()
 }
@@ -177,18 +163,18 @@ pub(crate) fn validate_schema(connection: &Connection) -> Result<(), CheckpointS
     schema::validate_current(connection)
 }
 
-pub(crate) fn validate_schema_without_restore_provenance(
-    connection: &Connection,
-) -> Result<(), CheckpointStoreError> {
-    schema::validate_v11(connection)
-}
-
 /// Insert a Starting checkpoint.  Retries with the same complete projection
 /// are idempotent; a different Checkpoint for the same `ChangeSet` is rejected.
 pub(crate) fn insert_checkpoint_in_transaction(
     transaction: &Transaction<'_>,
     checkpoint: &RegisteredCheckpoint,
 ) -> Result<RegisteredCheckpoint, CheckpointStoreError> {
+    if crate::workspace_goal_deletion::artifact_identity_is_pending(
+        transaction,
+        crate::workspace_goal_deletion::GoalDeletionArtifactIdentity::Checkpoint(checkpoint.id()),
+    )? {
+        return Err(CheckpointStoreError::IdentityConflict);
+    }
     if checkpoint.state() != CheckpointState::Starting {
         return Err(CheckpointStoreError::InvalidTransition);
     }

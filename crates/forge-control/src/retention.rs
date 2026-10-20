@@ -447,6 +447,7 @@ mod tests {
     use std::os::unix::fs::symlink;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use forge_domain::{
         ActivityId, BootstrapActivity, ChangeSetId, FileMutationId, FileMutationKind,
@@ -462,11 +463,17 @@ mod tests {
 
     static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
 
+    fn timestamp_now() -> Result<TimestampMillis, Box<dyn std::error::Error>> {
+        let millis = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())?;
+        Ok(TimestampMillis::new(millis)?)
+    }
+
     struct Fixture {
         root: PathBuf,
         control: ForgeControl,
         scope: ResolvedWorkspaceScope,
         activity: FileActivityScope,
+        write_authority: forge_domain::SourceWriteAuthority,
     }
 
     fn fixture() -> Result<Fixture, Box<dyn std::error::Error>> {
@@ -495,22 +502,41 @@ mod tests {
                 now,
             ),
         )?;
+        let lease_until = TimestampMillis::new(
+            timestamp_now()?
+                .get()
+                .checked_add(60_000)
+                .ok_or("Activity lease deadline overflow")?,
+        )?;
         store.bootstrap_activity(&BootstrapActivity::new(
             activity_id,
             workspace_id,
             WorkspaceRevision::INITIAL,
             runtime_id,
-            TimestampMillis::new(1_000)?,
+            lease_until,
             TimestampMillis::new(20)?,
         ))?;
         drop(store);
-        let control = ForgeControl::from_location_service(locations);
+        let control =
+            ForgeControl::from_location_service(locations, root.join("agent-sessions.sqlite3"));
         let locator = WorkspaceLocator::new(
             location_id,
             LocationRevision::INITIAL,
             Path::new("workspace"),
         )?;
         let scope = control.resolve_workspace(location_id, LocationRevision::INITIAL, &locator)?;
+        let observed_at = TimestampMillis::new(30)?;
+        let write_authority =
+            crate::filesystem::source_write_test_support::seed_source_write_authority(
+                &control,
+                &scope,
+                &crate::filesystem::source_write_test_support::SourceWriteTestRequest::new(
+                    activity_id,
+                    observed_at,
+                    0xE1_F000,
+                    &["retained.txt"],
+                ),
+            )?;
         Ok(Fixture {
             root,
             control,
@@ -518,8 +544,9 @@ mod tests {
             activity: FileActivityScope {
                 activity_id,
                 runtime_instance_id: runtime_id,
-                observed_at: TimestampMillis::new(30)?,
+                observed_at,
             },
+            write_authority,
         })
     }
 
@@ -531,6 +558,7 @@ mod tests {
             scope: fixture.scope.clone(),
             activity: fixture.activity,
             goal: None,
+            write_authority: fixture.write_authority,
             change_set_id,
             mutation_id: FileMutationId::from_uuid(Uuid::from_u128(0xE111)),
             plan: FileMutationPlan::new(

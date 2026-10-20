@@ -13,13 +13,12 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  RUST_TOOLCHAIN: "1.92.0"
-  CLOUDFLARED_VERSION: "2026.6.1"
-  CLOUDFLARED_DARWIN_ARM64_SHA256: "ae6ee90188ae5833c687ce937c3693e28403677607c06c65a2ff2b6a022f50e4"
+  RUST_TOOLCHAIN: "1.98.0"
+  PACKAGE_PLATFORM: "macos-aarch64"
 
 jobs:
   release:
-    name: macOS arm64 package
+    name: macOS aarch64 backend package
     runs-on: macos-15
     timeout-minutes: 60
 
@@ -47,41 +46,28 @@ jobs:
           fi
           echo "VERSION=${VERSION}" >> "${GITHUB_ENV}"
 
-      - name: Install verified cloudflared
-        shell: bash
-        run: |
-          set -euo pipefail
-          ARCHIVE="${RUNNER_TEMP}/cloudflared-darwin-arm64.tgz"
-          BIN_DIR="${RUNNER_TEMP}/forge-bin"
-          curl --fail --location --silent --show-error \
-            "https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-darwin-arm64.tgz" \
-            --output "${ARCHIVE}"
-          printf '%s  %s\n' "${CLOUDFLARED_DARWIN_ARM64_SHA256}" "${ARCHIVE}" | shasum -a 256 --check
-          mkdir -p "${BIN_DIR}"
-          tar -xzf "${ARCHIVE}" -C "${BIN_DIR}"
-          chmod 0755 "${BIN_DIR}/cloudflared"
-          echo "${BIN_DIR}" >> "${GITHUB_PATH}"
-          "${BIN_DIR}/cloudflared" --version
-
       - name: Run canonical CI harness
         run: make ci
 
-      - name: Build macOS installer
+      - name: Build backend package
         run: rustup run "${RUST_TOOLCHAIN}" cargo xtask package
 
       - name: Create release checksums
         shell: bash
         run: |
           set -euo pipefail
-          PACKAGE="target/dist/Heterarchy-Forge-${VERSION}-arm64.pkg"
-          if [[ ! -f "${PACKAGE}" ]]; then
-            echo "expected package does not exist: ${PACKAGE}" >&2
+          PACKAGE_NAME="forge-backend-v${VERSION}-${PACKAGE_PLATFORM}.tar.gz"
+          PACKAGE_PATH="dist/${PACKAGE_NAME}"
+          if [[ ! -f "${PACKAGE_PATH}" ]]; then
+            echo "expected package does not exist: ${PACKAGE_PATH}" >&2
             exit 1
           fi
           (
-            cd target/dist
-            shasum -a 256 "Heterarchy-Forge-${VERSION}-arm64.pkg" > SHA256SUMS.txt
+            cd dist
+            shasum -a 256 "${PACKAGE_NAME}" > SHA256SUMS.txt
           )
+          echo "PACKAGE_NAME=${PACKAGE_NAME}" >> "${GITHUB_ENV}"
+          echo "PACKAGE_PATH=${PACKAGE_PATH}" >> "${GITHUB_ENV}"
 
       - name: Publish GitHub Release
         env:
@@ -90,9 +76,9 @@ jobs:
         run: |
           set -euo pipefail
           gh release create "${GITHUB_REF_NAME}" \
-            "target/dist/Heterarchy-Forge-${VERSION}-arm64.pkg" \
-            "target/dist/SHA256SUMS.txt" \
+            "${PACKAGE_PATH}" \
+            "dist/SHA256SUMS.txt" \
             --verify-tag \
             --generate-notes \
             --title "Heterarchy Forge ${VERSION}" \
-            --notes "macOS arm64 build. The current public package is ad-hoc app-signed and the Installer package is unsigned; macOS Gatekeeper may require explicit user approval until Developer ID signing and notarization are configured."
+            --notes "Headless backend release. Contains the locked release forge-backend binary and the operations guide. No GUI installer is produced; run the backend over loopback HTTP per OPERATIONS.md."

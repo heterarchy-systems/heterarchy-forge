@@ -1,0 +1,55 @@
+# Forge standalone backend composition (development smoke environment).
+#
+# Scope: verify standalone startup, HTTP/JSON + SSE wiring, and dependency
+# isolation with the existing strict JSON config contract only — no mock
+# Orchestration is included. The session authority address below is
+# deliberately unreachable inside the container; readiness and every
+# issuer-only read stay healthy while session-bound ops would fail with the
+# typed DEPENDENCY_UNAVAILABLE code (fault-domain isolation proof).
+#
+# Loopback bind contract: BackendConfig rejects non-loopback binds (TLS/proxy
+# termination is a later lane decision), so the smoke driver talks to the
+# backend from inside the container namespace (docker/smoke.sh). Publishing
+# this port to a host interface is intentionally absent.
+#
+# Path honesty: paths registered in the Forge Registry are the CONTAINER
+# paths (/state, /workspaces/...), never host macOS paths. /workspaces/demo
+# is an explicit, optional bind mount for workspace-root registration checks.
+
+services:
+  forge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # The execution-evidence RUN layers use --security=insecure so the
+      # bubblewrap-confined suite can create its namespaces; the outer
+      # container remains the trusted host.
+      privileged: true
+    init: true
+    # The trusted host needs namespace setup rights; sandbox children drop
+    # all capabilities and cannot create further user namespaces.
+    cap_add: [SYS_ADMIN, NET_ADMIN]
+    security_opt:
+      - seccomp=unconfined
+      - systempaths=unconfined
+      - no-new-privileges=true
+    stop_grace_period: 10s
+    volumes:
+      - forge-state:/state
+      - ./docker/smoke/forge-backend.json:/config/forge-backend.json:ro
+      - ./docker/smoke/secrets:/secrets:ro
+      - ./docker/smoke/workspace:/workspaces/demo:ro
+    # The image ENTRYPOINT is the bare binary; this wrapper adds the explicit
+    # standalone bootstrap step (empty state volume → init-registry) while
+    # keeping `serve` fail-closed on a missing registry inside the binary.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        mkdir -p /state/product-cache
+        if [ ! -f /state/registry.sqlite3 ]; then
+          forge-backend init-registry /state/registry.sqlite3 || exit 1
+        fi
+        exec forge-backend serve /config/forge-backend.json
+
+volumes:
+  forge-state:

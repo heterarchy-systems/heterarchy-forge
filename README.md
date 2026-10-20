@@ -7,13 +7,41 @@
 [![CI](https://github.com/heterarchy-systems/heterarchy-forge/actions/workflows/ci.yml/badge.svg)](https://github.com/heterarchy-systems/heterarchy-forge/actions/workflows/ci.yml)
 [![Releases](https://img.shields.io/github/v/release/heterarchy-systems/heterarchy-forge?include_prereleases)](https://github.com/heterarchy-systems/heterarchy-forge/releases)
 
-Heterarchy Forge is a Rust-only macOS desktop application and local runtime for preparing, operating, and observing AI-driven local workspaces.
+Heterarchy Forge is a GUI-less, Rust-only execution and evidence backend: typed HTTP JSON commands and resumable SSE over loopback, with no GUI surface in the product.
 
 The product is being built from the accepted V1 architecture in Alexandria. The
 current verified foundation includes a typed runtime lifecycle, owned Tokio
-background runtime, host-standard application directories, structured logging,
-a Slint desktop control surface, explicit Location/Workspace flows, and the
-canonical Rust `xtask` quality gate.
+background runtime, structured logging, an addressable backend host, explicit
+Location/Workspace flows, and the canonical Rust `xtask` quality gate.
+
+## Accepted migration target (2026-09-09)
+
+The accepted target moves all GUI and external MCP
+entry points, Agent/session operations, approvals, scheduling, and team
+coordination into Orchestration. GroupCoordinator will be a separate module
+inside Orchestration. Forge retains Workspace storage, confined source/worktree
+execution, Goal/DAG, leases, Diff/checkpoint and verification evidence, exposed
+through an addressable HTTP JSON backend with resumable SSE. Broker retains
+generic membership, claims and fencing; its membership facade is distinct from
+team elections.
+
+The GUI retirement is now the product shape, not a migration stage: the
+Slint `forge-ui` projection crate and the `forge-desktop` application crate
+are removed, and the default build/run/package path is the headless backend
+host. The [HTTP backend host](crates/forge-backend/README.md)
+provides typed commands, resumable SSE, and remote Orchestration session
+resolution. Explicit host Rust CI configuration prepares the existing isolated
+toolchain and validates the selected cleanup root before admission. Verification
+executes a checked copy of its retained snapshot outside live Cargo ancestry.
+The current worktree exposes 111 backend operations; the Forge MCP crate and
+desktop MCP server host are removed, and full API/consumer parity and
+deployment recovery remain incomplete.
+The capability descriptions below retain some
+historical MCP terminology; they do not describe an available Forge MCP server.
+Goal/DAG deletion and durable cleanup recovery preserve
+shared checkpoints and pending-request readback.
+Architecture and feature plans are saved in Alexandria under Agent Platform,
+Architecture and Plans / Heterarchy Control Plane Cutover / 2026-09-09.
 
 ## Current implemented foundation
 
@@ -23,12 +51,8 @@ Cargo workspace
 ├─ crates/forge-workspace    # Location discovery, Workspace resolution, state layout
 ├─ crates/forge-persistence  # global Location registry + Workspace-local SQLite
 ├─ crates/forge-control      # bounded transport/UI-neutral application control plane
-├─ crates/forge-mcp          # official rmcp stdio server + Activity lease supervisor
-├─ crates/forge-platform     # paths, logging, safe objc2 folder picker
-├─ crates/forge-runtime      # owned Tokio runtime and latest-value transport
+├─ crates/forge-backend      # standalone typed HTTP commands + durable SSE
 ├─ crates/forge-execution    # macOS sandbox prototype + owned process supervision
-├─ crates/forge-ui           # Slint projection surface
-├─ crates/forge-desktop      # startup bootstrap, controls, and doctor
 └─ xtask                     # canonical bounded Rust verification harness
 ```
 
@@ -41,85 +65,108 @@ The implemented foundation is Rust-only and keeps authority explicit:
   remain in runtime memory.
 - Location and Workspace selection are explicit; there is no process-global
   active Workspace fallback.
-- Filesystem, Git, SQLite, process, and Slint effects stay behind Rust adapter
+- Filesystem, Git, SQLite, and process effects stay behind Rust adapter
   boundaries with typed errors and bounded ingress/output.
 - Runtime projections use owned Tokio tasks and a bounded/latest-value transport
   so a slow observer cannot create unbounded backlog.
-- The headless desktop doctor opens and health-checks the registry, starts the
-  runtime, and proves a `Running` projection before reporting PASS.
-- The platform boundary contains a safe direct `objc2`/`NSOpenPanel` adapter
-  for directory-only single-selection, with typed cancellation, main-thread,
-  modal, URL, and path outcomes.
-- The bounded application worker keeps filesystem/database work off the UI thread with
-  bounded request handling. Add Location, durable Location list projection,
+- The backend doctor boots the real headless product path: init-registry,
+  serve on loopback with file-backed bearer secrets, a real `/healthz` and
+  `/readyz` probe, and bounded graceful SIGTERM shutdown inside a throwaway
+  sandbox.
+- The platform boundary retains the macOS `objc2` adapters from the desktop era
+  (folder picker, clipboard, Keychain-backed MCP token stores); they have no
+  backend consumer and their retirement is a tracked decision pending review.
+- Bounded request handling keeps filesystem/database work off any interactive
+  thread. Add Location, durable Location list projection,
   Workspace discovery, and durable Workspace establishment are implemented.
-  Candidate indices remain UI correlation only; the UI publishes a selection
-  after candidate revalidation and the Workspace-local SQLite commit.
+  Selection happens through explicit registration flows; there is no window-local
+  candidate state in the product.
 - Location state uses schema-v2 revision CAS. Workspace/Activity records use
   independent typed revisions and fail-closed root fingerprints. A committed
   Workspace selection is still not a filesystem/process/network effect grant.
 - Workspace-local state initialization serializes concurrent writers and writes
   exact nested-worktree rules to `.git/info/exclude` without modifying tracked
   `.gitignore` files.
-- The official `rmcp 3.1.4` server exposes exactly 22 tools: `workspace_list`,
-  `workspace_resolve`, `activity_bootstrap`, `file_read`, `file_create`,
-  `file_replace`, `file_delete`, `diff_list`, `diff_read`, `diff_doctor`,
-  `diff_retention_plan`, `diff_artifact_doctor`, `agent_attach`,
-  `agent_set_focus`, `agent_publish_work`, `agent_get_context`, `agent_detach`,
-  `goal_list`, `goal_get`, `dag_get_current`,
-  `dag_authoring_grant_discover`, and `dag_replan_commit`. DAG mutation is
-  limited to one immutable successor revision under an operator-issued,
-  credential-bound, exact-head, five-minute one-shot grant; it grants no node
-  lifecycle, execution, command, shell, or deletion authority.
-  Every request carries an exact Location revision and Workspace
-  locator/identity. File effects additionally require a tracked live Activity;
+- The official `rmcp 3.1.4` server exposes exactly 61 tools. The surface covers
+  durable Workspace list/discovery/resolve, Activity bootstrap, bounded source
+  list/search/slice/patch, Diff evidence, Agent list/focus/work/context,
+  logical session issuance, assignment lifecycle and inbox reads,
+  Coordinator reads/claims, Goal create/revise/list/
+  get, current DAG planning, Location list, and the exact command/execution
+  lifecycle `command_list`, `command_run`, `execution_get`, `execution_cancel`,
+  `execution_read`, and bounded long-poll `execution_wait`. Planning belongs to the durable Activity-local
+  Coordinator, not to a declared role or a transport token. Initial plans and
+  immutable successor DAG revisions are fenced by exact Coordinator, Goal, and
+  DAG-head revisions. Node start/complete also require a current bound session.
+  The analyzed `shell_run` surface uses server-owned execution profiles; callers
+  cannot override executable, argv, environment, permission, or network policy.
+  Workspace operations carry an exact Location revision and Workspace
+  locator/identity. File effects additionally require a tracked live Activity,
+  bound session, current node focus, and Writer Lease;
   bounded history reads do not silently promote process ownership.
+- Open one logical session with `agent_session_open { request_id }`, retain the
+  returned non-secret `session_id`, and reuse it across reconnects and Activity
+  work bindings. Retrying the same issuance request preserves identity.
+  Transport sessions and OAuth grants do not identify a Chat. Operational
+  membership belongs to Orchestration; Forge activation requires the exact
+  delegated membership receipt and keeps historical bindings readable.
+  The retired `agent_attach`, `agent_detach`, `agent_handoff`,
+  `agent_session_touch`, and `agent_inbox_ack` tools are absent. New work still
+  requires current node focus and a Writer Lease. Inbox reads never acknowledge.
+- `command_list` returns sealed command classes, a catalog fingerprint and
+  current runtime availability. Catalog inspection remains available when the
+  Rust runtime is unavailable; execution still fails closed.
+  `command_run` requires `expected_catalog_fingerprint`; actual execution admission
+  checks it again after approval. `make:package` is a distinct generated command
+  requiring approval and writes only to its execution-specific product cache.
+  A successful execution exposes a persisted package hash/size manifest through
+  `execution_get`; user source and `.heterarchy-forge` are read-only to the child.
 - Stdio remains the default trusted-local process transport. An explicit
-  loopback-only Streamable HTTP mode uses the same 22-tool surface, validates
-  Host/Origin/body bounds, and requires a durable Workspace-scoped bearer
-  token on every request. Raw bearer text is revealed once; SQLite stores only
-  a keyed digest and metadata, while the pepper remains in macOS Keychain.
-  This local credential is not OAuth and grants no remote/public listener.
+  loopback-only Streamable HTTP listener uses the same 61-tool surface and
+  validates Host/Origin/body bounds. Loopback callers use a durable app-global
+  bearer token; a configured fixed HTTPS domain enables OAuth 2.1 discovery,
+  dynamic client registration, authorization-code PKCE S256, short-lived
+  access tokens, and refresh-token rotation/reuse revocation. Public-host MCP
+  requests accept OAuth access tokens only. Raw bearer/code/refresh values are
+  one-time reveals; SQLite stores keyed digests and typed metadata while
+  separate peppers remain in macOS Keychain. A fixed domain relies on the
+  operator-installed Cloudflare Named Tunnel; only blank-domain development
+  mode starts the bundled ephemeral Quick Tunnel.
 - Activity schema v2 separates durable Open/Closed/Interrupted state from a
   process-owned runtime lease. Heartbeats and graceful close are grouped into
   one bounded transaction per Workspace; expired leases reconcile to
   Interrupted and cannot be silently reattached.
-- WorkspaceStore schema v10 retains metadata-only, Activity-attributed ChangeSet,
-  Diff Evidence, execution intent/terminal records, approval authority, and
-  checkpoint/restore journals. Redacted Diff bodies remain bounded
-  Workspace-local `.diff.zst` artifacts with exact compressed/uncompressed
-  BLAKE3 hashes and sizes rather than SQLite BLOBs. A Starting/Intent pair is
-  recovery evidence and is never replayed automatically; migrated v3 Applied
-  records remain explicit legacy-without-Diff history.
-- Plan 10 schema-v10 foundation adds immutable DAG revision/head/node/edge
-  storage with exact SQL validation and a no-synthetic-state v9 migration.
+- WorkspaceStore schema v34 retains metadata-only, Activity-attributed ChangeSet,
+  Diff Evidence, execution intent/terminal/output records, approval authority
+  with exact Agent binding, checkpoint/restore journals, Harness state, stable
+  authenticated Agent attachment, and Activity-local Coordinator planning
+  authority. Redacted Diff bodies remain bounded Workspace-local
+  `.diff.zst` artifacts with exact compressed/uncompressed BLAKE3 hashes and
+  sizes rather than SQLite BLOBs. A Starting/Intent pair is recovery evidence
+  and is never replayed automatically. Older Workspace schemas are rejected
+  without rewriting them; FORGE only opens the current schema as authority.
+- Goal DAG persistence uses immutable revision/head/node/edge storage with exact
+  SQL validation and no synthetic reconstruction of missing authority.
   The pure domain already rejects cycles, self/duplicate/unknown edges and
   derives ALL-of readiness deterministically. Persistence now provides immutable
   revision insertion/readback, head CAS, current-head-only node lifecycle CAS,
   completed-node/evidence carry-forward, atomic source+Goal+node evidence
   admission, typed split/replace/merge lineage, and a Goal completion gate.
   Trusted-local control and bounded worker dispatch are active with explicit
-  revision/head/node requests and shutdown rejection. The Rust/Slint desktop
-  now projects the selected Goal's current immutable DAG revision as a bounded,
-  bidirectionally scrollable read-only causal canvas. Validated exact edges are
-  laid out into deterministic longest-depth columns and stable per-column
-  lanes; blocked incoming dependencies and exact edges into the active node are
-  visible without inventing a critical path. Nodes retain derived readiness,
-  waiting state, evidence counts, and selection-aware Inspector details. The UI
-  exposes no direct graph editing or node lifecycle mutation callback. The
-  Agent Inspector may issue/revoke one exact one-shot DAG authoring grant; the
-  authenticated Agent discovers it and submits the fully typed successor DAG
-  through MCP, while the graph remains a read-only projection.
-- Plan 09 durable Goal contracts are active in trusted local control and the
-  Rust/Slint desktop. Goals are optional, immutable after creation, revision-CAS
-  guarded, restart durable, and explicitly lifecycle controlled. Hard completion
+  revision/head/node requests and shutdown rejection. Planning submits flow
+  through the authenticated current Coordinator while the durable projection
+  remains read-only to every consumer.
+- Durable Goal contracts are active in trusted local control. Goals are
+  Activity-scoped, contract-revision-CAS guarded, restart
+  durable, and explicitly lifecycle controlled. Hard completion
   recomputes bounded linked Approval/Execution/ChangeSet/Checkpoint evidence in
   the write transaction and verifies `FilePresent` requirements through the
   descriptor-confined Workspace boundary before that transaction. Effect
   admission associates Goal evidence atomically; Goal-linked Diff artifacts are
   excluded from retention and tombstone races. A Goal creates no background
-  task, scheduler, implicit continuation, or execution authority. DAG remains a
-  separate optional contract, and MCP remains the exact 22-tool surface above.
+  task, scheduler, implicit continuation, or execution authority. Substantive
+  Agent execution requires an exact Goal/current-DAG/active-node focus, and MCP
+  uses the current 61-tool surface described above.
 - Plan 11A Doctor-01 adds a typed, exact-scope, read-only Workspace integrity
   report without a schema bump. It validates the current schema/application/
   Workspace binding, runs bounded `quick_check(1)` plus first-row foreign-key
@@ -145,14 +192,13 @@ The implemented foundation is Rust-only and keeps authority explicit:
   artifact inventory path now uses the same fixed-query preload instead of up
   to roughly 2,048 per-entry SQLite lookups. No schema, MCP tool, background
   task, repair, purge, or reconciliation authority was added.
-- Desktop and MCP `--doctor` now inspect an existing Global Registry before any
+- `--doctor` variants inspect an existing Global Registry before any
   Application Support creation, logging initialization, or write-capable open.
   A missing Registry is a truthful `NOT_INITIALIZED` warning and an active
-  Registry WAL fails closed without touching sidecars. MCP transport smoke uses
-  only an owned temporary Registry. Repository `xtask doctor` injects an
-  isolated HOME/nonexistent Registry path and verifies that Doctor creates no
-  Registry, so canonical verification no longer reads or mutates operator
-  state.
+  Registry WAL fails closed without touching sidecars. Repository `xtask doctor`
+  boots the headless backend inside an isolated HOME/sandbox registry and
+  proves health, readiness, and graceful shutdown, so canonical verification
+  never reads or mutates operator state.
 - File effects use a per-component descriptor-relative `rustix` walk with
   `NOFOLLOW`, reject protected paths, all symlinks, non-regular files and
   hardlinks, serialize Forge writers with a bounded cross-process lock, and use
@@ -173,7 +219,7 @@ The implemented foundation is Rust-only and keeps authority explicit:
   the same cross-process Workspace writer lock. No automatic age/count default
   exists. Bounded directory inventory classifies owned, orphan, and conflicting
   entries; orphan deletion requires the exact native name, BLAKE3 hash, and
-  size and refuses any current or legacy DB ownership conflict.
+  size and refuses any conflicting DB ownership.
 - Command execution keeps structured argv distinct from the explicit shell
   escape path, clears the parent environment, applies a fixed safe baseline,
   and hashes the exact request with typed/length-delimited BLAKE3 fields without
@@ -185,7 +231,7 @@ The implemented foundation is Rust-only and keeps authority explicit:
   graceful TERM -> KILL escalation, descendant cleanup, manual/Workspace/global
   cancel, and joined supervisor path. Runtime Stop/Restart/Shutdown drains the
   execution owner before publishing successful completion.
-- Execution evidence uses exact schema-v5 -> v6 migration, revision CAS, and
+- Execution evidence uses the current exact schema, revision CAS, and
   `Starting -> Running -> terminal` records with bounded output totals and
   truncation metadata. Exact request-digest retries converge; conflicting reuse
   fails closed. Restart reconciliation marks bounded incomplete records
@@ -197,7 +243,8 @@ The implemented foundation is Rust-only and keeps authority explicit:
   Workspace/Activity/Execution/request digest, bounded Auto Approval applies
   only to verified discovered commands, and Workspace/global stop reports
   success only after terminal evidence is journalled and owned process groups
-  are drained. No command or shell mutation tool is exposed through MCP.
+  are drained. MCP command and analyzed shell execution use the current bounded
+  admission and approval paths described above.
 - Plan 08 checkpoint foundations are typed and schema-v10 durable. Checkpoints
   bind the exact ChangeSet mutation path/PRE/POST attribution, lifecycle
   rehydration fails closed, terminal retries are idempotent, list reads use
@@ -213,50 +260,19 @@ The implemented foundation is Rust-only and keeps authority explicit:
   downgrade, and deliberately caps one process at two Workspace heartbeat
   groups / 128 Activities so the single-owner heartbeat lane stays within its
   lease budget.
-- The Desktop projects only fresh leased Open Activities as Live and shows
-  Closed/Interrupted/recovery records in History. An expired Open lease is
-  projected as explicit `Expired` history and is no longer rewritten to
-  `Interrupted` merely because the UI refreshed; semantic reconciliation stays
-  behind the separate trusted recovery operation. Activity UUIDs remain hidden
-  behind temporary `Chat NN` labels. Selecting a Live/History row loads at most
-  50 durable changes through the nonblocking control worker; selecting a change
-  opens a verified read-only Diff inspector with explicit binary/oversized/
-  missing/corrupt states. It provides no manual Chat-to-Workspace binding or
-  Activity creation control.
-- The Rust/Slint workbench now uses a real adaptive three-region topology:
-  Goal/Workspace scope on the left, Goal + read-only DAG + Activity/Evidence in
-  the center, and a full-height selection-aware Inspector with fixed Safety
-  access on the right. Minimum (`1120`), standard (`1280`), and wide (`1600`)
-  width classes change pane budgets and the lower-deck topology rather than
-  stretching one fixed layout. Both rails resize from a drag-origin snapshot,
-  collapse independently to 48px, and restore their session widths. Settings
-  replaces the whole workbench body with a flat domain surface. Harness Library
-  registration, selected-Workspace source integrity, declared verifiers, initial
-  Preview/Apply, and explicit Update / Switch / Remove all use bounded workers
-  rather than fabricated state. Initial Preview reports CREATE / MERGE /
-  UNCHANGED / CONFLICT without writing Workspace files. Lifecycle Preview reports
-  CREATE / UPDATE / REMOVE / PRESERVE / UNCHANGED / CONFLICT and must be reviewed
-  before Update, Switch, or Remove can run. Remove is deliberately two-step: an
-  ownership-safe Preview is required before the danger action is enabled.
-  Descriptor-confined materialization preserves user-authored `AGENTS.md` outside
-  the exact bundle marker block and writes `.agents/.heterarchy.toml` as durable
-  ownership provenance. Manifest schema v2 grants deletion authority only to
-  files FORGE can prove it created; legacy v1 and pre-existing byte-identical
-  files remain external. Update/Switch replace durable `AppliedHarness` state and
-  Remove deletes it only through exact revision CAS after filesystem success.
-  Still-unmodeled preferences remain explicitly labelled. A selected Goal's current DAG is loaded through the same bounded
-  nonblocking worker boundary; a missing DAG remains a truthful empty state.
-  The Goal rail now loads real bounded Workspace-local contracts through the
-  nonblocking worker and supports inline create, fresh hard review,
-  Pause/Resume/Cancel/Complete, revision-bound selection, and truthful Inspector
-  projections without exposing private model reasoning.
-- The final UI quality pass raises the operating type scale, replaces character
-  chevrons with accessible Slint paths, uses semantic unavailable-state contrast,
-  keeps one Inspector tab authority, removes splitter dead zones across width
-  classes, constrains Settings reading width, and makes the first Workspace
-  preparation action directly operable. Native 1120×720, 1480×920, 1680×920,
-  Settings, Harness Settings, and both-rails-collapsed captures are checked in
-  under `docs/screenshots/plan11-ui/`.
+- Activity projection is explicit about liveness: only fresh leased Open
+  Activities are Live; Closed/Interrupted/recovery records surface as History.
+  An expired Open lease is projected as explicit `Expired` history and is not
+  rewritten to `Interrupted` merely because an observer refreshed; semantic
+  reconciliation stays behind the separate trusted recovery operation. Change
+  reads stay bounded (at most 50 durable changes per selection equivalent) and
+  every Diff read is a verified read-only evidence query with explicit
+  binary/oversized/missing/corrupt states.
+- The Slint workbench projection (adaptive three-region topology, Inspector,
+  Harness read-only observation surface, UI quality passes, and the checked-in
+  screenshot corpus) was retired with the `forge-ui`/`forge-desktop` crates.
+  Every capability it only projected remains available through the backend
+  operations listed above; nothing was retired from the control plane itself.
 - MCP ingress frames, worker queues, catalog/activity lists, Git/doctor output,
   and heartbeat batches are explicitly bounded. SQLite/state roots are guarded
   against symlink, hardlink, parent replacement, and stale-handle races.
@@ -274,83 +290,80 @@ cargo xtask doctor
 cargo xtask supply-chain
 cargo xtask extended
 cargo xtask package
-cargo run -p forge-desktop
-cargo run -p forge-mcp -- --doctor
-cargo run -p forge-mcp
-cargo run -p forge-mcp -- token issue "Local Codex" <location-id> <location-revision> <workspace-id> <workspace-revision> <locator>
-cargo run -p forge-mcp -- http serve 8765
+cargo run --locked -p forge-backend -- init-registry /absolute/path/registry.sqlite3
+cargo run --locked -p forge-backend -- serve /absolute/path/backend.json
 ```
 
-`token issue` validates the exact current Workspace and prints the bearer value
-once. Put it in a private environment variable, then configure a local Codex
-host with the loopback URL and bearer-token environment-variable setting. Use
-`token rotate`, `token revoke`, and `token list` for explicit credential
-lifecycle. Never place the bearer value in repository files or shell history.
+For a verification run with an explicit existing temporary directory, set
+`FORGE_VERIFY_TMPDIR`. The xtask forwards it as Cargo command-line configuration
+to every child Cargo, including when an inherited `[env]` entry forces another
+`TMPDIR`. The outer Cargo also needs that override when launching xtask:
 
-`cargo xtask doctor` performs both desktop runtime and MCP stdio lifecycle smoke
-tests. The reviewed `deny.toml` policy requires current `cargo-deny` and
+```bash
+FORGE_VERIFY_TMPDIR=/absolute/task/tmp \
+cargo --config 'env.TMPDIR.value="/absolute/task/tmp"' --config env.TMPDIR.force=true xtask ci
+```
+
+This opt-in setting requires a real absolute directory and changes only the
+verification process temporary path. It does not edit Cargo configuration,
+select Cargo/Rustup homes, alter product startup storage policy or skip gates.
+
+The [backend host instructions](crates/forge-backend/README.md) specify exact
+Registry, Workspace, backend/destination identity and separate service credentials.
+External MCP ingress and logical-session issuance belong to Orchestration.
+
+`cargo xtask doctor` boots the headless backend product path inside a
+throwaway sandbox: build, init-registry, real loopback serve, `/healthz` and
+`/readyz` probes, and bounded graceful SIGTERM shutdown.
+The reviewed `deny.toml` policy requires current `cargo-deny` and
 `cargo-audit`; the final local evidence used versions 0.20.2 and 0.22.2.
 `cargo xtask perf` deliberately reports `unconfigured` until a reviewed
 benchmark target and workload exist; that result is not a performance PASS.
 
-### Local macOS installer
+### Local backend package
 
-On macOS, `cargo xtask package` builds the optimized desktop binary, assembles
-and verifies `Heterarchy Forge.app`, then creates these local installer
-artifacts:
+`cargo xtask package` builds the locked release `forge-backend` binary and
+assembles a bounded tarball with the binary and the operations guide:
 
 ```text
-target/dist/Heterarchy-Forge-<version>-<architecture>.pkg
-target/dist/Heterarchy-Forge.pkg
+dist/forge-backend-v<version>-<os>-<arch>.tar.gz
+dist/forge-backend-v<version>-<os>-<arch>.tar.gz.sha256
 ```
 
-Open either `.pkg` in Finder to install the application into `/Applications`.
-The default artifact is local-development scoped: the application has an
-ad-hoc signature and the Installer package is unsigned. Developer ID identities
-can be supplied through environment variables as documented in
-`packaging/macos/README.md`; Apple notarization is a separate release step.
+There is no installer and no GUI bundle; unpack the tarball and follow
+`OPERATIONS.md` inside it.
 
 ### GitHub Releases
 
-Public macOS arm64 builds are published from Git tags by
-`.github/workflows/release.yml`. Download the versioned Installer package and
+Public macOS arm64 backend builds are published from Git tags by
+`.github/workflows/release.yml`. Download the versioned backend tarball and
 `SHA256SUMS.txt` from:
 
 https://github.com/heterarchy-systems/heterarchy-forge/releases
 
 The release workflow is fail-closed: a tag must exactly match the workspace
-Cargo version (`v<version>`), the pinned `cloudflared` arm64 archive is verified
-against its SHA-256 before bundling, `make ci` must pass, and only then is the
-versioned `.pkg` attached to the GitHub Release. To publish a version, update the
-workspace version, land it on `main`, then create and push the matching tag, for
-example `v0.2.0`.
+Cargo version (`v<version>`), `make ci` must pass, and only then is the
+versioned backend tarball attached to the GitHub Release. To publish a version,
+update the workspace version, land it on `main`, then create and push the
+matching tag, for example `v0.2.0`.
 
-The current automated public artifact is still development-distribution scoped:
-the app uses an ad-hoc code signature and the Installer package is unsigned. It
-is downloadable from GitHub Releases, but macOS Gatekeeper may require explicit
-user approval. Developer ID Application/Installer signing plus Apple notarization
-should be configured before treating Releases as frictionless end-user
-distribution.
-
-The native folder picker adapter is implemented, but interactive modal E2E
-(accessibility/screen capture) remains unverified. The following product slices
-are not yet complete: production App Sandbox and security-scoped bookmark
-persistence, universal macOS packaging plus Developer ID signing/notarization,
-path list/stat/search/patch/move, automatic Diff retention policy,
-remote/public MCP TLS and OAuth authorization, production App Sandbox replacement,
-approval/grant-backed command UI/MCP exposure, descriptor-capable macOS Git
-checkpoint writes, production CAS restore authority, and full GUI/browser E2E
-evidence. The local stdio plus opt-in bearer-authenticated loopback HTTP MCP
-server, interactive desktop Connection/token lifecycle, durable Agent
-attachment/public work, explicit Goal/current-DAG reads, one-shot exact-head DAG
-replanning, durable Activity lifecycle, and bounded file read/create/replace/delete
-boundary are active. The low-level local command
-engine and Plan 07 grant path are active, but no command/shell mutation tool is
-MCP-exposed. Exact verification evidence is recorded in the dated development
-log rather than copied here as a count that immediately becomes stale. The
-canonical completion commands are `cargo xtask ci`, `cargo xtask msrv`,
-`cargo xtask doctor`, and `cargo xtask extended`; supply-chain output retains
-reviewed duplicate-version and four transitive unmaintained warnings.
+The backend product slices not yet complete: production Linux
+execution/deployment evidence, production CAS restore authority, two-endpoint
+source move with ChangeSet/Diff/checkpoint recovery, automatic Diff retention
+policy, and the remaining Orchestration consumer cutover. The retired Forge MCP
+server, Slint workbench, and desktop Connection/token lifecycle are
+unavailable. Durable Agent work bindings, explicit Goal/current-DAG reads,
+Activity-local Coordinator-authorized DAG planning/replanning, durable Activity
+lifecycle, and descriptor-confined file listing, literal text search, ranged
+source reads, and Add/Update/Delete source patch boundary are active. The
+low-level local command engine, Plan 07 grant path, sealed command catalog,
+and analyzed shell execution remain available through backend operations.
+Callers cannot override server-owned execution profiles. Exact verification
+evidence is recorded in the dated development log rather than copied here as a
+count that immediately becomes stale. The canonical completion commands are
+`cargo xtask ci`, `cargo xtask msrv`, `cargo xtask doctor`, and
+`cargo xtask extended`; supply-chain output retains reviewed duplicate-version
+and four transitive unmaintained warnings.
 
 ## Non-negotiable boundaries
 
@@ -364,5 +377,6 @@ reviewed duplicate-version and four transitive unmaintained warnings.
   even that identity cannot authorize filesystem, process, network, or other
   effects without a later explicit capability.
 - Deterministic domain logic does not read hidden filesystem, network, clock, random, process, UI, or SQLite state.
-- Slint remains a read/control projection; Tokio and effect adapters do not block the UI thread.
+- The backend is the only product surface: HTTP JSON/SSE over loopback, with no
+  GUI projection layer in the workspace.
 - Commit and push are explicit operator actions.

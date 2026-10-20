@@ -12,8 +12,9 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
-    ActivityId, ActivityProjection, DagNodeId, DagNodeRevision, DagRevisionNumber, GoalAttribution,
-    GoalEvidenceRef, McpTokenId, TimestampMillis, WorkspaceId,
+    ActivityId, ActivityProjection, AgentSessionId, AuthenticatedPrincipal, DagNodeId,
+    DagNodeRevision, DagRevisionNumber, GoalAttribution, GoalEvidenceRef, TimestampMillis,
+    WorkspaceId,
 };
 
 pub const MAX_AGENT_DISPLAY_NAME_BYTES: usize = 128;
@@ -130,7 +131,7 @@ impl fmt::Debug for AgentDisplayName {
 }
 
 /// Bounded declared role metadata.  A role is descriptive only; it does not
-/// grant permissions, filesystem access, execution authority, or MCP scope.
+/// grant permissions, filesystem access, execution authority, or remote scope.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct AgentDeclaredRole(String);
 
@@ -190,15 +191,16 @@ pub enum AgentMetadataError {
 /// not alter the capabilities granted by the Activity or Workspace scope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AgentTransportKind {
-    Mcp,
+    /// Retired transport; retained so persisted rows encoding it still decode.
+    Retired,
     Stdio,
     StreamableHttp,
     Other,
 }
 
 impl AgentTransportKind {
-    pub const fn is_mcp(self) -> bool {
-        matches!(self, Self::Mcp | Self::StreamableHttp)
+    pub const fn is_retired_or_stream(self) -> bool {
+        matches!(self, Self::Retired | Self::StreamableHttp)
     }
 }
 
@@ -726,17 +728,41 @@ impl AgentContextProjection {
     }
 }
 
-/// Durable agent projection returned by Workspace persistence.
+/// Checked rehydration input for a durable Agent projection.
+#[must_use]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentRecordParts {
+    pub id: AgentInstanceId,
+    pub workspace_id: WorkspaceId,
+    pub activity_id: ActivityId,
+    /// The logical session that owns this Workspace attachment.
+    ///
+    /// `None` is retained only for pre-session legacy rows. New attachment
+    /// admission must use [`RegisteredAgentInstance::create_bound`].
+    pub session_id: Option<AgentSessionId>,
+    pub display_name: AgentDisplayName,
+    pub declared_role: AgentDeclaredRole,
+    pub transport_kind: AgentTransportKind,
+    pub principal: AuthenticatedPrincipal,
+    pub attachment_state: AgentAttachmentState,
+    pub focus: AgentFocus,
+    pub created_at: TimestampMillis,
+    pub updated_at: TimestampMillis,
+    pub revision: AgentInstanceRevision,
+}
+
+/// Durable Agent projection returned by Workspace persistence.
 #[must_use]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegisteredAgentInstance {
     id: AgentInstanceId,
     workspace_id: WorkspaceId,
     activity_id: ActivityId,
+    session_id: Option<AgentSessionId>,
     display_name: AgentDisplayName,
     declared_role: AgentDeclaredRole,
     transport_kind: AgentTransportKind,
-    transport_principal: Option<McpTokenId>,
+    principal: AuthenticatedPrincipal,
     attachment_state: AgentAttachmentState,
     focus: AgentFocus,
     created_at: TimestampMillis,
@@ -761,7 +787,7 @@ impl RegisteredAgentInstance {
             display_name,
             declared_role,
             transport_kind,
-            None,
+            AuthenticatedPrincipal::TrustedStdio,
             observed_at,
         )
     }
@@ -774,17 +800,18 @@ impl RegisteredAgentInstance {
         display_name: AgentDisplayName,
         declared_role: AgentDeclaredRole,
         transport_kind: AgentTransportKind,
-        transport_principal: Option<McpTokenId>,
+        principal: AuthenticatedPrincipal,
         observed_at: TimestampMillis,
     ) -> Self {
         Self {
             id,
             workspace_id,
             activity_id,
+            session_id: None,
             display_name,
             declared_role,
             transport_kind,
-            transport_principal,
+            principal,
             attachment_state: AgentAttachmentState::Attached,
             focus: AgentFocus::unfocused(),
             created_at: observed_at,
@@ -793,78 +820,69 @@ impl RegisteredAgentInstance {
         }
     }
 
+    /// Construct a new attached Agent with an immutable logical-session
+    /// binding. This is the constructor for new public attach requests;
+    /// [`Self::create`] remains available for legacy and reconciliation
+    /// fixtures that intentionally model an unresolved pre-session row.
     #[allow(clippy::too_many_arguments)]
-    pub fn from_parts(
+    pub fn create_bound(
         id: AgentInstanceId,
         workspace_id: WorkspaceId,
         activity_id: ActivityId,
+        session_id: AgentSessionId,
         display_name: AgentDisplayName,
         declared_role: AgentDeclaredRole,
         transport_kind: AgentTransportKind,
-        attachment_state: AgentAttachmentState,
-        focus: AgentFocus,
-        created_at: TimestampMillis,
-        updated_at: TimestampMillis,
-        revision: AgentInstanceRevision,
-    ) -> Result<Self, AgentTransitionError> {
-        Self::from_parts_with_principal(
+        principal: AuthenticatedPrincipal,
+        observed_at: TimestampMillis,
+    ) -> Self {
+        let mut agent = Self::create_with_principal(
             id,
             workspace_id,
             activity_id,
             display_name,
             declared_role,
             transport_kind,
-            None,
-            attachment_state,
-            focus,
-            created_at,
-            updated_at,
-            revision,
-        )
+            principal,
+            observed_at,
+        );
+        agent.session_id = Some(session_id);
+        agent
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn from_parts_with_principal(
-        id: AgentInstanceId,
-        workspace_id: WorkspaceId,
-        activity_id: ActivityId,
-        display_name: AgentDisplayName,
-        declared_role: AgentDeclaredRole,
-        transport_kind: AgentTransportKind,
-        transport_principal: Option<McpTokenId>,
-        attachment_state: AgentAttachmentState,
-        focus: AgentFocus,
-        created_at: TimestampMillis,
-        updated_at: TimestampMillis,
-        revision: AgentInstanceRevision,
-    ) -> Result<Self, AgentTransitionError> {
-        if updated_at.get() < created_at.get() {
+    pub fn from_parts(parts: AgentRecordParts) -> Result<Self, AgentTransitionError> {
+        if parts.updated_at.get() < parts.created_at.get() {
             return Err(AgentTransitionError::TimestampOrder);
         }
-        if transport_principal.is_some() && !transport_kind.is_mcp() {
+        if parts.principal.is_token_or_grant_authenticated()
+            && !parts.transport_kind.is_retired_or_stream()
+        {
             return Err(AgentTransitionError::PrincipalTransportMismatch);
         }
-        if attachment_state.is_detached() && !focus.is_unfocused() {
+        if parts.attachment_state.is_detached() && !parts.focus.is_unfocused() {
             return Err(AgentTransitionError::DetachedFocus);
         }
-        if revision == AgentInstanceRevision::INITIAL
-            && (attachment_state.is_detached() || !focus.is_unfocused() || updated_at != created_at)
+        if parts.revision == AgentInstanceRevision::INITIAL
+            && (parts.attachment_state.is_detached()
+                || !parts.focus.is_unfocused()
+                || parts.updated_at != parts.created_at)
         {
             return Err(AgentTransitionError::InvalidInitialProjection);
         }
         Ok(Self {
-            id,
-            workspace_id,
-            activity_id,
-            display_name,
-            declared_role,
-            transport_kind,
-            transport_principal,
-            attachment_state,
-            focus,
-            created_at,
-            updated_at,
-            revision,
+            id: parts.id,
+            workspace_id: parts.workspace_id,
+            activity_id: parts.activity_id,
+            session_id: parts.session_id,
+            display_name: parts.display_name,
+            declared_role: parts.declared_role,
+            transport_kind: parts.transport_kind,
+            principal: parts.principal,
+            attachment_state: parts.attachment_state,
+            focus: parts.focus,
+            created_at: parts.created_at,
+            updated_at: parts.updated_at,
+            revision: parts.revision,
         })
     }
 
@@ -878,6 +896,12 @@ impl RegisteredAgentInstance {
 
     pub const fn activity_id(&self) -> ActivityId {
         self.activity_id
+    }
+
+    /// Return the immutable logical session binding, or `None` for an
+    /// unresolved legacy attachment.
+    pub const fn session_id(&self) -> Option<AgentSessionId> {
+        self.session_id
     }
 
     pub const fn display_name(&self) -> &AgentDisplayName {
@@ -896,12 +920,8 @@ impl RegisteredAgentInstance {
         self.transport_kind
     }
 
-    pub const fn transport_principal(&self) -> Option<McpTokenId> {
-        self.transport_principal
-    }
-
-    pub const fn principal(&self) -> Option<McpTokenId> {
-        self.transport_principal()
+    pub const fn principal(&self) -> AuthenticatedPrincipal {
+        self.principal
     }
 
     pub const fn attachment_state(&self) -> AgentAttachmentState {
@@ -979,6 +999,34 @@ impl RegisteredAgentInstance {
             ..self.clone()
         })
     }
+
+    /// Bind an existing pre-session attachment to one logical session while
+    /// preserving its attachment state, focus, and evidence identity.
+    pub fn bind_session(
+        &self,
+        expected_revision: AgentInstanceRevision,
+        session_id: AgentSessionId,
+        observed_at: TimestampMillis,
+    ) -> Result<Self, AgentTransitionError> {
+        if self.revision != expected_revision {
+            return Err(AgentTransitionError::RevisionConflict);
+        }
+        if self.session_id.is_some() {
+            return Err(AgentTransitionError::SessionAlreadyBound);
+        }
+        if observed_at.get() < self.updated_at.get() {
+            return Err(AgentTransitionError::TimestampOrder);
+        }
+        Ok(Self {
+            session_id: Some(session_id),
+            updated_at: observed_at,
+            revision: self
+                .revision
+                .checked_next()
+                .map_err(|_| AgentTransitionError::RevisionOverflow)?,
+            ..self.clone()
+        })
+    }
 }
 
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
@@ -997,26 +1045,10 @@ pub enum AgentTransitionError {
     Detached,
     #[error("Agent is already detached")]
     AlreadyDetached,
-    #[error("Agent transport principal requires an MCP transport")]
+    #[error("Agent transport principal requires a matching transport")]
     PrincipalTransportMismatch,
-}
-
-/// Input for creating one agent instance.  The application boundary owns ID
-/// generation; the domain only validates the resulting typed value.
-#[must_use]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AttachAgent {
-    agent: RegisteredAgentInstance,
-}
-
-impl AttachAgent {
-    pub const fn new(agent: RegisteredAgentInstance) -> Self {
-        Self { agent }
-    }
-
-    pub const fn agent(&self) -> &RegisteredAgentInstance {
-        &self.agent
-    }
+    #[error("Agent instance already has a logical session binding")]
+    SessionAlreadyBound,
 }
 
 /// Input for changing the exact focus of an attached agent.
@@ -1217,13 +1249,54 @@ mod tests {
             activity,
             AgentDisplayName::new("Planner".to_owned())?,
             AgentDeclaredRole::new("planner".to_owned())?,
-            AgentTransportKind::Mcp,
+            AgentTransportKind::Retired,
             TimestampMillis::new(1)?,
         );
         let detached = instance.detach(AgentInstanceRevision::INITIAL, TimestampMillis::new(2)?)?;
         assert!(detached.attachment_state().is_detached());
         assert!(detached.focus().is_unfocused());
         assert_eq!(detached.revision().get(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn oauth_grant_principal_requires_matching_transport() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (agent, workspace, activity, _) = ids();
+        let grant = crate::OAuthGrantId::from_uuid(Uuid::from_u128(7));
+        let instance = RegisteredAgentInstance::create_with_principal(
+            agent,
+            workspace,
+            activity,
+            AgentDisplayName::new("OAuth agent".to_owned())?,
+            AgentDeclaredRole::new("worker".to_owned())?,
+            AgentTransportKind::StreamableHttp,
+            AuthenticatedPrincipal::OAuthGrant(grant),
+            TimestampMillis::new(1)?,
+        );
+        assert_eq!(
+            instance.principal(),
+            AuthenticatedPrincipal::OAuthGrant(grant)
+        );
+        let invalid = RegisteredAgentInstance::from_parts(AgentRecordParts {
+            id: instance.id(),
+            workspace_id: instance.workspace_id(),
+            activity_id: instance.activity_id(),
+            session_id: instance.session_id(),
+            display_name: instance.display_name().clone(),
+            declared_role: instance.declared_role().clone(),
+            transport_kind: AgentTransportKind::Stdio,
+            principal: instance.principal(),
+            attachment_state: instance.attachment_state(),
+            focus: instance.focus(),
+            created_at: instance.created_at(),
+            updated_at: instance.updated_at(),
+            revision: instance.revision(),
+        });
+        assert!(matches!(
+            invalid,
+            Err(AgentTransitionError::PrincipalTransportMismatch)
+        ));
         Ok(())
     }
 }

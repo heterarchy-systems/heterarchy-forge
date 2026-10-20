@@ -24,6 +24,36 @@ pub enum WorkspaceCandidateKind {
     DirectChild,
 }
 
+/// Read-only classification of one filesystem observation during Workspace discovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WorkspaceDiscoveryDisposition {
+    Candidate,
+    Ignored,
+    NotWorkspace,
+}
+
+/// Deterministic reason for a discovery disposition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WorkspaceDiscoveryReason {
+    RegisteredLocationRoot,
+    ForgeState,
+    CargoWorkspace,
+    GitRepository,
+    AgentInstructions,
+    VcsMetadata,
+    ForgeInternalState,
+    BuildOutput,
+    DependencyCache,
+    FrameworkCache,
+    CoverageOutput,
+    Cache,
+    Temporary,
+    PythonCache,
+    VirtualEnvironment,
+    HiddenMetadata,
+    NoWorkspaceSignals,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum SignalPresence {
     #[default]
@@ -77,6 +107,61 @@ pub struct WorkspaceCandidate {
     signals: WorkspaceSignals,
 }
 
+/// Bounded, read-only filesystem observation. Possession of this value never
+/// grants Workspace registration or write authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceDiscoveryObservation {
+    candidate: WorkspaceCandidate,
+    disposition: WorkspaceDiscoveryDisposition,
+    reason: WorkspaceDiscoveryReason,
+}
+
+impl WorkspaceDiscoveryObservation {
+    fn new(
+        candidate: WorkspaceCandidate,
+        disposition: WorkspaceDiscoveryDisposition,
+        reason: WorkspaceDiscoveryReason,
+    ) -> Self {
+        Self {
+            candidate,
+            disposition,
+            reason,
+        }
+    }
+
+    pub fn key(&self) -> WorkspaceCandidateKey {
+        self.candidate.key()
+    }
+
+    pub const fn kind(&self) -> WorkspaceCandidateKind {
+        self.candidate.kind()
+    }
+
+    pub fn relative_root(&self) -> &Path {
+        self.candidate.relative_root()
+    }
+
+    pub fn display_name(&self) -> &OsStr {
+        self.candidate.display_name()
+    }
+
+    pub fn display_label(&self) -> Cow<'_, str> {
+        self.candidate.display_label()
+    }
+
+    pub const fn signals(&self) -> WorkspaceSignals {
+        self.candidate.signals()
+    }
+
+    pub const fn disposition(&self) -> WorkspaceDiscoveryDisposition {
+        self.disposition
+    }
+
+    pub const fn reason(&self) -> WorkspaceDiscoveryReason {
+        self.reason
+    }
+}
+
 /// Opaque native-path key for re-resolving a previously discovered candidate.
 ///
 /// The constructor remains private so callers obtain keys only from an actual
@@ -89,6 +174,17 @@ pub struct WorkspaceCandidateKey {
 }
 
 impl WorkspaceCandidateKey {
+    /// Project the registered Location root into UI correlation state.
+    ///
+    /// This never grants filesystem authority: effectful callers must still
+    /// resolve the key through the current Location revision and live scan.
+    pub fn location_root(location_id: LocationId) -> Self {
+        Self {
+            location_id,
+            relative_root: PathBuf::from("."),
+        }
+    }
+
     pub const fn location_id(&self) -> LocationId {
         self.location_id
     }
@@ -431,19 +527,39 @@ pub struct WorkspaceDiscovery {
     location_id: LocationId,
     location_root: PathBuf,
     candidates: Vec<WorkspaceCandidate>,
+    observations: Vec<WorkspaceDiscoveryObservation>,
 }
 
 impl WorkspaceDiscovery {
     pub fn scan(location: &RegisteredLocation) -> Result<Self, WorkspaceDiscoveryError> {
         let location_root = validate_location_root(location)?;
         let root_candidate = build_root_candidate(location, &location_root);
-        let children = scan_direct_children(location.id(), &location_root)?;
-        let candidates = collect_candidates(root_candidate, children);
+        let child_observations = scan_direct_children(location.id(), &location_root)?;
+
+        let mut candidates = Vec::with_capacity(child_observations.len() + 1);
+        candidates.push(root_candidate.clone());
+        candidates.extend(
+            child_observations
+                .iter()
+                .filter(|observation| {
+                    observation.disposition() != WorkspaceDiscoveryDisposition::Ignored
+                })
+                .map(|observation| observation.candidate.clone()),
+        );
+
+        let mut observations = Vec::with_capacity(child_observations.len() + 1);
+        observations.push(WorkspaceDiscoveryObservation::new(
+            root_candidate,
+            WorkspaceDiscoveryDisposition::Candidate,
+            WorkspaceDiscoveryReason::RegisteredLocationRoot,
+        ));
+        observations.extend(child_observations);
 
         Ok(Self {
             location_id: location.id(),
             location_root,
             candidates,
+            observations,
         })
     }
 
@@ -457,6 +573,10 @@ impl WorkspaceDiscovery {
 
     pub fn candidates(&self) -> &[WorkspaceCandidate] {
         &self.candidates
+    }
+
+    pub fn observations(&self) -> &[WorkspaceDiscoveryObservation] {
+        &self.observations
     }
 
     pub fn resolve(
@@ -550,6 +670,38 @@ fn validate_location_root(
     Ok(stored_root.to_path_buf())
 }
 
+pub(crate) fn resolve_locator_candidate(
+    location: &RegisteredLocation,
+    locator: &WorkspaceLocator,
+) -> Result<Option<WorkspaceCandidate>, WorkspaceDiscoveryError> {
+    let location_root = validate_location_root(location)?;
+    if locator.relative_root() == Path::new(".") {
+        return Ok(Some(build_root_candidate(location, &location_root)));
+    }
+
+    let child_path = location_root.join(locator.relative_root());
+    let metadata = match fs::symlink_metadata(&child_path) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(WorkspaceDiscoveryError::InspectEntry {
+                path: child_path,
+                source,
+            });
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Ok(None);
+    }
+    build_child_candidate(
+        location.id(),
+        &location_root,
+        locator.relative_root().as_os_str().to_os_string(),
+        &child_path,
+    )
+    .map(Some)
+}
+
 fn build_root_candidate(location: &RegisteredLocation, location_root: &Path) -> WorkspaceCandidate {
     WorkspaceCandidate {
         location_id: location.id(),
@@ -564,22 +716,18 @@ fn build_root_candidate(location: &RegisteredLocation, location_root: &Path) -> 
 fn scan_direct_children(
     location_id: LocationId,
     location_root: &Path,
-) -> Result<Vec<WorkspaceCandidate>, WorkspaceDiscoveryError> {
+) -> Result<Vec<WorkspaceDiscoveryObservation>, WorkspaceDiscoveryError> {
     let entries =
         fs::read_dir(location_root).map_err(|source| WorkspaceDiscoveryError::ReadLocation {
             path: location_root.to_path_buf(),
             source,
         })?;
-    let mut children = Vec::new();
+    let mut observations = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|source| WorkspaceDiscoveryError::ReadEntry {
             path: location_root.to_path_buf(),
             source,
         })?;
-        let name = entry.file_name();
-        if is_hidden(&name) {
-            continue;
-        }
         let file_type =
             entry
                 .file_type()
@@ -590,27 +738,31 @@ fn scan_direct_children(
         if !file_type.is_dir() || file_type.is_symlink() {
             continue;
         }
-        if children.len() >= MAX_WORKSPACE_CANDIDATES - 1 {
+        if observations.len() >= MAX_WORKSPACE_CANDIDATES - 1 {
             return Err(WorkspaceDiscoveryError::TooManyCandidates {
                 maximum: MAX_WORKSPACE_CANDIDATES,
             });
         }
+
+        let name = entry.file_name();
         let child_path = entry.path();
-        children.push(build_child_candidate(
-            location_id,
-            location_root,
-            name,
-            &child_path,
-        )?);
+        let candidate =
+            build_child_candidate(location_id, location_root, name.clone(), &child_path)?;
+        let (disposition, reason) = classify_direct_child(&name, candidate.signals());
+        observations.push(WorkspaceDiscoveryObservation::new(
+            candidate,
+            disposition,
+            reason,
+        ));
     }
 
-    children.sort_by(|left, right| {
-        left.relative_root
+    observations.sort_by(|left, right| {
+        left.relative_root()
             .as_os_str()
             .as_bytes()
-            .cmp(right.relative_root.as_os_str().as_bytes())
+            .cmp(right.relative_root().as_os_str().as_bytes())
     });
-    Ok(children)
+    Ok(observations)
 }
 
 fn build_child_candidate(
@@ -643,16 +795,6 @@ fn build_child_candidate(
     })
 }
 
-fn collect_candidates(
-    root_candidate: WorkspaceCandidate,
-    children: Vec<WorkspaceCandidate>,
-) -> Vec<WorkspaceCandidate> {
-    let mut candidates = Vec::with_capacity(children.len() + 1);
-    candidates.push(root_candidate);
-    candidates.extend(children);
-    candidates
-}
-
 fn inspect_signals(root: &Path) -> WorkspaceSignals {
     WorkspaceSignals {
         cargo_workspace: SignalPresence::from_bool(root.join("Cargo.toml").is_file()),
@@ -664,8 +806,71 @@ fn inspect_signals(root: &Path) -> WorkspaceSignals {
     }
 }
 
-fn is_hidden(name: &OsStr) -> bool {
-    name.as_bytes().first() == Some(&b'.')
+fn classify_direct_child(
+    name: &OsStr,
+    signals: WorkspaceSignals,
+) -> (WorkspaceDiscoveryDisposition, WorkspaceDiscoveryReason) {
+    if let Some(reason) = ignored_workspace_reason(name) {
+        return (WorkspaceDiscoveryDisposition::Ignored, reason);
+    }
+    if signals.forge_state() {
+        return (
+            WorkspaceDiscoveryDisposition::Candidate,
+            WorkspaceDiscoveryReason::ForgeState,
+        );
+    }
+    if signals.cargo_workspace() {
+        return (
+            WorkspaceDiscoveryDisposition::Candidate,
+            WorkspaceDiscoveryReason::CargoWorkspace,
+        );
+    }
+    if signals.git_repository() {
+        return (
+            WorkspaceDiscoveryDisposition::Candidate,
+            WorkspaceDiscoveryReason::GitRepository,
+        );
+    }
+    if signals.agent_instructions() {
+        return (
+            WorkspaceDiscoveryDisposition::Candidate,
+            WorkspaceDiscoveryReason::AgentInstructions,
+        );
+    }
+    (
+        WorkspaceDiscoveryDisposition::NotWorkspace,
+        WorkspaceDiscoveryReason::NoWorkspaceSignals,
+    )
+}
+
+fn ignored_workspace_reason(name: &OsStr) -> Option<WorkspaceDiscoveryReason> {
+    let bytes = name.as_bytes();
+    let matches = |candidate: &[u8]| bytes.eq_ignore_ascii_case(candidate);
+    if matches(b".git") {
+        Some(WorkspaceDiscoveryReason::VcsMetadata)
+    } else if matches(b".heterarchy-forge") {
+        Some(WorkspaceDiscoveryReason::ForgeInternalState)
+    } else if matches(b"target") || matches(b"dist") || matches(b"build") {
+        Some(WorkspaceDiscoveryReason::BuildOutput)
+    } else if matches(b"node_modules") {
+        Some(WorkspaceDiscoveryReason::DependencyCache)
+    } else if matches(b".next") {
+        Some(WorkspaceDiscoveryReason::FrameworkCache)
+    } else if matches(b"coverage") {
+        Some(WorkspaceDiscoveryReason::CoverageOutput)
+    } else if matches(b".cache") {
+        Some(WorkspaceDiscoveryReason::Cache)
+    } else if matches(b"tmp") {
+        Some(WorkspaceDiscoveryReason::Temporary)
+    } else if matches(b"__pycache__") {
+        Some(WorkspaceDiscoveryReason::PythonCache)
+    } else if matches(b".venv") || matches(b"venv") {
+        Some(WorkspaceDiscoveryReason::VirtualEnvironment)
+    } else if bytes.first() == Some(&b'.') {
+        Some(WorkspaceDiscoveryReason::HiddenMetadata)
+    } else {
+        None
+    }
 }
 
 #[derive(Debug, Error)]
@@ -804,8 +1009,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        WorkspaceCandidateKind, WorkspaceDiscovery, WorkspaceLocator, WorkspaceLocatorError,
-        WorkspaceResolveError, WorkspaceSelector, WorkspaceSignals,
+        WorkspaceCandidateKind, WorkspaceDiscovery, WorkspaceDiscoveryDisposition,
+        WorkspaceDiscoveryReason, WorkspaceLocator, WorkspaceLocatorError, WorkspaceResolveError,
+        WorkspaceSelector, WorkspaceSignals,
     };
     use forge_domain::{
         LocationId, LocationName, LocationRevision, LocationRoot, LocationState,
@@ -813,12 +1019,15 @@ mod tests {
     };
 
     #[test]
-    fn scan_discovers_root_and_sorted_direct_children_without_hidden_or_symlink_dirs()
+    fn scan_discovers_sorted_children_without_hidden_generated_or_symlink_dirs()
     -> Result<(), Box<dyn std::error::Error>> {
         let root = unique_test_root("scan")?;
         fs::create_dir_all(root.join("B"))?;
         fs::create_dir_all(root.join("A"))?;
         fs::create_dir_all(root.join(".hidden"))?;
+        for generated in ["target", "dist", "node_modules", ".cache"] {
+            fs::create_dir_all(root.join(generated))?;
+        }
         fs::write(
             root.join("A/Cargo.toml"),
             "[package]\nname='a'\nversion='0.1.0'\n",
@@ -835,11 +1044,120 @@ mod tests {
         assert_eq!(candidates[1].display_name(), OsStr::new("A"));
         assert!(candidates[1].signals().cargo_workspace());
         assert_eq!(candidates[2].display_name(), OsStr::new("B"));
-        assert!(
-            candidates
+        assert!(candidates.iter().all(|candidate| !matches!(
+            candidate.display_name().to_string_lossy().as_ref(),
+            "linked-a" | "target" | "dist" | "node_modules" | ".cache"
+        )));
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn discovery_observations_separate_candidates_ignored_and_non_workspaces()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = unique_test_root("dispositions")?;
+        fs::create_dir_all(root.join("project"))?;
+        fs::write(root.join("project/Cargo.toml"), "[workspace]\n")?;
+        fs::create_dir_all(root.join("notes"))?;
+        for ignored in [
+            ".git",
+            ".heterarchy-forge",
+            "target",
+            "dist",
+            "build",
+            "node_modules",
+            ".next",
+            "coverage",
+            ".cache",
+            "tmp",
+            "__pycache__",
+            ".venv",
+            "venv",
+        ] {
+            fs::create_dir_all(root.join(ignored))?;
+        }
+
+        let discovery =
+            WorkspaceDiscovery::scan(&registered_location(&root, LocationState::Enabled)?)?;
+        let observations = discovery.observations();
+        let find = |name: &str| {
+            observations
                 .iter()
-                .all(|candidate| candidate.display_name() != "linked-a")
+                .find(|entry| entry.display_name() == OsStr::new(name))
+                .ok_or_else(|| format!("missing observation: {name}"))
+        };
+
+        let root_entry = observations
+            .iter()
+            .find(|entry| entry.kind() == WorkspaceCandidateKind::LocationRoot)
+            .ok_or("missing location-root observation")?;
+        assert_eq!(
+            root_entry.disposition(),
+            WorkspaceDiscoveryDisposition::Candidate
         );
+        assert_eq!(
+            root_entry.reason(),
+            WorkspaceDiscoveryReason::RegisteredLocationRoot
+        );
+
+        assert_eq!(
+            find("project")?.disposition(),
+            WorkspaceDiscoveryDisposition::Candidate
+        );
+        assert_eq!(
+            find("project")?.reason(),
+            WorkspaceDiscoveryReason::CargoWorkspace
+        );
+        assert_eq!(
+            find("notes")?.disposition(),
+            WorkspaceDiscoveryDisposition::NotWorkspace
+        );
+        assert_eq!(
+            find("notes")?.reason(),
+            WorkspaceDiscoveryReason::NoWorkspaceSignals
+        );
+
+        for ignored in [
+            ".git",
+            ".heterarchy-forge",
+            "target",
+            "dist",
+            "build",
+            "node_modules",
+            ".next",
+            "coverage",
+            ".cache",
+            "tmp",
+            "__pycache__",
+            ".venv",
+            "venv",
+        ] {
+            assert_eq!(
+                find(ignored)?.disposition(),
+                WorkspaceDiscoveryDisposition::Ignored,
+                "{ignored} must never be projected as a Workspace candidate"
+            );
+        }
+
+        assert!(discovery.candidates().iter().all(|candidate| {
+            !matches!(
+                candidate.display_name().to_string_lossy().as_ref(),
+                ".git"
+                    | ".heterarchy-forge"
+                    | "target"
+                    | "dist"
+                    | "build"
+                    | "node_modules"
+                    | ".next"
+                    | "coverage"
+                    | ".cache"
+                    | "tmp"
+                    | "__pycache__"
+                    | ".venv"
+                    | "venv"
+            )
+        }));
 
         fs::remove_dir_all(root)?;
         Ok(())

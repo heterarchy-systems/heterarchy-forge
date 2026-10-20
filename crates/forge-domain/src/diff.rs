@@ -95,6 +95,7 @@ pub struct DiffRendererVersion(u32);
 
 impl DiffRendererVersion {
     pub const V1: Self = Self(1);
+    pub const V2: Self = Self(2);
 
     pub const fn new(value: u32) -> Result<Self, DiffVersionError> {
         if value == 0 {
@@ -115,6 +116,7 @@ pub struct DiffRedactionPolicyVersion(u32);
 
 impl DiffRedactionPolicyVersion {
     pub const V1: Self = Self(1);
+    pub const V2: Self = Self(2);
 
     pub const fn new(value: u32) -> Result<Self, DiffVersionError> {
         if value == 0 {
@@ -144,6 +146,8 @@ pub struct DiffContractVersions {
 
 impl DiffContractVersions {
     pub const V1: Self = Self::new(DiffRendererVersion::V1, DiffRedactionPolicyVersion::V1);
+    /// Absolute patch-window coordinates and line-preserving secret redaction.
+    pub const V2: Self = Self::new(DiffRendererVersion::V2, DiffRedactionPolicyVersion::V2);
 
     pub const fn new(
         renderer: DiffRendererVersion,
@@ -193,6 +197,10 @@ impl DiffEvidenceTimestamps {
 pub struct DiffPayloadHash(FileContentHash);
 
 impl DiffPayloadHash {
+    pub fn for_content(bytes: &[u8]) -> Self {
+        Self::from_bytes(*blake3::hash(bytes).as_bytes())
+    }
+
     pub const fn from_bytes(value: [u8; FileContentHash::BYTE_LEN]) -> Self {
         Self(FileContentHash::from_bytes(value))
     }
@@ -266,12 +274,20 @@ impl DiffLineCount {
     }
 }
 
-/// Known-path change category represented by one first-slice `ChangeSet`.
+/// Aggregate change category represented by one `ChangeSet` evidence entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DiffChangeKind {
     Created,
     Modified,
     Deleted,
+    Moved,
+}
+
+/// Source-tree subject represented by one Diff evidence entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DiffEntrySubject {
+    File,
+    Directory,
 }
 
 /// Durable payload state. Missing/corrupt are caller-time health observations,
@@ -292,6 +308,14 @@ pub enum DiffRenderKind {
     Text,
     Binary,
     Oversized,
+    Structured,
+}
+
+/// Exact semantic origin of one Diff Evidence record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DiffOrigin {
+    FileMutation(FileMutationId),
+    TreeChangeSet,
 }
 
 /// Workspace/Activity/ChangeSet attribution for one Diff.
@@ -301,11 +325,11 @@ pub struct DiffAttribution {
     workspace_id: WorkspaceId,
     activity_id: ActivityId,
     change_set_id: ChangeSetId,
-    mutation_id: FileMutationId,
+    origin: DiffOrigin,
 }
 
 impl DiffAttribution {
-    pub const fn new(
+    pub const fn for_file_mutation(
         id: DiffId,
         workspace_id: WorkspaceId,
         activity_id: ActivityId,
@@ -317,67 +341,90 @@ impl DiffAttribution {
             workspace_id,
             activity_id,
             change_set_id,
-            mutation_id,
+            origin: DiffOrigin::FileMutation(mutation_id),
+        }
+    }
+
+    pub const fn for_tree_change_set(
+        id: DiffId,
+        workspace_id: WorkspaceId,
+        activity_id: ActivityId,
+        change_set_id: ChangeSetId,
+    ) -> Self {
+        Self {
+            id,
+            workspace_id,
+            activity_id,
+            change_set_id,
+            origin: DiffOrigin::TreeChangeSet,
         }
     }
 
     pub const fn id(self) -> DiffId {
         self.id
     }
-
     pub const fn workspace_id(self) -> WorkspaceId {
         self.workspace_id
     }
-
     pub const fn activity_id(self) -> ActivityId {
         self.activity_id
     }
-
     pub const fn change_set_id(self) -> ChangeSetId {
         self.change_set_id
     }
-
-    pub const fn mutation_id(self) -> FileMutationId {
-        self.mutation_id
+    pub const fn origin(self) -> DiffOrigin {
+        self.origin
     }
 }
 
-/// One-file human review summary; payload bytes remain outside `SQLite`.
+/// One bounded path-level entry in aggregate human-review Diff Evidence.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DiffFileSummary {
-    path: WorkspaceRelativePath,
+pub struct DiffEntrySummary {
+    subject: DiffEntrySubject,
+    primary_path: WorkspaceRelativePath,
+    secondary_path: Option<WorkspaceRelativePath>,
     kind: DiffChangeKind,
     additions: DiffLineCount,
     deletions: DiffLineCount,
 }
 
-impl DiffFileSummary {
-    pub const fn new(
-        path: WorkspaceRelativePath,
+impl DiffEntrySummary {
+    pub fn new(
+        subject: DiffEntrySubject,
+        primary_path: WorkspaceRelativePath,
+        secondary_path: Option<WorkspaceRelativePath>,
         kind: DiffChangeKind,
         additions: DiffLineCount,
         deletions: DiffLineCount,
-    ) -> Self {
-        Self {
-            path,
+    ) -> Result<Self, DiffTransitionError> {
+        if matches!(kind, DiffChangeKind::Moved) != secondary_path.is_some() {
+            return Err(DiffTransitionError::InvalidEntryShape);
+        }
+        Ok(Self {
+            subject,
+            primary_path,
+            secondary_path,
             kind,
             additions,
             deletions,
-        }
+        })
     }
 
-    pub fn path(&self) -> &WorkspaceRelativePath {
-        &self.path
+    pub const fn subject(&self) -> DiffEntrySubject {
+        self.subject
     }
-
+    pub fn primary_path(&self) -> &WorkspaceRelativePath {
+        &self.primary_path
+    }
+    pub const fn secondary_path(&self) -> Option<&WorkspaceRelativePath> {
+        self.secondary_path.as_ref()
+    }
     pub const fn kind(&self) -> DiffChangeKind {
         self.kind
     }
-
     pub const fn additions(&self) -> DiffLineCount {
         self.additions
     }
-
     pub const fn deletions(&self) -> DiffLineCount {
         self.deletions
     }
@@ -453,7 +500,7 @@ impl DiffPayloadProjection {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BeginDiffEvidence {
     attribution: DiffAttribution,
-    file: DiffFileSummary,
+    entries: Vec<DiffEntrySummary>,
     payload: DiffPayloadProjection,
     observed_at: TimestampMillis,
     versions: DiffContractVersions,
@@ -462,7 +509,7 @@ pub struct BeginDiffEvidence {
 impl BeginDiffEvidence {
     pub fn new(
         attribution: DiffAttribution,
-        file: DiffFileSummary,
+        entries: Vec<DiffEntrySummary>,
         payload: DiffPayloadProjection,
         observed_at: TimestampMillis,
         versions: DiffContractVersions,
@@ -473,9 +520,12 @@ impl BeginDiffEvidence {
         if payload.state() != DiffEvidenceState::Intent {
             return Err(DiffTransitionError::InvalidPayloadState);
         }
+        if entries.is_empty() || entries.len() > crate::MAX_TREE_CHANGESET_MUTATIONS {
+            return Err(DiffTransitionError::InvalidEntryCount);
+        }
         Ok(Self {
             attribution,
-            file,
+            entries,
             payload,
             observed_at,
             versions,
@@ -486,8 +536,8 @@ impl BeginDiffEvidence {
         self.attribution
     }
 
-    pub const fn file(&self) -> &DiffFileSummary {
-        &self.file
+    pub fn entries(&self) -> &[DiffEntrySummary] {
+        &self.entries
     }
 
     pub const fn payload(&self) -> &DiffPayloadProjection {
@@ -593,6 +643,10 @@ pub enum DiffTransitionError {
     IdentityMismatch,
     #[error("Diff payload state is invalid for this transition")]
     InvalidPayloadState,
+    #[error("Diff entry count is outside the bounded ChangeSet range")]
+    InvalidEntryCount,
+    #[error("Diff entry path shape does not match its change kind")]
+    InvalidEntryShape,
 }
 
 /// Durable metadata/index projection for one human-review Diff.
@@ -600,7 +654,7 @@ pub enum DiffTransitionError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegisteredDiffEvidence {
     attribution: DiffAttribution,
-    file: DiffFileSummary,
+    entries: Vec<DiffEntrySummary>,
     payload: DiffPayloadProjection,
     timestamps: DiffEvidenceTimestamps,
     versions: DiffContractVersions,
@@ -610,7 +664,7 @@ pub struct RegisteredDiffEvidence {
 impl RegisteredDiffEvidence {
     pub const fn from_parts(
         attribution: DiffAttribution,
-        file: DiffFileSummary,
+        entries: Vec<DiffEntrySummary>,
         payload: DiffPayloadProjection,
         timestamps: DiffEvidenceTimestamps,
         versions: DiffContractVersions,
@@ -618,7 +672,7 @@ impl RegisteredDiffEvidence {
     ) -> Self {
         Self {
             attribution,
-            file,
+            entries,
             payload,
             timestamps,
             versions,
@@ -642,12 +696,12 @@ impl RegisteredDiffEvidence {
         self.attribution.change_set_id()
     }
 
-    pub const fn mutation_id(&self) -> FileMutationId {
-        self.attribution.mutation_id()
+    pub const fn origin(&self) -> DiffOrigin {
+        self.attribution.origin()
     }
 
-    pub const fn file(&self) -> &DiffFileSummary {
-        &self.file
+    pub fn entries(&self) -> &[DiffEntrySummary] {
+        &self.entries
     }
 
     pub const fn payload(&self) -> &DiffPayloadProjection {
@@ -744,26 +798,26 @@ mod tests {
     }
 
     #[test]
-    fn diff_projection_keeps_payload_reference_separate_from_summary()
+    fn diff_projection_keeps_payload_reference_separate_from_aggregate_entries()
     -> Result<(), Box<dyn std::error::Error>> {
         let path = WorkspaceRelativePath::new(PathBuf::from("src/lib.rs"))?;
-        let artifact = DiffArtifactRelativePath::new(PathBuf::from(
-            "diffs/diff_00000000-0000-0000-0000-000000000001.diff.zst",
-        ))?;
+        let artifact = DiffArtifactRelativePath::new(PathBuf::from("[REDACTED].diff.zst"))?;
         let evidence = RegisteredDiffEvidence::from_parts(
-            DiffAttribution::new(
+            DiffAttribution::for_file_mutation(
                 DiffId::from_uuid(Uuid::from_u128(1)),
                 WorkspaceId::from_uuid(Uuid::from_u128(2)),
                 ActivityId::from_uuid(Uuid::from_u128(3)),
                 ChangeSetId::from_uuid(Uuid::from_u128(4)),
                 FileMutationId::from_uuid(Uuid::from_u128(5)),
             ),
-            DiffFileSummary::new(
+            vec![DiffEntrySummary::new(
+                DiffEntrySubject::File,
                 path,
+                None,
                 DiffChangeKind::Modified,
                 DiffLineCount::new(2),
                 DiffLineCount::new(1),
-            ),
+            )?],
             DiffPayloadProjection::Ready {
                 relative_path: artifact,
                 compressed_hash: DiffPayloadHash::from_bytes([9; FileContentHash::BYTE_LEN]),
@@ -777,8 +831,53 @@ mod tests {
         );
         assert_eq!(evidence.state(), DiffEvidenceState::Ready);
         assert_eq!(evidence.payload().render_kind(), DiffRenderKind::Text);
-        assert_eq!(evidence.file().additions().get(), 2);
-        assert_eq!(evidence.file().deletions().get(), 1);
+        assert!(matches!(evidence.origin(), DiffOrigin::FileMutation(_)));
+        assert_eq!(evidence.entries()[0].additions().get(), 2);
+        assert_eq!(evidence.entries()[0].deletions().get(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn aggregate_diff_supports_structured_move_and_rejects_invalid_shapes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let change_set_id = ChangeSetId::from_uuid(Uuid::from_u128(4));
+        let attribution = DiffAttribution::for_tree_change_set(
+            DiffId::for_change_set(change_set_id),
+            WorkspaceId::from_uuid(Uuid::from_u128(2)),
+            ActivityId::from_uuid(Uuid::from_u128(3)),
+            change_set_id,
+        );
+        let moved = DiffEntrySummary::new(
+            DiffEntrySubject::Directory,
+            WorkspaceRelativePath::new(PathBuf::from("src"))?,
+            Some(WorkspaceRelativePath::new(PathBuf::from("lib"))?),
+            DiffChangeKind::Moved,
+            DiffLineCount::new(0),
+            DiffLineCount::new(0),
+        )?;
+        assert!(
+            BeginDiffEvidence::new(
+                attribution,
+                vec![moved],
+                DiffPayloadProjection::IntentSummary {
+                    render_kind: DiffRenderKind::Structured,
+                },
+                TimestampMillis::new(10)?,
+                DiffContractVersions::V1,
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            DiffEntrySummary::new(
+                DiffEntrySubject::File,
+                WorkspaceRelativePath::new(PathBuf::from("a"))?,
+                None,
+                DiffChangeKind::Moved,
+                DiffLineCount::new(0),
+                DiffLineCount::new(0),
+            ),
+            Err(DiffTransitionError::InvalidEntryShape)
+        ));
         Ok(())
     }
 
@@ -786,23 +885,25 @@ mod tests {
     fn diff_commands_reject_identity_and_lifecycle_mismatches()
     -> Result<(), Box<dyn std::error::Error>> {
         let change_set_id = ChangeSetId::from_uuid(Uuid::from_u128(4));
-        let attribution = DiffAttribution::new(
+        let attribution = DiffAttribution::for_file_mutation(
             DiffId::for_change_set(change_set_id),
             WorkspaceId::from_uuid(Uuid::from_u128(2)),
             ActivityId::from_uuid(Uuid::from_u128(3)),
             change_set_id,
             FileMutationId::from_uuid(Uuid::from_u128(5)),
         );
-        let file = DiffFileSummary::new(
+        let entry = DiffEntrySummary::new(
+            DiffEntrySubject::File,
             WorkspaceRelativePath::new(PathBuf::from("src/lib.rs"))?,
+            None,
             DiffChangeKind::Modified,
             DiffLineCount::new(1),
             DiffLineCount::new(1),
-        );
+        )?;
         assert!(
             BeginDiffEvidence::new(
                 attribution,
-                file.clone(),
+                vec![entry.clone()],
                 DiffPayloadProjection::IntentSummary {
                     render_kind: DiffRenderKind::Binary,
                 },
@@ -811,17 +912,21 @@ mod tests {
             )
             .is_ok()
         );
-        let mismatched = DiffAttribution::new(
+        let mutation_id = match attribution.origin() {
+            DiffOrigin::FileMutation(id) => id,
+            DiffOrigin::TreeChangeSet => return Err("unexpected tree origin".into()),
+        };
+        let mismatched = DiffAttribution::for_file_mutation(
             DiffId::from_uuid(Uuid::from_u128(99)),
             attribution.workspace_id(),
             attribution.activity_id(),
             attribution.change_set_id(),
-            attribution.mutation_id(),
+            mutation_id,
         );
         assert!(matches!(
             BeginDiffEvidence::new(
                 mismatched,
-                file,
+                vec![entry],
                 DiffPayloadProjection::IntentSummary {
                     render_kind: DiffRenderKind::Binary,
                 },

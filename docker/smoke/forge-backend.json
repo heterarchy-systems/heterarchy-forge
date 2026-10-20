@@ -1,0 +1,11 @@
+{
+  "listen": "127.0.0.1:8080",
+  "registry_path": "/state/registry.sqlite3",
+  "product_cache_root": "/state/product-cache",
+  "backend_id": "21ff7a97-da8e-45d9-b6dc-bb01587d00bd",
+  "issuer_id": "d3a58f8c-9c6a-48d7-a63a-50d70cde6bbd",
+  "destination_id": "e32f5460-055d-4627-a7aa-1be543cfb749",
+  "api_bearer_file": "/secrets/api.secret",
+  "session_authority": "127.0.0.1:9101",
+  "session_bearer_file": "/secrets/session.secret"
+}

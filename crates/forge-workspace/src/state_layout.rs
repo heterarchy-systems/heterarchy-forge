@@ -13,7 +13,8 @@ use forge_domain::WorkspaceRootFingerprint;
 
 use thiserror::Error;
 
-const GIT_PROGRAM: &str = "/usr/bin/git";
+use crate::git_safety::FORGE_GIT_PROGRAM;
+
 const STATE_DIRECTORY_NAME: &str = ".heterarchy-forge";
 const STATE_FORMAT_FILE_NAME: &str = "FORMAT";
 const STATE_FORMAT: &[u8] = b"heterarchy-forge-state-v1\n";
@@ -158,7 +159,7 @@ impl WorkspaceStateLayout {
         // Capture and validate the root identity before inspecting the child
         // state tree.  This is intentionally repeated by callers before any
         // effect because the filesystem may change after this observation.
-        observe_root_fingerprint(&workspace_root)?;
+        Self::observe_root_fingerprint(&workspace_root)?;
 
         let state_root = workspace_root.join(STATE_DIRECTORY_NAME);
         match fs::symlink_metadata(&state_root) {
@@ -204,7 +205,15 @@ impl WorkspaceStateLayout {
     /// buffer. Callers must treat the result as an observation and re-check it
     /// before granting any Workspace-scoped effect.
     pub fn root_fingerprint(&self) -> Result<WorkspaceRootFingerprint, StateLayoutError> {
-        observe_root_fingerprint(&self.workspace_root)
+        Self::observe_root_fingerprint(&self.workspace_root)
+    }
+
+    /// Observe a canonical Workspace root's current physical identity without
+    /// creating or inspecting Forge-owned state.
+    pub fn observe_root_fingerprint(
+        workspace_root: &Path,
+    ) -> Result<WorkspaceRootFingerprint, StateLayoutError> {
+        observe_root_fingerprint(workspace_root)
     }
 
     pub fn diffs(&self) -> &Path {
@@ -279,7 +288,7 @@ impl ExistingWorkspaceStateLayout {
 
     /// Re-observe the canonical Workspace root's stable physical identity.
     pub fn root_fingerprint(&self) -> Result<WorkspaceRootFingerprint, StateLayoutError> {
-        observe_root_fingerprint(&self.workspace_root)
+        WorkspaceStateLayout::observe_root_fingerprint(&self.workspace_root)
     }
 
     /// Inspect local Git visibility without changing Git or Workspace state.
@@ -1238,7 +1247,7 @@ fn capture_git_streams(
 }
 
 fn run_git(workspace_root: &Path, arguments: &[&str]) -> Result<BoundedOutput, StateLayoutError> {
-    let mut command = Command::new(GIT_PROGRAM);
+    let mut command = Command::new(FORGE_GIT_PROGRAM);
     command
         .arg("-C")
         .arg(workspace_root)
@@ -1578,6 +1587,8 @@ mod tests {
     use std::sync::{Arc, Barrier};
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    use crate::FORGE_GIT_PROGRAM;
 
     use super::{
         GitLocalState, GitLocalStateDoctor, INITIALIZATION_LOCK_NAME, LOCAL_EXCLUDE_COMMENT,
@@ -2404,7 +2415,7 @@ mod tests {
         root: &Path,
         arguments: &[&str],
     ) -> Result<std::process::Output, Box<dyn std::error::Error>> {
-        Ok(Command::new("/usr/bin/git")
+        Ok(Command::new(FORGE_GIT_PROGRAM)
             .arg("-C")
             .arg(root)
             .args(arguments)

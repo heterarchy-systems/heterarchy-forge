@@ -3,10 +3,12 @@
 use std::collections::HashMap;
 
 use forge_domain::{
-    DagAcceptanceCriterion, DagEdge, DagHeadRevision, DagLineageKind, DagNodeDefinition, DagNodeId,
-    DagNodeLifecycle, DagNodeLineage, DagNodeObjective, DagNodeOrdinal, DagNodeRevision,
-    DagNodeTitle, DagRevision, DagRevisionId, DagRevisionNumber, GoalEvidenceRef, GoalId,
-    GoalNodeAttribution, GoalPublicReason, GoalStatusKind, RegisteredDagNode, TimestampMillis,
+    ActivityId, AgentSessionId, AuthenticatedPrincipal, DagAcceptanceCriterion, DagEdge,
+    DagHeadRevision, DagLineageKind, DagNodeDefinition, DagNodeId, DagNodeLifecycle,
+    DagNodeLineage, DagNodeObjective, DagNodeOrdinal, DagNodeRevision, DagNodeTitle, DagRevision,
+    DagRevisionId, DagRevisionNumber, GoalEvidenceRef, GoalId, GoalNodeAttribution,
+    GoalPublicReason, GoalRevision, GoalStatusKind, RegisteredDagNode, TimestampMillis,
+    WorkspaceId,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use thiserror::Error;
@@ -21,17 +23,14 @@ pub use doctor::{
     DagDoctorReport, DagDoctorState,
 };
 
+use crate::workspace_coordinators::{self, CoordinatorStoreError};
 use crate::workspace_goals;
+use crate::workspace_semantic_events::{
+    self, SemanticEventAppend, SemanticEventKind, SemanticEventSubjects,
+};
 
 pub(crate) fn create_schema(connection: &Connection) -> Result<(), DagStoreError> {
     schema::create_schema(connection)
-}
-
-pub(crate) fn migrate_v9_to_v10(
-    connection: &mut Connection,
-    next_schema_version: i64,
-) -> Result<(), DagStoreError> {
-    schema::migrate_v9_to_v10(connection, next_schema_version)
 }
 
 pub(crate) fn schema_objects() -> [(&'static str, &'static str); 8] {
@@ -129,9 +128,9 @@ pub(crate) fn insert_revision(
 }
 
 /// Insert one immutable DAG revision into a caller-owned IMMEDIATE
-/// transaction.  This is intentionally crate-private: Agent authoring uses
-/// it to atomically commit the DAG head, grant consumption, ledger row, and
-/// factual Agent history in one transaction.
+/// transaction. This is intentionally crate-private: Coordinator planning
+/// uses it to atomically fence authority, commit the DAG head and replay
+/// ledger, and publish factual planning history in one transaction.
 pub(crate) fn insert_revision_in_transaction(
     transaction: &Transaction<'_>,
     revision: &DagRevision,
@@ -150,7 +149,9 @@ pub(crate) fn insert_revision_in_transaction(
     // projection.  A Goal lifecycle update after a DAG commit must not make
     // the same durable request non-idempotent.  The revision, node set, and
     // canonical lineage comparisons still protect identity/scope safety.
-    if let Some(existing) = get_revision_tx(transaction, revision.goal_id(), revision.number())? {
+    if let Some(existing) =
+        get_revision_in_transaction(transaction, revision.goal_id(), revision.number())?
+    {
         if existing.revision() == revision
             && nodes_equivalent(existing.nodes(), nodes)
             && existing.lineage() == lineage
@@ -159,6 +160,12 @@ pub(crate) fn insert_revision_in_transaction(
         }
         return Err(DagStoreError::IdentityConflict);
     }
+    let workspace_id = revision_workspace_id(transaction, revision.goal_id())?;
+    crate::workspace_work_cuts::guards::ensure_goal_open(
+        transaction,
+        workspace_id,
+        revision.goal_id(),
+    )?;
     validate_goal_for_revision(transaction, revision)?;
     let current_head = validate_revision_preconditions(
         transaction,
@@ -231,12 +238,56 @@ pub(crate) fn insert_revision_in_transaction(
             next
         }
     };
-    let result = get_revision_tx(transaction, revision.goal_id(), revision.number())?
+    let result = get_revision_in_transaction(transaction, revision.goal_id(), revision.number())?
         .ok_or(DagStoreError::CorruptRecord("dag.inserted_revision"))?;
     if result.head().revision() != head_revision {
         return Err(DagStoreError::HeadConflict);
     }
+    append_dag_committed_event(transaction, revision, head_revision)?;
     Ok(result)
+}
+
+/// Append the durable `dag_committed` event inside the same transaction that
+/// advanced the immutable revision and its mutable head.
+fn append_dag_committed_event(
+    transaction: &Transaction<'_>,
+    revision: &DagRevision,
+    head_revision: DagHeadRevision,
+) -> Result<(), DagStoreError> {
+    workspace_semantic_events::append_semantic_event(
+        transaction,
+        &SemanticEventAppend::new(
+            SemanticEventKind::DagCommitted,
+            revision_workspace_id(transaction, revision.goal_id())?,
+            SemanticEventSubjects {
+                goal_id: Some(revision.goal_id()),
+                dag_revision: Some(revision.number()),
+                ..SemanticEventSubjects::NONE
+            },
+            head_revision.get(),
+            revision.created_at(),
+        ),
+    )?;
+    Ok(())
+}
+
+/// Resolve the Workspace identity every Goal-scoped semantic event carries.
+fn revision_workspace_id(
+    connection: &Connection,
+    goal_id: GoalId,
+) -> Result<WorkspaceId, DagStoreError> {
+    let raw: Option<Vec<u8>> = connection
+        .query_row(
+            "SELECT workspace_id FROM goals WHERE goal_id = ?1",
+            params![goal_id.into_uuid().as_bytes()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let raw = raw.ok_or(DagStoreError::GoalMissing)?;
+    Ok(WorkspaceId::from_uuid(decode_uuid(
+        "dag.goal_workspace_id",
+        &raw,
+    )?))
 }
 
 fn validate_revision_preconditions(
@@ -249,8 +300,9 @@ fn validate_revision_preconditions(
     let current_head = get_head(connection, revision.goal_id())?;
     validate_head_advance(revision, current_head, expected_head_revision)?;
     if let Some(head) = current_head {
-        let parent = get_revision_tx(connection, revision.goal_id(), head.dag_revision())?
-            .ok_or(DagStoreError::CorruptRecord("dag.parent"))?;
+        let parent =
+            get_revision_in_transaction(connection, revision.goal_id(), head.dag_revision())?
+                .ok_or(DagStoreError::CorruptRecord("dag.parent"))?;
         validate_replan(&parent, nodes, lineage)?;
     } else if nodes.iter().any(|node| {
         node.revision() != DagNodeRevision::INITIAL
@@ -348,10 +400,20 @@ pub(crate) fn get_current(
     connection: &Connection,
     goal_id: GoalId,
 ) -> Result<Option<StoredDagRevision>, DagStoreError> {
+    let transaction = connection.unchecked_transaction()?;
+    let result = get_current_in_transaction(&transaction, goal_id)?;
+    transaction.commit()?;
+    Ok(result)
+}
+
+pub(crate) fn get_current_in_transaction(
+    connection: &Connection,
+    goal_id: GoalId,
+) -> Result<Option<StoredDagRevision>, DagStoreError> {
     let Some(head) = get_head(connection, goal_id)? else {
         return Ok(None);
     };
-    get_revision(connection, goal_id, head.dag_revision())
+    get_revision_in_transaction(connection, goal_id, head.dag_revision())
 }
 
 pub(crate) fn get_revision(
@@ -360,56 +422,300 @@ pub(crate) fn get_revision(
     number: DagRevisionNumber,
 ) -> Result<Option<StoredDagRevision>, DagStoreError> {
     let transaction = connection.unchecked_transaction()?;
-    let result = get_revision_tx(&transaction, goal_id, number)?;
+    let result = get_revision_in_transaction(&transaction, goal_id, number)?;
     transaction.commit()?;
     Ok(result)
 }
 
 pub(crate) fn start_node(
     connection: &mut Connection,
-    goal_id: GoalId,
-    node_id: DagNodeId,
-    expected_revision: DagNodeRevision,
-    observed_at: TimestampMillis,
+    request: DagNodeTransition,
 ) -> Result<RegisteredDagNode, DagStoreError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let head = get_head(&transaction, goal_id)?.ok_or(DagStoreError::HeadMissing)?;
-    let current = get_revision_tx(&transaction, goal_id, head.dag_revision())?
-        .ok_or(DagStoreError::HeadMissing)?;
-    let updated =
-        current
-            .revision()
-            .start_node(current.nodes(), node_id, expected_revision, observed_at)?;
-    persist_node_transition(&transaction, &updated, expected_revision)?;
+    let updated = start_node_in_transaction(&transaction, request)?;
     transaction.commit()?;
     Ok(updated)
 }
 
+/// Start a DAG node after resolving the exact attached Agent for the current
+/// Activity/session/principal tuple in the same transaction as the node CAS.
+/// The un-authorized [`start_node`] primitive remains available to trusted
+/// internal callers and deterministic persistence tests.
+pub(crate) fn start_node_authorized(
+    connection: &mut Connection,
+    request: DagNodeTransition,
+    session_id: AgentSessionId,
+    principal: AuthenticatedPrincipal,
+    admitted_at: TimestampMillis,
+) -> Result<RegisteredDagNode, DagStoreError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    workspace_coordinators::ensure_live_activity_in_transaction(
+        &transaction,
+        request.scope.activity_id,
+        request.scope.workspace_id,
+        admitted_at,
+    )?;
+    let updated =
+        start_node_authorized_in_transaction(&transaction, request, session_id, principal)?;
+    transaction.commit()?;
+    Ok(updated)
+}
+
+/// Start one current ready node after exact Agent authorization inside a
+/// caller-owned transaction. Assignment claim uses this narrow primitive so
+/// node activation, target focus, and assignment state share one commit.
+pub(crate) fn start_node_authorized_in_transaction(
+    transaction: &Transaction<'_>,
+    request: DagNodeTransition,
+    session_id: AgentSessionId,
+    principal: AuthenticatedPrincipal,
+) -> Result<RegisteredDagNode, DagStoreError> {
+    authorize_node_transition(transaction, request.scope, session_id, principal)?;
+    start_node_in_transaction(transaction, request)
+}
+
+fn start_node_in_transaction(
+    transaction: &Transaction<'_>,
+    request: DagNodeTransition,
+) -> Result<RegisteredDagNode, DagStoreError> {
+    validate_goal_revision(
+        transaction,
+        request.scope.workspace_id,
+        request.scope.activity_id,
+        request.scope.goal_id,
+        request.scope.expected_goal_revision,
+    )?;
+    let head = get_head(transaction, request.scope.goal_id)?.ok_or(DagStoreError::HeadMissing)?;
+    if head.dag_revision() != request.scope.expected_dag_revision {
+        return Err(DagStoreError::HeadConflict);
+    }
+    let current = get_revision_in_transaction(
+        transaction,
+        request.scope.goal_id,
+        request.scope.expected_dag_revision,
+    )?
+    .ok_or(DagStoreError::HeadMissing)?;
+    crate::workspace_work_cuts::guards::ensure_node_open(
+        transaction,
+        request.scope.workspace_id,
+        request.scope.goal_id,
+        request.scope.expected_dag_revision,
+        request.node_id,
+    )?;
+    let updated = current.revision().start_node(
+        current.nodes(),
+        request.node_id,
+        request.expected_node_revision,
+        request.observed_at,
+    )?;
+    persist_node_transition(transaction, &updated, request.expected_node_revision)?;
+    Ok(updated)
+}
+
+pub(crate) fn complete_node(
+    connection: &mut Connection,
+    request: DagNodeTransition,
+) -> Result<RegisteredDagNode, DagStoreError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let completed = complete_node_in_transaction(&transaction, request)?;
+    transaction.commit()?;
+    Ok(completed)
+}
+
+/// Complete a DAG node after resolving the exact attached Agent for the
+/// current Activity/session/principal tuple in the same transaction as the
+/// node CAS. The transition itself does not require Agent focus; source-write
+/// authority remains a separate focus/lease contract.
+pub(crate) fn complete_node_authorized(
+    connection: &mut Connection,
+    request: DagNodeTransition,
+    session_id: AgentSessionId,
+    principal: AuthenticatedPrincipal,
+    admitted_at: TimestampMillis,
+) -> Result<RegisteredDagNode, DagStoreError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    workspace_coordinators::ensure_live_activity_in_transaction(
+        &transaction,
+        request.scope.activity_id,
+        request.scope.workspace_id,
+        admitted_at,
+    )?;
+    authorize_node_transition(&transaction, request.scope, session_id, principal)?;
+    let completed = complete_node_in_transaction(&transaction, request)?;
+    transaction.commit()?;
+    Ok(completed)
+}
+
+fn complete_node_in_transaction(
+    transaction: &Transaction<'_>,
+    request: DagNodeTransition,
+) -> Result<RegisteredDagNode, DagStoreError> {
+    validate_goal_revision(
+        transaction,
+        request.scope.workspace_id,
+        request.scope.activity_id,
+        request.scope.goal_id,
+        request.scope.expected_goal_revision,
+    )?;
+    let head = get_head(transaction, request.scope.goal_id)?.ok_or(DagStoreError::HeadMissing)?;
+    if head.dag_revision() != request.scope.expected_dag_revision {
+        return Err(DagStoreError::HeadConflict);
+    }
+    let current = get_revision_in_transaction(
+        transaction,
+        request.scope.goal_id,
+        request.scope.expected_dag_revision,
+    )?
+    .and_then(|stored| {
+        stored
+            .nodes()
+            .iter()
+            .find(|node| node.id() == request.node_id)
+            .cloned()
+    })
+    .ok_or(DagStoreError::NodeMissing)?;
+    let completed = current.complete(request.expected_node_revision, request.observed_at)?;
+    persist_node_transition(transaction, &completed, request.expected_node_revision)?;
+    Ok(completed)
+}
+
+/// Resolve one and only one current Activity attachment for the supplied
+/// logical session, then compare its immutable principal and attachment state.
+/// The partial unique index on `(activity_id, session_id)` is the durable
+/// primary fence; `LIMIT 2` also fails closed if a damaged database bypassed
+/// that index.
+fn authorize_node_transition(
+    connection: &Connection,
+    scope: DagTransitionScope,
+    session_id: AgentSessionId,
+    principal: AuthenticatedPrincipal,
+) -> Result<(), DagStoreError> {
+    let mut statement = connection.prepare(
+        "SELECT workspace_id, activity_id, principal_kind, principal_id, attachment_state
+         FROM agent_instances
+         WHERE activity_id = ?1 AND session_id = ?2
+         LIMIT 2",
+    )?;
+    let mut rows = statement.query(params![
+        scope.activity_id.into_uuid().as_bytes(),
+        session_id.into_uuid().as_bytes(),
+    ])?;
+    let (workspace_id, activity_id, principal_kind, principal_id, attachment_state) = {
+        let Some(row) = rows.next()? else {
+            return Err(DagStoreError::AgentAuthorizationConflict);
+        };
+        (
+            row.get::<_, Vec<u8>>(0)?,
+            row.get::<_, Vec<u8>>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, Option<Vec<u8>>>(3)?,
+            row.get::<_, i64>(4)?,
+        )
+    };
+    if rows.next()?.is_some() {
+        return Err(DagStoreError::AgentAuthorizationConflict);
+    }
+    let (expected_principal_kind, expected_principal_id) = encode_principal(principal);
+    if workspace_id.as_slice() != scope.workspace_id.into_uuid().as_bytes()
+        || activity_id.as_slice() != scope.activity_id.into_uuid().as_bytes()
+        || principal_kind != expected_principal_kind
+        || principal_id != expected_principal_id
+        || attachment_state != 0
+    {
+        return Err(DagStoreError::AgentAuthorizationConflict);
+    }
+    Ok(())
+}
+
+fn encode_principal(value: AuthenticatedPrincipal) -> (i64, Option<Vec<u8>>) {
+    match value {
+        AuthenticatedPrincipal::TrustedStdio => (0, None),
+        AuthenticatedPrincipal::DirectToken(id) => (1, Some(id.into_uuid().into_bytes().to_vec())),
+        AuthenticatedPrincipal::OAuthGrant(id) => (2, Some(id.into_uuid().into_bytes().to_vec())),
+    }
+}
+
+fn validate_goal_revision(
+    connection: &Connection,
+    workspace_id: WorkspaceId,
+    activity_id: ActivityId,
+    goal_id: GoalId,
+    expected_goal_revision: GoalRevision,
+) -> Result<(), DagStoreError> {
+    let goal = workspace_goals::get_goal(connection, goal_id)?.ok_or(DagStoreError::GoalMissing)?;
+    if goal.workspace_id() == workspace_id
+        && goal.activity_id() == activity_id
+        && goal.revision() == expected_goal_revision
+        && matches!(
+            goal.status().kind(),
+            GoalStatusKind::Active | GoalStatusKind::Paused
+        )
+    {
+        Ok(())
+    } else {
+        Err(DagStoreError::GoalConflict)
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn update_node(
     connection: &mut Connection,
     requested: &RegisteredDagNode,
     expected_revision: DagNodeRevision,
 ) -> Result<RegisteredDagNode, DagStoreError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let head = get_head(&transaction, requested.goal_id())?.ok_or(DagStoreError::HeadMissing)?;
+    let updated = update_node_in_transaction(&transaction, requested, expected_revision)?;
+    transaction.commit()?;
+    Ok(updated)
+}
+
+/// Apply the independently reachable control-plane DAG update only while the
+/// owning Activity lease is live. The exact replay path is fenced by the same
+/// transaction before it can return the prior node projection.
+pub(crate) fn update_node_authorized(
+    connection: &mut Connection,
+    requested: &RegisteredDagNode,
+    expected_revision: DagNodeRevision,
+    admitted_at: TimestampMillis,
+) -> Result<RegisteredDagNode, DagStoreError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let goal = workspace_goals::get_goal(&transaction, requested.goal_id())?
+        .ok_or(DagStoreError::GoalMissing)?;
+    workspace_coordinators::ensure_live_activity_in_transaction(
+        &transaction,
+        goal.activity_id(),
+        goal.workspace_id(),
+        admitted_at,
+    )?;
+    let updated = update_node_in_transaction(&transaction, requested, expected_revision)?;
+    transaction.commit()?;
+    Ok(updated)
+}
+
+fn update_node_in_transaction(
+    transaction: &Transaction<'_>,
+    requested: &RegisteredDagNode,
+    expected_revision: DagNodeRevision,
+) -> Result<RegisteredDagNode, DagStoreError> {
+    let head = get_head(transaction, requested.goal_id())?.ok_or(DagStoreError::HeadMissing)?;
     if head.dag_revision() != requested.dag_revision() {
         return Err(DagStoreError::HistoricalRevisionImmutable);
     }
-    let current = get_revision_tx(&transaction, requested.goal_id(), requested.dag_revision())?
-        .and_then(|stored| {
-            stored
-                .nodes()
-                .iter()
-                .find(|node| node.id() == requested.id())
-                .cloned()
-        })
-        .ok_or(DagStoreError::NodeMissing)?;
+    let current =
+        get_revision_in_transaction(transaction, requested.goal_id(), requested.dag_revision())?
+            .and_then(|stored| {
+                stored
+                    .nodes()
+                    .iter()
+                    .find(|node| node.id() == requested.id())
+                    .cloned()
+            })
+            .ok_or(DagStoreError::NodeMissing)?;
     if current == *requested {
         let expected_next = expected_revision
             .checked_next()
             .map_err(|_| DagStoreError::RevisionOverflow)?;
         if requested.revision() == expected_next {
-            transaction.commit()?;
             return Ok(current);
         }
         return Err(DagStoreError::NodeConflict);
@@ -421,8 +727,7 @@ pub(crate) fn update_node(
     if expected != *requested {
         return Err(DagStoreError::NodeConflict);
     }
-    persist_node_transition(&transaction, requested, expected_revision)?;
-    transaction.commit()?;
+    persist_node_transition(transaction, requested, expected_revision)?;
     Ok(requested.clone())
 }
 
@@ -497,19 +802,6 @@ pub(crate) fn associate_node_evidence_in_transaction(
     if !linked {
         return Err(DagStoreError::GoalEvidenceMissing);
     }
-    let count: i64 = transaction.query_row(
-        "SELECT COUNT(*) FROM goal_dag_node_evidence_refs
-         WHERE goal_id = ?1 AND dag_revision = ?2 AND node_id = ?3",
-        params![
-            attribution.goal_id().into_uuid().as_bytes(),
-            attribution.dag_revision().get(),
-            attribution.node_id().into_uuid().as_bytes()
-        ],
-        |row| row.get(0),
-    )?;
-    if count >= 32 {
-        return Err(DagStoreError::NodeEvidenceLimit);
-    }
     transaction.execute(
         "INSERT INTO goal_dag_node_evidence_refs (
             goal_id, dag_revision, node_id, evidence_kind, evidence_id, associated_at_ms
@@ -577,16 +869,30 @@ fn persist_node_transition(
             expected_revision.get()
         ],
     )?;
-    if changed == 1 {
-        Ok(())
-    } else {
-        Err(DagStoreError::NodeConflict)
+    if changed != 1 {
+        return Err(DagStoreError::NodeConflict);
     }
+    workspace_semantic_events::append_semantic_event(
+        transaction,
+        &SemanticEventAppend::new(
+            SemanticEventKind::NodeTransition,
+            revision_workspace_id(transaction, node.goal_id())?,
+            SemanticEventSubjects {
+                goal_id: Some(node.goal_id()),
+                dag_revision: Some(node.dag_revision()),
+                node_id: Some(node.id()),
+                ..SemanticEventSubjects::NONE
+            },
+            node.revision().get(),
+            node.updated_at(),
+        ),
+    )?;
+    Ok(())
 }
 
 type RawRevisionRow = (Vec<u8>, i64, Option<i64>, i64, i64, i64, i64);
 
-fn get_revision_tx(
+pub(crate) fn get_revision_in_transaction(
     connection: &Connection,
     goal_id: GoalId,
     number: DagRevisionNumber,
@@ -1090,12 +1396,71 @@ fn decode_timestamp(field: &'static str, value: i64) -> Result<TimestampMillis, 
     TimestampMillis::new(value).map_err(|_| DagStoreError::CorruptRecord(field))
 }
 
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DagTransitionScope {
+    workspace_id: WorkspaceId,
+    activity_id: ActivityId,
+    goal_id: GoalId,
+    expected_goal_revision: GoalRevision,
+    expected_dag_revision: DagRevisionNumber,
+}
+
+impl DagTransitionScope {
+    pub const fn new(
+        workspace_id: WorkspaceId,
+        activity_id: ActivityId,
+        goal_id: GoalId,
+        expected_goal_revision: GoalRevision,
+        expected_dag_revision: DagRevisionNumber,
+    ) -> Self {
+        Self {
+            workspace_id,
+            activity_id,
+            goal_id,
+            expected_goal_revision,
+            expected_dag_revision,
+        }
+    }
+}
+
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DagNodeTransition {
+    scope: DagTransitionScope,
+    node_id: DagNodeId,
+    expected_node_revision: DagNodeRevision,
+    observed_at: TimestampMillis,
+}
+
+impl DagNodeTransition {
+    pub const fn new(
+        scope: DagTransitionScope,
+        node_id: DagNodeId,
+        expected_node_revision: DagNodeRevision,
+        observed_at: TimestampMillis,
+    ) -> Self {
+        Self {
+            scope,
+            node_id,
+            expected_node_revision,
+            observed_at,
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum DagStoreError {
     #[error(transparent)]
+    WorkCut(#[from] Box<crate::WorkCutError>),
+    #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]
+    SemanticEvents(#[from] crate::SemanticEventError),
+    #[error(transparent)]
     Goal(#[from] crate::GoalStoreError),
+    #[error(transparent)]
+    Coordinator(#[from] CoordinatorStoreError),
     #[error(transparent)]
     Structure(#[from] forge_domain::DagStructureError),
     #[error(transparent)]
@@ -1112,6 +1477,8 @@ pub enum DagStoreError {
     GoalMissing,
     #[error("DAG Goal revision or lifecycle conflicts")]
     GoalConflict,
+    #[error("DAG node transition Agent session is not an attached authorized Agent")]
+    AgentAuthorizationConflict,
     #[error("DAG identity conflicts with durable state")]
     IdentityConflict,
     #[error("DAG head revision is stale")]
@@ -1148,8 +1515,12 @@ pub enum DagStoreError {
     LineageMissing(DagNodeId),
     #[error("Goal evidence is missing before DAG node association")]
     GoalEvidenceMissing,
-    #[error("DAG node evidence exceeds the 32-entry bound")]
-    NodeEvidenceLimit,
+}
+
+impl From<crate::WorkCutError> for DagStoreError {
+    fn from(error: crate::WorkCutError) -> Self {
+        Self::WorkCut(Box::new(error))
+    }
 }
 
 #[cfg(test)]

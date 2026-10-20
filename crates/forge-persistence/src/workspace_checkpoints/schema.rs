@@ -1,6 +1,6 @@
-//! `SQLite` schema, migration, and exact-shape validation for checkpoint persistence.
+//! `SQLite` schema creation and exact-shape validation for checkpoint persistence.
 
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use super::CheckpointStoreError;
 
@@ -78,38 +78,6 @@ CREATE TABLE checkpoint_restores (
 )
 ";
 
-pub(super) const RESTORES_V11_TABLE_SQL: &str = r"
-CREATE TABLE checkpoint_restores (
-    restore_id BLOB PRIMARY KEY NOT NULL CHECK(length(restore_id) = 16),
-    checkpoint_id BLOB NOT NULL REFERENCES checkpoints(checkpoint_id) CHECK(length(checkpoint_id) = 16),
-    workspace_id BLOB NOT NULL REFERENCES workspace(workspace_id) CHECK(length(workspace_id) = 16),
-    expected_checkpoint_revision INTEGER NOT NULL CHECK(expected_checkpoint_revision >= 1),
-    expected_post_state INTEGER NOT NULL CHECK(expected_post_state IN (0, 1)),
-    expected_post_hash BLOB CHECK(expected_post_hash IS NULL OR length(expected_post_hash) = 32),
-    expected_post_size INTEGER CHECK(expected_post_size IS NULL OR expected_post_size >= 0),
-    expected_post_mode INTEGER CHECK(expected_post_mode IS NULL OR expected_post_mode BETWEEN 0 AND 511),
-    inverse_kind INTEGER NOT NULL CHECK(inverse_kind IN (0, 1)),
-    inverse_blob BLOB CHECK(inverse_blob IS NULL OR length(inverse_blob) = 20),
-    inverse_hash BLOB CHECK(inverse_hash IS NULL OR length(inverse_hash) = 32),
-    inverse_size INTEGER CHECK(inverse_size IS NULL OR inverse_size >= 0),
-    inverse_mode INTEGER CHECK(inverse_mode IS NULL OR inverse_mode BETWEEN 0 AND 511),
-    state INTEGER NOT NULL CHECK(state IN (0, 1, 2, 3)),
-    failure_code INTEGER CHECK(failure_code IS NULL OR failure_code IN (0, 1, 2, 3)),
-    created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0),
-    updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= 0),
-    revision INTEGER NOT NULL CHECK(revision >= 1),
-    CHECK((expected_post_state = 0 AND expected_post_hash IS NULL AND expected_post_size IS NULL AND expected_post_mode IS NULL)
-       OR (expected_post_state = 1 AND expected_post_hash IS NOT NULL AND expected_post_size IS NOT NULL AND expected_post_mode IS NOT NULL)),
-    CHECK((inverse_kind = 0 AND inverse_blob IS NULL AND inverse_hash IS NULL AND inverse_size IS NULL AND inverse_mode IS NULL)
-       OR (inverse_kind = 1 AND inverse_blob IS NOT NULL AND inverse_hash IS NOT NULL AND inverse_size IS NOT NULL AND inverse_mode IS NOT NULL)),
-    CHECK((state IN (0, 1, 3) AND failure_code IS NULL) OR (state = 2 AND failure_code IS NOT NULL)),
-    CHECK((state = 0 AND revision = 1 AND updated_at_ms = created_at_ms AND failure_code IS NULL)
-       OR (state = 1 AND revision = 2 AND updated_at_ms >= created_at_ms AND failure_code IS NULL)
-       OR (state = 2 AND revision = 2 AND updated_at_ms >= created_at_ms AND failure_code IS NOT NULL)
-       OR (state = 3 AND revision = 2 AND updated_at_ms >= created_at_ms AND failure_code IS NULL))
-)
-";
-
 pub(super) const CHECKPOINTS_WORKSPACE_INDEX_SQL: &str = "CREATE INDEX checkpoints_workspace_created_idx ON checkpoints(workspace_id, created_at_ms DESC, checkpoint_id DESC)";
 pub(super) const CHECKPOINTS_STATE_INDEX_SQL: &str = "CREATE INDEX checkpoints_state_updated_idx ON checkpoints(state, updated_at_ms, checkpoint_id)";
 pub(super) const RESTORES_WORKSPACE_INDEX_SQL: &str = "CREATE INDEX checkpoint_restores_workspace_created_idx ON checkpoint_restores(workspace_id, created_at_ms DESC, restore_id DESC)";
@@ -128,50 +96,6 @@ pub(super) fn create_schema(connection: &Connection) -> Result<(), CheckpointSto
     for sql in CURRENT_SCHEMA_SQL {
         connection.execute_batch(sql)?;
     }
-    Ok(())
-}
-
-pub(super) fn migrate_v7_to_v8(
-    connection: &mut Connection,
-    next_schema_version: i64,
-) -> Result<(), CheckpointStoreError> {
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    create_schema(&transaction)?;
-    transaction.pragma_update(None, "user_version", next_schema_version)?;
-    transaction.commit()?;
-    Ok(())
-}
-
-/// Migrate a pre-provenance v11 checkpoint journal to the exact v12 schema.
-///
-/// Existing restore rows cannot be attributed truthfully because v11 persisted
-/// neither initiator/Activity/approval nor recovery-fence provenance.  The
-/// migration therefore fails closed when such a row exists.  An empty restore
-/// journal is rebuilt to the exact v12 table instead of using nullable ALTERs,
-/// so migrated and fresh databases have one schema authority.
-pub(super) fn migrate_v11_to_v12(
-    connection: &mut Connection,
-    next_schema_version: i64,
-) -> Result<(), CheckpointStoreError> {
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let has_legacy_restore: i64 = transaction.query_row(
-        "SELECT EXISTS(SELECT 1 FROM checkpoint_restores LIMIT 1)",
-        [],
-        |row| row.get(0),
-    )?;
-    if has_legacy_restore != 0 {
-        return Err(CheckpointStoreError::LegacyRestoreProvenanceUnavailable);
-    }
-    transaction.execute_batch("DROP TABLE checkpoint_restores")?;
-    for sql in [
-        RESTORES_V12_TABLE_SQL,
-        RESTORES_WORKSPACE_INDEX_SQL,
-        RESTORES_STATE_INDEX_SQL,
-    ] {
-        transaction.execute_batch(sql)?;
-    }
-    transaction.pragma_update(None, "user_version", next_schema_version)?;
-    transaction.commit()?;
     Ok(())
 }
 
@@ -236,53 +160,6 @@ pub(super) fn validate_current(connection: &Connection) -> Result<(), Checkpoint
             ("workspace", "workspace_id", "workspace_id"),
             ("activities", "activity_id", "activity_id"),
             ("approval_requests", "approval_request_id", "approval_id"),
-        ],
-    )
-}
-
-pub(super) fn validate_v11(connection: &Connection) -> Result<(), CheckpointStoreError> {
-    validate_schema_sqls(connection, RESTORES_V11_TABLE_SQL)?;
-    validate_checkpoint_columns(connection)?;
-    validate_table_columns(
-        connection,
-        "checkpoint_restores",
-        &[
-            ("restore_id", "BLOB", 1, 1),
-            ("checkpoint_id", "BLOB", 1, 0),
-            ("workspace_id", "BLOB", 1, 0),
-            ("expected_checkpoint_revision", "INTEGER", 1, 0),
-            ("expected_post_state", "INTEGER", 1, 0),
-            ("expected_post_hash", "BLOB", 0, 0),
-            ("expected_post_size", "INTEGER", 0, 0),
-            ("expected_post_mode", "INTEGER", 0, 0),
-            ("inverse_kind", "INTEGER", 1, 0),
-            ("inverse_blob", "BLOB", 0, 0),
-            ("inverse_hash", "BLOB", 0, 0),
-            ("inverse_size", "INTEGER", 0, 0),
-            ("inverse_mode", "INTEGER", 0, 0),
-            ("state", "INTEGER", 1, 0),
-            ("failure_code", "INTEGER", 0, 0),
-            ("created_at_ms", "INTEGER", 1, 0),
-            ("updated_at_ms", "INTEGER", 1, 0),
-            ("revision", "INTEGER", 1, 0),
-        ],
-    )?;
-    validate_common_indexes(connection)?;
-    validate_foreign_keys(
-        connection,
-        "checkpoints",
-        &[
-            ("change_sets", "changeset_id", "changeset_id"),
-            ("workspace", "workspace_id", "workspace_id"),
-            ("activities", "activity_id", "activity_id"),
-        ],
-    )?;
-    validate_foreign_keys(
-        connection,
-        "checkpoint_restores",
-        &[
-            ("checkpoints", "checkpoint_id", "checkpoint_id"),
-            ("workspace", "workspace_id", "workspace_id"),
         ],
     )
 }

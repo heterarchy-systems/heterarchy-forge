@@ -11,7 +11,7 @@ use forge_domain::{
     RecoveryMaintenanceLease, RecoveryMaintenanceLeaseError, ReleaseRecoveryLease,
     RenewRecoveryLease, RuntimeInstanceId, TimestampMillis, TimestampMillisError, WorkspaceId,
 };
-use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 use thiserror::Error;
 
 const ID_BYTES: usize = 16;
@@ -140,29 +140,6 @@ pub(crate) fn create_schema(connection: &Connection) -> Result<(), RecoveryStore
             CHECK((owner_runtime_instance_id IS NULL) = (lease_until_ms IS NULL))
          );",
     )?;
-    Ok(())
-}
-
-/// Migrate an owned v10 database to v11 without changing any existing
-/// semantic row.  The new row is released and inherits the Workspace's
-/// durable update timestamp.
-pub(crate) fn migrate_v10_to_v11(
-    connection: &mut Connection,
-    next_schema_version: i64,
-) -> Result<(), RecoveryStoreError> {
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    create_schema(&transaction)?;
-    transaction.execute(
-        "INSERT INTO recovery_maintenance (
-            workspace_id, owner_runtime_instance_id, lease_until_ms,
-            epoch, updated_at_ms, revision
-         )
-         SELECT workspace_id, NULL, NULL, 0, updated_at_ms, 1
-         FROM workspace",
-        [],
-    )?;
-    transaction.pragma_update(None, "user_version", next_schema_version)?;
-    transaction.commit()?;
     Ok(())
 }
 
@@ -537,6 +514,7 @@ fn normalize_sql(value: &str) -> String {
 mod tests {
     use super::*;
     use forge_domain::RecoveryLeaseDurationMillis;
+    use rusqlite::TransactionBehavior;
     use uuid::Uuid;
 
     fn workspace(value: u128) -> WorkspaceId {
