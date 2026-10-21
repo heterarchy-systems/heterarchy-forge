@@ -452,7 +452,10 @@ async fn build_fixture() -> Result<MultiFixture, Box<dyn std::error::Error>> {
             SECRET,
             forge_domain::ForgeBackendId::from_uuid(Uuid::from_u128(0xE001)),
             forge_domain::OrchestrationIssuerId::from_uuid(Uuid::from_u128(0xE002)),
-        )?,
+        )?
+        // Match the other bounded SSE fixtures while retaining the real
+        // multi-Workspace event source and the existing read deadline.
+        .with_sse_poll_interval(Duration::from_millis(50)),
         forge_backend::http::BackendClients {
             control: &client,
             execution: &execution.client(),
