@@ -752,9 +752,12 @@ async fn observe_write_on_tail(
     let observed = match observed {
         Ok(wire) => wire,
         Err(error) => {
-            let durable = get_json(
-                address,
-                &format!("/api/v1/events?{}&after={after}", scope_query(shared)),
+            let durable = tokio::time::timeout(
+                HTTP_ROUNDTRIP_TIMEOUT,
+                get_json(
+                    address,
+                    &format!("/api/v1/events?{}&after={after}", scope_query(shared)),
+                ),
             )
             .await;
             return Err(format!(
