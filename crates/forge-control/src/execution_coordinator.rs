@@ -1062,6 +1062,7 @@ struct ExecutionStartIdentity {
     scope: ResolvedWorkspaceScope,
     activity_id: ActivityId,
     runtime_instance_id: RuntimeInstanceId,
+    authorization_replay: StartAuthorizationReplayIdentity,
     authorization_request: ExecutionAuthorizationRequest,
     request: ExecutionRequest,
     goal: Option<GoalWorkAttribution>,
@@ -1076,6 +1077,16 @@ impl ExecutionStartIdentity {
             scope: request.scope.clone(),
             activity_id: request.activity_id,
             runtime_instance_id: request.runtime_instance_id,
+            authorization_replay: match request.authorization {
+                CoordinatorAuthorization::Explicit {
+                    grant_id,
+                    grant_revision,
+                } => StartAuthorizationReplayIdentity::Explicit {
+                    grant_id,
+                    grant_revision,
+                },
+                CoordinatorAuthorization::Auto(_) => StartAuthorizationReplayIdentity::Auto,
+            },
             authorization_request: request.authorization_request,
             request: request.request.clone(),
             goal: request.goal,
@@ -1084,6 +1095,20 @@ impl ExecutionStartIdentity {
             admission_envelope: request.admission_envelope,
         }
     }
+}
+
+/// The authorization portion of an active Start replay identity.
+///
+/// Explicit grants are stable across retries and must retain their exact
+/// pre-consumption identity. Auto-approval selectors are freshly issued for
+/// retries, so only their authorization mode participates in active replay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartAuthorizationReplayIdentity {
+    Explicit {
+        grant_id: ExecutionGrantId,
+        grant_revision: ExecutionGrantRevision,
+    },
+    Auto,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3841,18 +3866,19 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        AckReadback, ActiveExecution, AgentExecutionAuthorityRequest, COORDINATOR_QUEUE_CAPACITY,
-        CoordinatorAuthorization, CoordinatorReceive, CoordinatorRequest, CoordinatorRuntime,
-        EXECUTION_WAIT_CANCELLATION_CAPACITY, EXECUTION_WAIT_CANCELLED, EXECUTION_WAIT_COMPLETED,
-        ExecutionCoordinatorStartRequest, ExecutionJournalAuthority, ExecutionLaunchKind,
-        ExecutionStartIdentity, ExecutionWaitCompletionBridge, ExecutionWaitHandle,
-        ExecutionWaitObservation, ExecutionWaitRequest, ExecutionWaitResult, ExecutionWaiterId,
+        AckReadback, ActiveExecution, AgentExecutionAuthorityRequest, AutoCoordinatorAuthorization,
+        COORDINATOR_QUEUE_CAPACITY, CoordinatorAuthorization, CoordinatorReceive,
+        CoordinatorRequest, CoordinatorRuntime, EXECUTION_WAIT_CANCELLATION_CAPACITY,
+        EXECUTION_WAIT_CANCELLED, EXECUTION_WAIT_COMPLETED, ExecutionCoordinatorStartRequest,
+        ExecutionJournalAuthority, ExecutionLaunchKind, ExecutionStartIdentity,
+        ExecutionWaitCompletionBridge, ExecutionWaitHandle, ExecutionWaitObservation,
+        ExecutionWaitRequest, ExecutionWaitResult, ExecutionWaiterId,
         ForgeExecutionCoordinatorClient, ForgeExecutionCoordinatorError,
         ForgeExecutionCoordinatorShutdown, JournalProgress, JournalWorkState,
         MAX_EXECUTION_WAIT_TIMEOUT, MAX_EXECUTION_WAITERS, MAX_TERMINAL_BACKLOG,
         PendingExecutionWait, PendingStart, PendingStartAckPhase, PendingStartOutcome,
-        PendingTerminal, ResolvedWorkspaceScope, TerminalAckPhase, TerminalStep,
-        classify_ack_readback, derive_launch_kind_parts,
+        PendingTerminal, ResolvedWorkspaceScope, StartAuthorizationReplayIdentity,
+        TerminalAckPhase, TerminalStep, classify_ack_readback, derive_launch_kind_parts,
     };
     use crate::worker::ForgeControlRequest;
     use crate::{
@@ -4193,6 +4219,80 @@ mod tests {
             verification_input: None,
             admission_envelope: None,
         })
+    }
+
+    #[test]
+    fn active_replay_identity_fences_explicit_grants_and_keeps_auto_selectors_opaque()
+    -> Result<(), Box<dyn Error>> {
+        let request = || {
+            start_request(
+                ExecutionActionClass::DirectStructured,
+                "",
+                "/usr/bin/true",
+                "",
+                ExecutionPermissions::new(false, false, false),
+            )
+        };
+
+        let original = request()?;
+        let original_identity = ExecutionStartIdentity::from_request(&original);
+        let exact_retry = request()?;
+        assert_eq!(
+            original_identity,
+            ExecutionStartIdentity::from_request(&exact_retry),
+            "an exact explicit grant retry must retain active replay"
+        );
+
+        let mut changed_grant = request()?;
+        changed_grant.authorization = CoordinatorAuthorization::Explicit {
+            grant_id: ExecutionGrantId::from_uuid(id(0xD101)),
+            grant_revision: ExecutionGrantRevision::INITIAL,
+        };
+        assert_ne!(
+            original_identity,
+            ExecutionStartIdentity::from_request(&changed_grant),
+            "a different explicit grant must not replay an active execution"
+        );
+
+        let mut changed_revision = request()?;
+        changed_revision.authorization = CoordinatorAuthorization::Explicit {
+            grant_id: ExecutionGrantId::from_uuid(id(6)),
+            grant_revision: ExecutionGrantRevision::new(2)?,
+        };
+        assert_ne!(
+            original_identity,
+            ExecutionStartIdentity::from_request(&changed_revision),
+            "a different pre-consumption revision must not replay an active execution"
+        );
+
+        let mut first_auto = request()?;
+        first_auto.authorization =
+            CoordinatorAuthorization::Auto(AutoCoordinatorAuthorization::new(
+                forge_domain::AutoApprovalScopeId::from_uuid(id(0xD201)),
+                forge_domain::AutoApprovalScopeRevision::INITIAL,
+                forge_domain::ApprovalRequestId::from_uuid(id(0xD202)),
+                ExecutionGrantId::from_uuid(id(0xD203)),
+            ));
+        let first_auto_identity = ExecutionStartIdentity::from_request(&first_auto);
+        assert_ne!(
+            original_identity, first_auto_identity,
+            "an explicit request must not replay through Auto authorization"
+        );
+
+        let mut refreshed_auto = request()?;
+        refreshed_auto.authorization =
+            CoordinatorAuthorization::Auto(AutoCoordinatorAuthorization::new(
+                forge_domain::AutoApprovalScopeId::from_uuid(id(0xD211)),
+                forge_domain::AutoApprovalScopeRevision::new(2)?,
+                forge_domain::ApprovalRequestId::from_uuid(id(0xD212)),
+                ExecutionGrantId::from_uuid(id(0xD213)),
+            ));
+        assert_eq!(
+            first_auto_identity,
+            ExecutionStartIdentity::from_request(&refreshed_auto),
+            "a fresh Auto selector set must replay the same active execution"
+        );
+        Ok(())
     }
 
     fn forge_control_authority(
@@ -4711,6 +4811,10 @@ mod tests {
             scope: fixture.workspace.scope.clone(),
             activity_id: fixture.authority.activity_id,
             runtime_instance_id: RuntimeInstanceId::from_uuid(id(0xFE00)),
+            authorization_replay: StartAuthorizationReplayIdentity::Explicit {
+                grant_id: ExecutionGrantId::from_uuid(fixture.execution_id.into_uuid()),
+                grant_revision: ExecutionGrantRevision::INITIAL,
+            },
             authorization_request: authorization,
             request: request.clone(),
             goal: None,

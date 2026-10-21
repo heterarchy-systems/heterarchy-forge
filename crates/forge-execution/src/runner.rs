@@ -1158,6 +1158,19 @@ fn supervise(
             )),
         },
     };
+    if let Err(error) = &result {
+        let (detail, errno) = error.native_failure_diagnostic();
+        // Diagnostics are best-effort: a closed stderr must not replace the
+        // original completion or prevent its delivery to the supervisor.
+        let _diagnostic = writeln!(
+            std::io::stderr(),
+            "forge execution_id={} stage=completion code={:?} detail={detail} errno={errno:?} process={:?} runtime={:?}",
+            prepared.request.id(),
+            error.failure_code(),
+            prepared.process_finalization,
+            prepared.rust_ci_runtime_finalization,
+        );
+    }
     ExecutionCompletion {
         result,
         process_finalization: prepared.process_finalization,
@@ -1925,6 +1938,33 @@ pub enum ExecutionError {
 }
 
 impl ExecutionError {
+    // Only static categories and numeric OS errors cross this logging boundary.
+    // Error source strings may contain paths, scripts or other request payloads.
+    fn native_failure_diagnostic(&self) -> (&'static str, Option<i32>) {
+        match self {
+            Self::WaitProcess(source) => ("wait_process", source.raw_os_error()),
+            Self::SignalProcessGroup(source) => {
+                ("signal_process_group", Some(source.raw_os_error()))
+            }
+            Self::ProcessGroupSurvived => ("process_group_survived", None),
+            Self::SpawnOutputReader(source) => ("spawn_output_reader", source.raw_os_error()),
+            Self::ConfigureOutputPipe(source) => {
+                ("configure_output_pipe", Some(source.raw_os_error()))
+            }
+            Self::WriteStdin(source) => ("write_stdin", source.raw_os_error()),
+            Self::ReadOutput(source) => ("read_output", source.raw_os_error()),
+            Self::MissingPipe => ("missing_pipe", None),
+            Self::OutputLimitOverflow => ("output_limit_overflow", None),
+            Self::OutputSequence(_) => ("output_sequence", None),
+            Self::OutputChunk(_) => ("output_chunk", None),
+            Self::OutputGap(_) => ("output_gap", None),
+            Self::OutputReaderPanicked => ("output_reader_panicked", None),
+            Self::SupervisorPanicked => ("supervisor_panicked", None),
+            Self::SupervisorClosed => ("supervisor_closed", None),
+            _ => ("other", None),
+        }
+    }
+
     pub const fn failure_code(&self) -> ExecutionFailureCode {
         match self {
             Self::InvalidConcurrency { .. }
