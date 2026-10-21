@@ -473,7 +473,10 @@ async fn start_composition(shared: &Shared) -> Result<Composition, Box<dyn std::
             SECRET,
             forge_domain::ForgeBackendId::from_uuid(Uuid::from_u128(0xE001)),
             forge_domain::OrchestrationIssuerId::from_uuid(Uuid::from_u128(0xE002)),
-        )?,
+        )?
+        // Match the SSE contract fixtures' short cadence, leaving more poll
+        // opportunities within the unchanged bounded flow-test read budget.
+        .with_sse_poll_interval(Duration::from_millis(50)),
         forge_backend::http::BackendClients {
             control: &client,
             execution: &execution_client,
