@@ -8,6 +8,11 @@ on:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      publication_probe:
+        description: Run only the macOS sealed-directory publication probe
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -18,6 +23,7 @@ concurrency:
 
 jobs:
   ci:
+    if: ${{ !inputs.publication_probe }}
     name: Rust harness
     runs-on: macos-15
     timeout-minutes: 45
@@ -31,3 +37,59 @@ jobs:
 
       - name: Run canonical CI harness
         run: make ci
+
+  publication-probe:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publication_probe }}
+    name: macOS publication probe
+    runs-on: macos-15
+    timeout-minutes: 5
+    steps:
+      - name: Check sealed-directory atomic publication
+        shell: bash
+        run: |
+          python3 - <<'PYPROBE'
+          import ctypes
+          import json
+          import os
+          import pathlib
+          import stat
+          import subprocess
+          import tempfile
+
+          system = ctypes.CDLL('/usr/lib/libSystem.B.dylib', use_errno=True)
+          rename = system.renameatx_np
+          rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+          rename.restype = ctypes.c_int
+          print(subprocess.check_output(['sw_vers'], text=True), flush=True)
+          results = []
+          for mode in (0o555, 0o755):
+              with tempfile.TemporaryDirectory(dir=os.environ['RUNNER_TEMP'], prefix='forge-publication-') as raw:
+                  root = pathlib.Path(raw)
+                  parent = root / '.heterarchy-forge' / 'state' / 'artifacts' / 'verification'
+                  parent.mkdir(parents=True, mode=0o700)
+                  pending = parent / '.pending-input'
+                  pending.mkdir(mode=0o700)
+                  source = pending / 'source'
+                  source.mkdir()
+                  (source / 'Makefile').write_text('ci:\n\t@true\n')
+                  (pending / 'manifest').write_text('owned publication probe\n')
+                  for item in (source / 'Makefile', pending / 'manifest'):
+                      item.chmod(0o444)
+                  source.chmod(0o555)
+                  pending.chmod(mode)
+                  fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+                  try:
+                      ctypes.set_errno(0)
+                      result = rename(fd, b'.pending-input', fd, b'published', 4)
+                      error = ctypes.get_errno()
+                      info = os.fstat(fd)
+                      results.append({'pending_mode': oct(mode), 'parent_mode': oct(stat.S_IMODE(info.st_mode)), 'parent_uid': info.st_uid, 'current_uid': os.getuid(), 'return': result, 'errno': error})
+                  finally:
+                      os.close(fd)
+                      for directory, dirs, files in os.walk(root, topdown=False):
+                          for name in files:
+                              (pathlib.Path(directory) / name).chmod(0o600)
+                          pathlib.Path(directory).chmod(0o700)
+          print(json.dumps(results, indent=2), flush=True)
+          assert all(item['return'] == 0 for item in results), 'atomic directory publication probe failed'
+          PYPROBE
