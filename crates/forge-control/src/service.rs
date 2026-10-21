@@ -4201,16 +4201,34 @@ mod integration_tests {
     }
 
     #[test]
-    #[allow(clippy::too_many_lines)]
     fn bounded_auto_approval_starts_discovered_and_analyzed_shell_and_leaves_audit()
     -> Result<(), Box<dyn std::error::Error>> {
         if nested_sandbox_execution_is_unavailable() {
             return Ok(());
         }
         let fixture = fixture("auto-approval", &[0], 1)?;
+        let cleanup_root = fixture.root.clone();
+        let result = exercise_auto_approval_audit(fixture);
+        let cleanup = cleanup_test_root(cleanup_root);
+        if let Err(error) = result {
+            let mut cause = error.source();
+            for depth in 0..8 {
+                let Some(current) = cause else { break };
+                eprintln!("auto approval cause[{depth}]: {current}");
+                cause = current.source();
+            }
+            if let Err(cleanup_error) = cleanup {
+                eprintln!("auto approval fixture cleanup also failed: {cleanup_error}");
+            }
+            return Err(error);
+        }
+        cleanup
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn exercise_auto_approval_audit(fixture: Fixture) -> Result<(), Box<dyn std::error::Error>> {
         let workspace_root = fixture.workspaces[0].clone();
         let locator = locator_for(&fixture.control, fixture.location_id, "workspace-0")?;
-        let cleanup_root = fixture.root.clone();
         let location_id = fixture.location_id;
         let (client, mut worker) = ForgeControlWorker::start(fixture.control)?;
         let scope = client.resolve_workspace(
@@ -4310,7 +4328,6 @@ mod integration_tests {
             assert_auto_approval_audit(&store, approval_id, execution_id)?;
         }
         drop(store);
-        cleanup_test_root(cleanup_root)?;
         Ok(())
     }
 

@@ -13,7 +13,7 @@ endif
 CARGO := PATH="$(RUST_TOOLCHAIN_BIN):$${PATH}" "$(RUSTUP)" run $(RUST_TOOLCHAIN) cargo
 CI_TARGET_DIR := target/ci-$(RUST_TOOLCHAIN)
 
-.PHONY: ci rules fmt check test doctor deps supply-chain extended perf msrv package clean
+.PHONY: ci rules fmt check test doctor deps supply-chain extended perf msrv harness package clean
 
 ci:
 	CARGO_TARGET_DIR="$${CARGO_TARGET_DIR:-$(CI_TARGET_DIR)}" $(CARGO) xtask ci
@@ -47,6 +47,9 @@ perf:
 
 msrv:
 	$(CARGO) xtask msrv
+
+harness:
+	$(CARGO) xtask harness
 
 # This remains a sealed server-discovered target when invoked through FORGE.
 # The actual package output location is selected only by the Rust-CI runtime.

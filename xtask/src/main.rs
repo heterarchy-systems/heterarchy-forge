@@ -1,7 +1,7 @@
 //! Heterarchy Forge repository-local mechanical verification harness.
 //!
-//! This active Rust workspace uses `xtask` for rules, locked metadata,
-//! formatting, build/test/Clippy, dependency, and doctor gates.
+//! This active Rust workspace uses `xtask` for source rules, local Harness,
+//! locked metadata, formatting, build/test/Clippy, dependency, and doctor gates.
 
 mod doctor;
 mod package;
@@ -119,6 +119,7 @@ fn main() {
 fn run() -> Result<(), String> {
     match env::args().nth(1).as_deref().unwrap_or("help") {
         "rules" => rules(),
+        "harness" => harness(),
         "fmt" => cargo(&["fmt", "--all", "--", "--check"]),
         "check" => check(),
         "test" => test(),
@@ -134,7 +135,7 @@ fn run() -> Result<(), String> {
         "policy-package" => policy_package::run(&workspace_root(), env::args().skip(2)),
         "help" | "--help" | "-h" => {
             println!(
-                "usage: cargo xtask <rules|fmt|check|test|ci|doctor|deps|supply-chain|extended|perf|msrv|persistence|package|policy-package>"
+                "usage: cargo xtask <rules|harness|fmt|check|test|ci|doctor|deps|supply-chain|extended|perf|msrv|persistence|package|policy-package>"
             );
             Ok(())
         }
@@ -216,8 +217,7 @@ fn outer_rust_ci_test_profile_enabled_for(
 
 fn persistence() -> Result<(), String> {
     let root = workspace_root();
-    let harness_root = root.join(HARNESS_DIR);
-    verify_forge_persistence_policy(&root, &harness_root)?;
+    verify_forge_persistence_source_policy(&root)?;
     cargo(&[
         "check",
         "--locked",
@@ -440,9 +440,28 @@ fn require_tool_version(program: &str, expected: &str, root: &Path) -> Result<()
 
 fn rules() -> Result<(), String> {
     let root = workspace_root();
-    let harness_root = root.join(HARNESS_DIR);
-
     require_nonempty_file(&root.join("AGENTS.md"), "root agent instructions")?;
+    verify_rust_only_sources(&root)?;
+    verify_workspace_manifest(&root)?;
+    verify_forge_persistence_source_policy(&root)?;
+    let metadata = cargo_metadata(&root)?;
+    verify_manifest_lints(&metadata)?;
+    verify_locked_metadata(&metadata)?;
+    policy_package::verify(&root)?;
+
+    println!("Heterarchy Forge Rust rules verification passed");
+    Ok(())
+}
+
+fn harness() -> Result<(), String> {
+    verify_private_harness(&workspace_root())?;
+    rules()?;
+    println!("Heterarchy Forge local Rust Harness verification passed");
+    Ok(())
+}
+
+fn verify_private_harness(root: &Path) -> Result<(), String> {
+    let harness_root = root.join(HARNESS_DIR);
     require_nonempty_file(
         &harness_root.join("PROJECT_PROFILE.md"),
         "Rust project profile",
@@ -450,7 +469,7 @@ fn rules() -> Result<(), String> {
     require_nonempty_file(&harness_root.join("README.md"), "Rust harness README")?;
     require_nonempty_file(
         &harness_root.join("HARNESS_MANIFEST.tsv"),
-        "public harness manifest",
+        "private Rust harness manifest",
     )?;
     let skill = read_bounded_text(&harness_root.join(REQUIRED_SKILL), "Rust engineering skill")
         .map_err(|error| error.to_string())?;
@@ -462,17 +481,7 @@ fn rules() -> Result<(), String> {
     verify_rule_group(&harness_root.join("rules/type_dev_rules"), TYPE_RULES)?;
     verify_rule_group(&harness_root.join("rules/async_dev_rules"), ASYNC_RULES)?;
     verify_harness_manifest(&harness_root)?;
-    verify_forge_persistence_policy(&root, &harness_root)?;
-
-    verify_rust_only_sources(&root)?;
-    verify_workspace_manifest(&root)?;
-    let metadata = cargo_metadata(&root)?;
-    verify_manifest_lints(&metadata)?;
-    verify_locked_metadata(&metadata)?;
-    policy_package::verify(&root)?;
-
-    println!("Heterarchy Forge Rust rules verification passed");
-    Ok(())
+    verify_forge_persistence_harness_policy(&harness_root)
 }
 
 fn verify_rule_group(root: &Path, rules: &[&str]) -> Result<(), String> {
@@ -482,7 +491,7 @@ fn verify_rule_group(root: &Path, rules: &[&str]) -> Result<(), String> {
     Ok(())
 }
 
-fn verify_forge_persistence_policy(root: &Path, harness_root: &Path) -> Result<(), String> {
+fn verify_forge_persistence_harness_policy(harness_root: &Path) -> Result<(), String> {
     require_nonempty_file(
         &harness_root
             .join("rules/normal_dev_rules")
@@ -506,6 +515,10 @@ fn verify_forge_persistence_policy(root: &Path, harness_root: &Path) -> Result<(
         verify_forge_local_asset_not_shared_manifested(&harness_manifest, &local_asset)?;
     }
 
+    Ok(())
+}
+
+fn verify_forge_persistence_source_policy(root: &Path) -> Result<(), String> {
     let workspace = read_toml_file(&root.join("Cargo.toml"), "workspace Cargo.toml")?;
     let persistence = read_toml_file(
         &root.join(FORGE_PERSISTENCE_MANIFEST),
@@ -1907,6 +1920,69 @@ database = { package = "sea-orm", version = "2" }
         )
         .map_err(|error| error.to_string())?;
         assert!(verify_forge_persistence_manifests(&workspace, &with_orm).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn forge_persistence_source_policy_runs_without_private_harness() -> Result<(), String> {
+        let sandbox = super::DoctorSandbox::create()?;
+        let root = &sandbox.root;
+        assert!(!root.join(super::HARNESS_DIR).exists());
+
+        fs::create_dir_all(root.join("crates/forge-persistence"))
+            .map_err(|error| format!("cannot create source-policy fixture: {error}"))?;
+        fs::write(
+            root.join("Cargo.toml"),
+            r#"
+[workspace.dependencies]
+rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled"] }
+"#,
+        )
+        .map_err(|error| format!("cannot write workspace policy fixture: {error}"))?;
+        let persistence_manifest = root.join(super::FORGE_PERSISTENCE_MANIFEST);
+        fs::write(
+            &persistence_manifest,
+            r#"
+[package]
+name = "forge-persistence"
+
+[dependencies]
+rusqlite.workspace = true
+"#,
+        )
+        .map_err(|error| format!("cannot write persistence policy fixture: {error}"))?;
+
+        assert!(super::verify_forge_persistence_source_policy(root).is_ok());
+
+        fs::write(
+            &persistence_manifest,
+            r#"
+[package]
+name = "forge-persistence"
+
+[dependencies]
+rusqlite.workspace = true
+database = { package = "sea-orm", version = "2" }
+"#,
+        )
+        .map_err(|error| format!("cannot write forbidden dependency fixture: {error}"))?;
+        let Err(error) = super::verify_forge_persistence_source_policy(root) else {
+            return Err(
+                "public persistence policy must keep rejecting direct ORM dependencies".to_owned(),
+            );
+        };
+        assert!(error.contains("forbidden persistence framework \"sea-orm\""));
+        Ok(())
+    }
+
+    #[test]
+    fn private_harness_validation_fails_when_the_tree_is_missing() -> Result<(), String> {
+        let sandbox = super::DoctorSandbox::create()?;
+        assert!(!sandbox.root.join(super::HARNESS_DIR).exists());
+        let Err(error) = super::verify_private_harness(&sandbox.root) else {
+            return Err("private Harness validation must fail when its tree is absent".to_owned());
+        };
+        assert!(error.contains("Rust project profile"));
         Ok(())
     }
 

@@ -285,6 +285,8 @@ cargo xtask fmt
 cargo xtask check
 cargo xtask test
 cargo xtask ci
+cargo xtask harness
+make harness
 cargo xtask msrv
 cargo xtask doctor
 cargo xtask supply-chain
@@ -293,6 +295,12 @@ cargo xtask package
 cargo run --locked -p forge-backend -- init-registry /absolute/path/registry.sqlite3
 cargo run --locked -p forge-backend -- serve /absolute/path/backend.json
 ```
+
+`make ci` is the public-source gate and must run without `.agents`. The strict
+local-only check is available as `make harness` or `cargo xtask harness`; it
+requires the ignored local agent Harness and fails if that material is missing
+or invalid. Keep `.agents/` ignored and out of source commits, CI inputs, and
+release artifacts.
 
 For a verification run with an explicit existing temporary directory, set
 `FORGE_VERIFY_TMPDIR`. The xtask forwards it as Cargo command-line configuration
