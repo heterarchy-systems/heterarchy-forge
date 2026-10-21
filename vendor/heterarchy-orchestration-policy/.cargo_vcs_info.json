@@ -1,0 +1,7 @@
+{
+  "git": {
+    "sha1": "11c472fc834cf0e92092f778d74f6012a64e22d3",
+    "dirty": true
+  },
+  "path_in_vcs": "crates/heterarchy-orchestration-policy"
+}

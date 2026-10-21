@@ -1,9 +1,8 @@
-//! Typed, bounded one-shot Agent DAG authoring contracts.
+//! Typed, bounded Coordinator-authorized DAG planning contracts.
 //!
-//! A grant is a narrow capability for one exact Workspace/Agent/Activity,
-//! credential, Goal revision, and current DAG head.  It is not an execution
-//! permission and it never creates continuation work.  Replanning is one
-//! immutable successor DAG revision; persistence owns the final CAS/ledger
+//! Planning commits are Activity-local and revision-fenced by the durable
+//! Coordinator authority. Initial and successor DAG revisions share one
+//! immutable draft/replay contract; persistence owns the final CAS/ledger
 //! transaction.
 
 use std::fmt;
@@ -14,15 +13,10 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
-    ActivityId, AgentInstanceId, AgentWorkUpdateId, AgentWorkUpdateSequence, DagEdge,
-    DagHeadRevision, DagLineageKind, DagNodeDefinition, DagNodeLifecycle, DagNodeLineage,
-    DagRevision, DagRevisionId, DagRevisionNumber, GoalAttribution, McpTokenId, RegisteredDagNode,
-    TimestampMillis, WorkspaceId,
+    AgentWorkUpdateId, AgentWorkUpdateSequence, DagEdge, DagHeadRevision, DagLineageKind,
+    DagNodeDefinition, DagNodeLifecycle, DagNodeLineage, DagRevision, DagRevisionId,
+    DagRevisionNumber, GoalAttribution, RegisteredDagNode, TimestampMillis,
 };
-
-pub const DEFAULT_AGENT_DAG_AUTHORING_GRANT_TTL_MILLIS: i64 = 5 * 60 * 1_000;
-pub const MAX_AGENT_DAG_AUTHORING_GRANT_TTL_MILLIS: i64 = 15 * 60 * 1_000;
-pub const MAX_AGENT_DAG_REPLAN_REQUESTS: usize = 256;
 
 macro_rules! uuid_identity {
     ($name:ident, $error:ident, $message:literal) => {
@@ -64,54 +58,9 @@ macro_rules! uuid_identity {
 }
 
 uuid_identity!(
-    AgentDagAuthoringGrantId,
-    AgentDagAuthoringGrantIdParseError,
-    "invalid Agent DAG authoring grant UUID"
-);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct AgentDagAuthoringGrantRevision(i64);
-
-impl AgentDagAuthoringGrantRevision {
-    pub const INITIAL: Self = Self(1);
-
-    pub const fn new(value: i64) -> Result<Self, AgentDagAuthoringGrantRevisionError> {
-        if value < 1 {
-            Err(AgentDagAuthoringGrantRevisionError::Invalid { actual: value })
-        } else {
-            Ok(Self(value))
-        }
-    }
-
-    pub const fn get(self) -> i64 {
-        self.0
-    }
-
-    pub const fn checked_next(self) -> Result<Self, AgentDagAuthoringGrantRevisionError> {
-        match self.0.checked_add(1) {
-            Some(value) => Ok(Self(value)),
-            None => Err(AgentDagAuthoringGrantRevisionError::Overflow { current: self.0 }),
-        }
-    }
-}
-
-impl fmt::Display for AgentDagAuthoringGrantRevision {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
-    }
-}
-
-#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
-pub enum AgentDagAuthoringGrantRevisionError {
-    #[error("Agent DAG authoring grant revision must be at least 1, got {actual}")]
-    Invalid { actual: i64 },
-    #[error("Agent DAG authoring grant revision overflowed at {current}")]
-    Overflow { current: i64 },
-}
-uuid_identity!(
-    AgentDagReplanRequestId,
-    AgentDagReplanRequestIdParseError,
-    "invalid Agent DAG replan request UUID"
+    AgentDagPlanRequestId,
+    AgentDagPlanRequestIdParseError,
+    "invalid Agent DAG plan request UUID"
 );
 
 /// BLAKE3 digest of the canonical length-delimited DAG draft.
@@ -142,324 +91,6 @@ impl fmt::Display for AgentDagDraftDigest {
         }
         Ok(())
     }
-}
-
-/// Explicit credential identity bound into an authoring grant.  Raw bearer
-/// values never enter the domain; trusted stdio is an explicit adapter claim.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum AgentAuthoringCredential {
-    Token(McpTokenId),
-    TrustedStdio,
-}
-
-impl AgentAuthoringCredential {
-    pub const fn token_id(self) -> Option<McpTokenId> {
-        match self {
-            Self::Token(id) => Some(id),
-            Self::TrustedStdio => None,
-        }
-    }
-
-    pub const fn is_trusted_stdio(self) -> bool {
-        matches!(self, Self::TrustedStdio)
-    }
-}
-
-/// Actor tuple that must match a grant and a replay-ledger row exactly.
-#[must_use]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct AgentDagAuthoringActor {
-    workspace_id: WorkspaceId,
-    agent_id: AgentInstanceId,
-    activity_id: ActivityId,
-    credential: AgentAuthoringCredential,
-}
-
-impl AgentDagAuthoringActor {
-    pub const fn new(
-        workspace_id: WorkspaceId,
-        agent_id: AgentInstanceId,
-        activity_id: ActivityId,
-        credential: AgentAuthoringCredential,
-    ) -> Self {
-        Self {
-            workspace_id,
-            agent_id,
-            activity_id,
-            credential,
-        }
-    }
-
-    pub const fn workspace_id(self) -> WorkspaceId {
-        self.workspace_id
-    }
-
-    pub const fn agent_id(self) -> AgentInstanceId {
-        self.agent_id
-    }
-
-    pub const fn activity_id(self) -> ActivityId {
-        self.activity_id
-    }
-
-    pub const fn credential(self) -> AgentAuthoringCredential {
-        self.credential
-    }
-}
-
-/// Bounded grant TTL.  The grant constructor computes expiry only from the
-/// caller-supplied issue time and this explicit duration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct AgentDagAuthoringGrantTtl(i64);
-
-impl AgentDagAuthoringGrantTtl {
-    pub const DEFAULT: Self = Self(DEFAULT_AGENT_DAG_AUTHORING_GRANT_TTL_MILLIS);
-    pub const MAX: Self = Self(MAX_AGENT_DAG_AUTHORING_GRANT_TTL_MILLIS);
-
-    pub const fn new(value: i64) -> Result<Self, AgentDagAuthoringGrantTtlError> {
-        if value <= 0 || value > MAX_AGENT_DAG_AUTHORING_GRANT_TTL_MILLIS {
-            Err(AgentDagAuthoringGrantTtlError::OutOfRange {
-                actual: value,
-                maximum: MAX_AGENT_DAG_AUTHORING_GRANT_TTL_MILLIS,
-            })
-        } else {
-            Ok(Self(value))
-        }
-    }
-
-    pub const fn get(self) -> i64 {
-        self.0
-    }
-}
-
-#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
-pub enum AgentDagAuthoringGrantTtlError {
-    #[error("Agent DAG authoring grant TTL {actual} is outside 1..={maximum} ms")]
-    OutOfRange { actual: i64, maximum: i64 },
-    #[error("Agent DAG authoring grant expiry overflowed")]
-    Overflow,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum AgentDagAuthoringGrantState {
-    Active,
-    Consumed,
-    Revoked,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum AgentDagAuthoringGrantAvailability {
-    Available,
-    Expired,
-    Consumed,
-    Revoked,
-}
-
-impl AgentDagAuthoringGrantAvailability {
-    pub const fn is_available(self) -> bool {
-        matches!(self, Self::Available)
-    }
-}
-
-/// Durable one-shot authoring capability bound to an exact DAG head.
-#[must_use]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AgentDagAuthoringGrant {
-    id: AgentDagAuthoringGrantId,
-    actor: AgentDagAuthoringActor,
-    goal: GoalAttribution,
-    expected_dag_revision: DagRevisionNumber,
-    expected_head_revision: DagHeadRevision,
-    issued_at: TimestampMillis,
-    expires_at: TimestampMillis,
-    state: AgentDagAuthoringGrantState,
-    revision: AgentDagAuthoringGrantRevision,
-}
-
-impl AgentDagAuthoringGrant {
-    pub fn issue(
-        id: AgentDagAuthoringGrantId,
-        actor: AgentDagAuthoringActor,
-        goal: GoalAttribution,
-        expected_dag_revision: DagRevisionNumber,
-        expected_head_revision: DagHeadRevision,
-        issued_at: TimestampMillis,
-        ttl: AgentDagAuthoringGrantTtl,
-    ) -> Result<Self, AgentDagAuthoringGrantError> {
-        let expires_at = issued_at
-            .get()
-            .checked_add(ttl.get())
-            .ok_or(AgentDagAuthoringGrantError::ExpiryOverflow)?;
-        let expires_at = TimestampMillis::new(expires_at)
-            .map_err(|_| AgentDagAuthoringGrantError::ExpiryOverflow)?;
-        Ok(Self {
-            id,
-            actor,
-            goal,
-            expected_dag_revision,
-            expected_head_revision,
-            issued_at,
-            expires_at,
-            state: AgentDagAuthoringGrantState::Active,
-            revision: AgentDagAuthoringGrantRevision::INITIAL,
-        })
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn from_parts(
-        id: AgentDagAuthoringGrantId,
-        actor: AgentDagAuthoringActor,
-        goal: GoalAttribution,
-        expected_dag_revision: DagRevisionNumber,
-        expected_head_revision: DagHeadRevision,
-        issued_at: TimestampMillis,
-        expires_at: TimestampMillis,
-        state: AgentDagAuthoringGrantState,
-        revision: AgentDagAuthoringGrantRevision,
-    ) -> Result<Self, AgentDagAuthoringGrantError> {
-        let ttl = expires_at
-            .get()
-            .checked_sub(issued_at.get())
-            .ok_or(AgentDagAuthoringGrantError::TimestampOrder)?;
-        AgentDagAuthoringGrantTtl::new(ttl).map_err(|_| AgentDagAuthoringGrantError::InvalidTtl)?;
-        if revision == AgentDagAuthoringGrantRevision::INITIAL
-            && state != AgentDagAuthoringGrantState::Active
-        {
-            return Err(AgentDagAuthoringGrantError::InvalidInitialState);
-        }
-        Ok(Self {
-            id,
-            actor,
-            goal,
-            expected_dag_revision,
-            expected_head_revision,
-            issued_at,
-            expires_at,
-            state,
-            revision,
-        })
-    }
-
-    pub const fn id(&self) -> AgentDagAuthoringGrantId {
-        self.id
-    }
-
-    pub const fn actor(&self) -> AgentDagAuthoringActor {
-        self.actor
-    }
-
-    pub const fn workspace_id(&self) -> WorkspaceId {
-        self.actor.workspace_id()
-    }
-
-    pub const fn agent_id(&self) -> AgentInstanceId {
-        self.actor.agent_id()
-    }
-
-    pub const fn activity_id(&self) -> ActivityId {
-        self.actor.activity_id()
-    }
-
-    pub const fn credential(&self) -> AgentAuthoringCredential {
-        self.actor.credential()
-    }
-
-    pub const fn goal(&self) -> GoalAttribution {
-        self.goal
-    }
-
-    pub const fn expected_dag_revision(&self) -> DagRevisionNumber {
-        self.expected_dag_revision
-    }
-
-    pub const fn expected_head_revision(&self) -> DagHeadRevision {
-        self.expected_head_revision
-    }
-
-    pub const fn issued_at(&self) -> TimestampMillis {
-        self.issued_at
-    }
-
-    pub const fn expires_at(&self) -> TimestampMillis {
-        self.expires_at
-    }
-
-    pub const fn state(&self) -> AgentDagAuthoringGrantState {
-        self.state
-    }
-
-    pub const fn revision(&self) -> AgentDagAuthoringGrantRevision {
-        self.revision
-    }
-
-    pub const fn availability(&self, now: TimestampMillis) -> AgentDagAuthoringGrantAvailability {
-        match self.state {
-            AgentDagAuthoringGrantState::Consumed => AgentDagAuthoringGrantAvailability::Consumed,
-            AgentDagAuthoringGrantState::Revoked => AgentDagAuthoringGrantAvailability::Revoked,
-            AgentDagAuthoringGrantState::Active if now.get() < self.expires_at.get() => {
-                AgentDagAuthoringGrantAvailability::Available
-            }
-            AgentDagAuthoringGrantState::Active => AgentDagAuthoringGrantAvailability::Expired,
-        }
-    }
-
-    pub fn consume(
-        &self,
-        expected_revision: AgentDagAuthoringGrantRevision,
-    ) -> Result<Self, AgentDagAuthoringGrantError> {
-        if self.revision != expected_revision {
-            return Err(AgentDagAuthoringGrantError::RevisionConflict);
-        }
-        if self.state != AgentDagAuthoringGrantState::Active {
-            return Err(AgentDagAuthoringGrantError::NotActive);
-        }
-        Ok(Self {
-            state: AgentDagAuthoringGrantState::Consumed,
-            revision: self
-                .revision
-                .checked_next()
-                .map_err(|_| AgentDagAuthoringGrantError::RevisionOverflow)?,
-            ..self.clone()
-        })
-    }
-
-    pub fn revoke(
-        &self,
-        expected_revision: AgentDagAuthoringGrantRevision,
-    ) -> Result<Self, AgentDagAuthoringGrantError> {
-        if self.revision != expected_revision {
-            return Err(AgentDagAuthoringGrantError::RevisionConflict);
-        }
-        if self.state != AgentDagAuthoringGrantState::Active {
-            return Err(AgentDagAuthoringGrantError::NotActive);
-        }
-        Ok(Self {
-            state: AgentDagAuthoringGrantState::Revoked,
-            revision: self
-                .revision
-                .checked_next()
-                .map_err(|_| AgentDagAuthoringGrantError::RevisionOverflow)?,
-            ..self.clone()
-        })
-    }
-}
-
-#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
-pub enum AgentDagAuthoringGrantError {
-    #[error("Agent DAG authoring grant expiry overflowed")]
-    ExpiryOverflow,
-    #[error("Agent DAG authoring grant timestamps are out of order")]
-    TimestampOrder,
-    #[error("Agent DAG authoring grant TTL is invalid")]
-    InvalidTtl,
-    #[error("Agent DAG authoring grant initial state is invalid")]
-    InvalidInitialState,
-    #[error("Agent DAG authoring grant revision conflicts")]
-    RevisionConflict,
-    #[error("Agent DAG authoring grant is not active")]
-    NotActive,
-    #[error("Agent DAG authoring grant revision overflowed")]
-    RevisionOverflow,
 }
 
 /// Immutable full successor DAG draft.  Node/edge/lineage collections are
@@ -640,27 +271,29 @@ fn hash_registered_node(hasher: &mut Hasher, node: &RegisteredDagNode) {
     hash_i64(hasher, node.revision().get());
 }
 
-/// Typed request for one one-shot immutable successor DAG commit.
+/// Typed request for one immutable initial or successor Coordinator-authorized DAG plan.
 #[must_use]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AgentDagReplanRequest {
-    id: AgentDagReplanRequestId,
-    grant_id: AgentDagAuthoringGrantId,
-    expected_grant_revision: AgentDagAuthoringGrantRevision,
-    actor: AgentDagAuthoringActor,
+pub struct AgentDagPlanRequest {
+    id: AgentDagPlanRequestId,
+    actor: crate::ActivityCoordinatorActor,
+    goal: GoalAttribution,
+    expected_parent_revision: Option<DagRevisionNumber>,
+    expected_head_revision: Option<DagHeadRevision>,
     draft: AgentDagDraft,
     history_update_id: AgentWorkUpdateId,
     history_update_sequence: AgentWorkUpdateSequence,
     observed_at: TimestampMillis,
 }
 
-impl AgentDagReplanRequest {
+impl AgentDagPlanRequest {
     #[allow(clippy::too_many_arguments)]
     pub const fn new(
-        id: AgentDagReplanRequestId,
-        grant_id: AgentDagAuthoringGrantId,
-        expected_grant_revision: AgentDagAuthoringGrantRevision,
-        actor: AgentDagAuthoringActor,
+        id: AgentDagPlanRequestId,
+        actor: crate::ActivityCoordinatorActor,
+        goal: GoalAttribution,
+        expected_parent_revision: Option<DagRevisionNumber>,
+        expected_head_revision: Option<DagHeadRevision>,
         draft: AgentDagDraft,
         history_update_id: AgentWorkUpdateId,
         history_update_sequence: AgentWorkUpdateSequence,
@@ -668,9 +301,10 @@ impl AgentDagReplanRequest {
     ) -> Self {
         Self {
             id,
-            grant_id,
-            expected_grant_revision,
             actor,
+            goal,
+            expected_parent_revision,
+            expected_head_revision,
             draft,
             history_update_id,
             history_update_sequence,
@@ -678,20 +312,24 @@ impl AgentDagReplanRequest {
         }
     }
 
-    pub const fn id(&self) -> AgentDagReplanRequestId {
+    pub const fn id(&self) -> AgentDagPlanRequestId {
         self.id
     }
 
-    pub const fn grant_id(&self) -> AgentDagAuthoringGrantId {
-        self.grant_id
-    }
-
-    pub const fn expected_grant_revision(&self) -> AgentDagAuthoringGrantRevision {
-        self.expected_grant_revision
-    }
-
-    pub const fn actor(&self) -> AgentDagAuthoringActor {
+    pub const fn actor(&self) -> crate::ActivityCoordinatorActor {
         self.actor
+    }
+
+    pub const fn goal(&self) -> GoalAttribution {
+        self.goal
+    }
+
+    pub const fn expected_parent_revision(&self) -> Option<DagRevisionNumber> {
+        self.expected_parent_revision
+    }
+
+    pub const fn expected_head_revision(&self) -> Option<DagHeadRevision> {
+        self.expected_head_revision
     }
 
     pub const fn draft(&self) -> &AgentDagDraft {
@@ -715,12 +353,11 @@ impl AgentDagReplanRequest {
     }
 }
 
-/// Public receipt for a committed or replayed replan ledger entry.
+/// Public receipt for a committed or idempotently replayed Coordinator DAG plan.
 #[must_use]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AgentDagReplanReceipt {
-    request_id: AgentDagReplanRequestId,
-    grant_id: AgentDagAuthoringGrantId,
+pub struct AgentDagPlanReceipt {
+    request_id: AgentDagPlanRequestId,
     digest: AgentDagDraftDigest,
     dag_revision_id: DagRevisionId,
     dag_revision: DagRevisionNumber,
@@ -728,10 +365,9 @@ pub struct AgentDagReplanReceipt {
     replayed: bool,
 }
 
-impl AgentDagReplanReceipt {
+impl AgentDagPlanReceipt {
     pub const fn new(
-        request_id: AgentDagReplanRequestId,
-        grant_id: AgentDagAuthoringGrantId,
+        request_id: AgentDagPlanRequestId,
         digest: AgentDagDraftDigest,
         dag_revision_id: DagRevisionId,
         dag_revision: DagRevisionNumber,
@@ -740,7 +376,6 @@ impl AgentDagReplanReceipt {
     ) -> Self {
         Self {
             request_id,
-            grant_id,
             digest,
             dag_revision_id,
             dag_revision,
@@ -749,12 +384,8 @@ impl AgentDagReplanReceipt {
         }
     }
 
-    pub const fn request_id(self) -> AgentDagReplanRequestId {
+    pub const fn request_id(self) -> AgentDagPlanRequestId {
         self.request_id
-    }
-
-    pub const fn grant_id(self) -> AgentDagAuthoringGrantId {
-        self.grant_id
     }
 
     pub const fn digest(self) -> AgentDagDraftDigest {
@@ -786,54 +417,13 @@ mod tests {
         GoalRevision,
     };
 
-    fn ids() -> (WorkspaceId, AgentInstanceId, ActivityId, GoalId) {
-        (
-            WorkspaceId::from_uuid(Uuid::from_u128(1)),
-            AgentInstanceId::from_uuid(Uuid::from_u128(2)),
-            ActivityId::from_uuid(Uuid::from_u128(3)),
-            GoalId::from_uuid(Uuid::from_u128(4)),
-        )
-    }
-
-    #[test]
-    fn grant_ttl_and_availability_are_bounded() -> Result<(), Box<dyn std::error::Error>> {
-        let (workspace, agent, activity, goal_id) = ids();
-        assert!(AgentDagAuthoringGrantTtl::new(0).is_err());
-        assert!(
-            AgentDagAuthoringGrantTtl::new(MAX_AGENT_DAG_AUTHORING_GRANT_TTL_MILLIS + 1).is_err()
-        );
-        let grant = AgentDagAuthoringGrant::issue(
-            AgentDagAuthoringGrantId::from_uuid(Uuid::from_u128(5)),
-            AgentDagAuthoringActor::new(
-                workspace,
-                agent,
-                activity,
-                AgentAuthoringCredential::TrustedStdio,
-            ),
-            GoalAttribution::new(goal_id, GoalRevision::INITIAL),
-            DagRevisionNumber::INITIAL,
-            DagHeadRevision::INITIAL,
-            TimestampMillis::new(10)?,
-            AgentDagAuthoringGrantTtl::DEFAULT,
-        )?;
-        assert!(grant.availability(TimestampMillis::new(10)?).is_available());
-        assert!(matches!(
-            grant.availability(TimestampMillis::new(
-                10 + DEFAULT_AGENT_DAG_AUTHORING_GRANT_TTL_MILLIS
-            )?),
-            AgentDagAuthoringGrantAvailability::Expired
-        ));
-        let consumed = grant.consume(grant.revision())?;
-        assert_eq!(
-            consumed.availability(TimestampMillis::new(10)?),
-            AgentDagAuthoringGrantAvailability::Consumed
-        );
-        Ok(())
+    fn goal_id() -> GoalId {
+        GoalId::from_uuid(Uuid::from_u128(4))
     }
 
     #[test]
     fn draft_digest_is_independent_of_node_input_order() -> Result<(), Box<dyn std::error::Error>> {
-        let (_, _, _, goal_id) = ids();
+        let goal_id = goal_id();
         let first = DagNodeDefinition::new(
             DagNodeId::from_uuid(Uuid::from_u128(10)),
             DagNodeOrdinal::new(0)?,

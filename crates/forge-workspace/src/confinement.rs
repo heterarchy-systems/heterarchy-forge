@@ -2,39 +2,70 @@ use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::OwnedFd;
-use std::os::unix::ffi::OsStrExt;
-use std::path::{Component, Path};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+#[cfg(not(target_os = "macos"))]
+use std::path::Component;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
 use forge_domain::{
-    CheckpointFileMode, FileByteCount, FileContentHash, FileMutationFailureCode, FileMutationId,
-    FileMutationKind, FileMutationPlan, FilePathState, FilePrecondition, WorkspaceRelativePath,
-    WorkspaceRootFingerprint,
+    CheckpointFileMode, FileByteCount, FileContentHash, FileEntryKind, FileMutationFailureCode,
+    FileMutationId, FileMutationKind, FileMutationPlan, FilePathState, FilePrecondition,
+    WorkspaceRelativePath, WorkspaceRootFingerprint,
 };
 use rustix::fs::{
-    AtFlags, FileType, FlockOperation, Mode, OFlags, RenameFlags, fchmod, fstat, fsync, mkdirat,
-    open, openat, renameat, renameat_with, unlinkat,
+    AtFlags, Dir, FileType, FlockOperation, Mode, OFlags, RenameFlags, fchmod, fstat, fsync, open,
+    openat, renameat, renameat_with, statat, unlinkat,
 };
 use rustix::io::{Errno, dup};
 use thiserror::Error;
 
-use crate::ExistingWorkspaceStateLayout;
 use crate::diff_artifact::{DiffArtifactStore, DiffArtifactStoreParts};
+use crate::{ExistingWorkspaceStateLayout, WorkspaceStateExclusiveGate};
+
+mod harness_presence;
+mod source_editing;
+mod source_tree;
+mod verification_input;
+pub use harness_presence::{
+    HarnessDirectoryObservation, MAX_WORKSPACE_HARNESS_AGENTS_ROOTS,
+    MAX_WORKSPACE_HARNESS_DIRECTORIES, MAX_WORKSPACE_HARNESS_DIRECTORY_SCAN_ENTRIES,
+    MAX_WORKSPACE_HARNESS_PATH_BYTES, MAX_WORKSPACE_HARNESS_PATH_COMPONENTS,
+    MAX_WORKSPACE_HARNESS_SCAN_ENTRIES, MAX_WORKSPACE_HARNESS_TREE_ENTRIES,
+    WorkspaceHarnessObservation, WorkspaceHarnessObservationError, WorkspaceHarnessTree,
+    WorkspaceHarnessTreeEntry, inspect_workspace_harness_directories,
+    inspect_workspace_harness_tree,
+};
+pub use source_editing::{
+    MAX_FILE_LIST_SCAN_ENTRIES, MAX_TEXT_SEARCH_FILE_BYTES, PreparedSourcePatch,
+};
+pub use source_tree::{
+    AppliedSourceTreeTransaction, MAX_SOURCE_TREE_PAYLOAD_BYTES, PreparedSourceTreeTransaction,
+    SourceTreeApplyError, SourceTreeMutationPayload, SourceTreePayloadSet, TreeMutationObservation,
+};
+pub use verification_input::{
+    MAX_VERIFICATION_INPUT_MANIFEST_BYTES, PublishedVerificationInput, StagedVerificationInput,
+    VerificationInputError,
+};
 
 /// Maximum number of native path components walked for one request.
 pub const MAX_FILE_PATH_COMPONENTS: usize = 128;
 /// Maximum file bytes returned by the first control-plane read surface.
 pub const MAX_FILE_READ_BYTES: usize = 32 * 1024;
-/// Maximum existing target bytes hashed for CAS in the first mutation slice.
-pub const MAX_HASHED_FILE_BYTES: usize = 1024 * 1024;
+/// Maximum bytes accepted by the explicit binary import operation.
+pub const MAX_BINARY_IMPORT_BYTES: usize = 4 * 1024 * 1024;
+/// Maximum existing target bytes hashed for CAS and recovery. Observation
+/// must cover every file the bounded binary import operation can create.
+pub const MAX_HASHED_FILE_BYTES: usize = MAX_BINARY_IMPORT_BYTES;
 /// Maximum replacement payload accepted by the first bounded mutation slice.
 pub const MAX_FILE_WRITE_BYTES: usize = 8 * 1024;
+/// Maximum materialized content accepted by one compiled source patch.
+pub const MAX_SOURCE_PATCH_BYTES: usize = forge_domain::MAX_SOURCE_PATCH_BYTES;
 /// Maximum source bytes retained in memory for one human-review Diff side.
 ///
-/// Files larger than this remain hashable for compare-and-swap, but their
-/// Diff Evidence is deliberately summary-only.
+/// Larger files remain hashable for compare-and-swap. Whole-source V1 capture
+/// is summary-only; validated source patches use separate bounded V2 windows.
 pub const MAX_DIFF_SOURCE_BYTES: usize = 64 * 1024;
 
 const LOCK_RETRY_LIMIT: u32 = 1_000;
@@ -43,18 +74,55 @@ const LOCK_RETRY_DELAY: Duration = Duration::from_millis(1);
 const STATE_DIRECTORY: &str = ".heterarchy-forge";
 const MUTATION_LOCK_FILE: &str = "file-mutation.lock";
 const TEMP_PREFIX: &str = ".heterarchy-forge-tmp-";
-const MANAGED_TEMP_PREFIX: &str = ".heterarchy-forge-managed-tmp-";
-static NEXT_MANAGED_TEMP: AtomicU64 = AtomicU64::new(1);
+const MAX_STATE_REMOVAL_ENTRIES: usize = 65_536;
+const MAX_STATE_REMOVAL_DEPTH: usize = 64;
+
+const EXCLUDED_WORKSPACE_COMPONENTS: [&[u8]; 14] = [
+    b".git",
+    b".heterarchy-forge",
+    b"target",
+    b"dist",
+    b"build",
+    b"node_modules",
+    b".next",
+    b"coverage",
+    b".cache",
+    b".ruff_cache",
+    b"tmp",
+    b"__pycache__",
+    b".venv",
+    b"venv",
+];
+
+pub(crate) fn is_excluded_workspace_component(component: &[u8]) -> bool {
+    EXCLUDED_WORKSPACE_COMPONENTS
+        .iter()
+        .any(|excluded| component.eq_ignore_ascii_case(excluded))
+}
 
 /// Validate and hash one bounded create/replace payload before durable intent
 /// persistence. This is the same algorithm used for observed POST state.
 pub fn bounded_write_content_hash(
     content: &[u8],
 ) -> Result<FileContentHash, ConfinedFilesystemError> {
-    if content.len() > MAX_FILE_WRITE_BYTES {
+    content_hash_with_limit(content, MAX_FILE_WRITE_BYTES)
+}
+
+/// Validate and hash a binary import before durable intent admission.
+pub fn bounded_binary_content_hash(
+    content: &[u8],
+) -> Result<FileContentHash, ConfinedFilesystemError> {
+    content_hash_with_limit(content, MAX_BINARY_IMPORT_BYTES)
+}
+
+fn content_hash_with_limit(
+    content: &[u8],
+    maximum: usize,
+) -> Result<FileContentHash, ConfinedFilesystemError> {
+    if content.len() > maximum {
         return Err(ConfinedFilesystemError::WriteTooLarge {
             actual: content.len(),
-            maximum: MAX_FILE_WRITE_BYTES,
+            maximum,
         });
     }
     Ok(FileContentHash::from_bytes(
@@ -159,14 +227,6 @@ impl CapturedDiffSource {
             Ok(_) | Err(_) => Self::Binary { size },
         }
     }
-
-    fn from_payload(content: &[u8]) -> Self {
-        Self::from_retained(
-            content.to_vec(),
-            FileByteCount::new(content.len() as u64),
-            true,
-        )
-    }
 }
 
 /// Successful filesystem effect, exact observed POST state, and the bounded
@@ -178,6 +238,40 @@ pub struct AppliedFileMutation {
     post_state: FilePathState,
     pre_source: CapturedDiffSource,
     post_source: CapturedDiffSource,
+}
+
+/// Successful two-endpoint move observed through the same descriptor-rooted
+/// confinement boundary as single-file mutations.
+#[must_use]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppliedFileMove {
+    source_pre_state: FilePathState,
+    source_post_state: FilePathState,
+    destination_pre_state: FilePathState,
+    destination_post_state: FilePathState,
+    source_pre_source: CapturedDiffSource,
+}
+
+impl AppliedFileMove {
+    pub const fn source_pre_state(&self) -> FilePathState {
+        self.source_pre_state
+    }
+
+    pub const fn source_post_state(&self) -> FilePathState {
+        self.source_post_state
+    }
+
+    pub const fn destination_pre_state(&self) -> FilePathState {
+        self.destination_pre_state
+    }
+
+    pub const fn destination_post_state(&self) -> FilePathState {
+        self.destination_post_state
+    }
+
+    pub const fn source_pre_source(&self) -> &CapturedDiffSource {
+        &self.source_pre_source
+    }
 }
 
 impl AppliedFileMutation {
@@ -205,11 +299,97 @@ impl AppliedFileMutation {
 /// multi-component untrusted syscall path.
 pub struct ConfinedWorkspace {
     workspace_root: std::path::PathBuf,
+    #[cfg(not(target_os = "macos"))]
     filesystem_root: OwnedFd,
+    #[cfg(not(target_os = "macos"))]
     root_components: Vec<OsString>,
     root: OwnedFd,
     root_identity: DirectoryIdentity,
     state_identity: DirectoryIdentity,
+}
+
+/// Read-only descriptor capability for Workspace observations that must not
+/// require Forge-owned state or confer mutation authority.
+///
+/// Unlike [`ConfinedWorkspace`], this capability intentionally does not open
+/// `.heterarchy-forge`. It nevertheless retains the same root descriptor and
+/// physical identity fencing so observational scans cannot escape through a
+/// pathname replacement or symlink race.
+pub(crate) struct WorkspaceObservationRoot {
+    workspace_root: PathBuf,
+    #[cfg(not(target_os = "macos"))]
+    filesystem_root: OwnedFd,
+    #[cfg(not(target_os = "macos"))]
+    root_components: Vec<OsString>,
+    root: OwnedFd,
+    root_identity: DirectoryIdentity,
+}
+
+impl WorkspaceObservationRoot {
+    pub(crate) fn open(
+        workspace_root: &Path,
+        expected_root_fingerprint: WorkspaceRootFingerprint,
+    ) -> Result<Self, ConfinedFilesystemError> {
+        if !workspace_root.is_absolute() {
+            return Err(ConfinedFilesystemError::WorkspaceUnavailable);
+        }
+        let workspace_root = workspace_root.to_path_buf();
+        #[cfg(not(target_os = "macos"))]
+        let filesystem_root = open(
+            Path::new("/"),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|source| ConfinedFilesystemError::Syscall {
+            operation: FilesystemOperation::OpenFilesystemRoot,
+            committed: false,
+            source,
+        })?;
+        #[cfg(not(target_os = "macos"))]
+        let root_components = collect_absolute_components(&workspace_root)?;
+        #[cfg(target_os = "macos")]
+        let root = reopen_workspace_root(&workspace_root, false)?;
+        #[cfg(not(target_os = "macos"))]
+        let root = reopen_workspace_root(&filesystem_root, &root_components, false)?;
+        let root_identity = directory_identity(&root)?;
+        if root_identity.fingerprint() != expected_root_fingerprint {
+            return Err(ConfinedFilesystemError::WorkspaceUnavailable);
+        }
+        Ok(Self {
+            workspace_root,
+            #[cfg(not(target_os = "macos"))]
+            filesystem_root,
+            #[cfg(not(target_os = "macos"))]
+            root_components,
+            root,
+            root_identity,
+        })
+    }
+
+    pub(crate) fn open_directory(
+        &self,
+        components: &[OsString],
+    ) -> Result<OwnedFd, ConfinedFilesystemError> {
+        walk_directories(&self.root, components, false)
+    }
+
+    pub(crate) fn ensure_directory_current(
+        &self,
+        components: &[OsString],
+        expected: DirectoryIdentity,
+    ) -> Result<(), ConfinedFilesystemError> {
+        let reopened = self.open_directory(components)?;
+        ensure_directory_identity(&reopened, expected, false)
+    }
+
+    pub(crate) fn ensure_root(&self) -> Result<(), ConfinedFilesystemError> {
+        ensure_directory_identity(&self.root, self.root_identity, false)?;
+        #[cfg(target_os = "macos")]
+        let reopened = reopen_workspace_root(&self.workspace_root, false)?;
+        #[cfg(not(target_os = "macos"))]
+        let reopened = reopen_workspace_root(&self.filesystem_root, &self.root_components, false)?;
+        ensure_directory_identity(&reopened, self.root_identity, false)
+    }
 }
 
 impl std::fmt::Debug for ConfinedWorkspace {
@@ -226,6 +406,8 @@ impl ConfinedWorkspace {
         let expected = layout
             .root_fingerprint()
             .map_err(|_| ConfinedFilesystemError::WorkspaceUnavailable)?;
+        let workspace_root = layout.workspace_root().to_path_buf();
+        #[cfg(not(target_os = "macos"))]
         let filesystem_root = open(
             Path::new("/"),
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
@@ -236,8 +418,12 @@ impl ConfinedWorkspace {
             committed: false,
             source,
         })?;
+        #[cfg(not(target_os = "macos"))]
         let root_components = collect_absolute_components(layout.workspace_root())?;
-        let root = walk_directories(&filesystem_root, &root_components, false)?;
+        #[cfg(target_os = "macos")]
+        let root = reopen_workspace_root(&workspace_root, false)?;
+        #[cfg(not(target_os = "macos"))]
+        let root = reopen_workspace_root(&filesystem_root, &root_components, false)?;
         let root_identity = directory_identity(&root)?;
         if root_identity.fingerprint() != expected {
             return Err(ConfinedFilesystemError::WorkspaceUnavailable);
@@ -255,8 +441,10 @@ impl ConfinedWorkspace {
         })?;
         let state_identity = directory_identity(&state)?;
         Ok(Self {
-            workspace_root: layout.workspace_root().to_path_buf(),
+            workspace_root,
+            #[cfg(not(target_os = "macos"))]
             filesystem_root,
+            #[cfg(not(target_os = "macos"))]
             root_components,
             root,
             root_identity,
@@ -293,182 +481,6 @@ impl ConfinedWorkspace {
             size,
             mode: result.mode,
         })
-    }
-
-    /// Observe one Harness-managed target without retaining its bytes.
-    ///
-    /// Missing ancestors are projected as an absent target so read-only
-    /// installation Preview can distinguish `Create` from a real confinement
-    /// failure without resolving a multi-component path outside descriptor
-    /// ownership. Symlinks, non-directory ancestors, non-regular leaves, and
-    /// files above the caller-owned bound still fail closed.
-    pub(crate) fn observe_bounded_file_state(
-        &self,
-        path: &WorkspaceRelativePath,
-        maximum: usize,
-    ) -> Result<FilePathState, ConfinedFilesystemError> {
-        self.ensure_root()?;
-        validate_not_protected(path)?;
-        let components = collect_components(path)?;
-        let (basename, ancestors) = components
-            .split_last()
-            .ok_or(ConfinedFilesystemError::InvalidPath)?;
-        let parent = match walk_directories(&self.root, ancestors, false) {
-            Ok(parent) => parent,
-            Err(ConfinedFilesystemError::Syscall {
-                operation: FilesystemOperation::OpenAncestor,
-                source,
-                ..
-            }) if source == Errno::NOENT => return Ok(FilePathState::Absent),
-            Err(error) => return Err(error),
-        };
-        let state = read_leaf(&parent, basename, maximum, None)?
-            .map_or(FilePathState::Absent, |read| read.state);
-        self.ensure_root()?;
-        Ok(state)
-    }
-
-    /// Read one bounded regular file for Harness merge/materialization.
-    /// Missing ancestors are treated as an absent target; unsafe path shapes
-    /// and non-regular targets fail closed.
-    pub(crate) fn read_bounded_file(
-        &self,
-        path: &WorkspaceRelativePath,
-        maximum: usize,
-    ) -> Result<Option<ConfinedFileRead>, ConfinedFilesystemError> {
-        self.ensure_root()?;
-        validate_not_protected(path)?;
-        let components = collect_components(path)?;
-        let (basename, ancestors) = components
-            .split_last()
-            .ok_or(ConfinedFilesystemError::InvalidPath)?;
-        let parent = match walk_directories(&self.root, ancestors, false) {
-            Ok(parent) => parent,
-            Err(ConfinedFilesystemError::Syscall {
-                operation: FilesystemOperation::OpenAncestor,
-                source,
-                ..
-            }) if source == Errno::NOENT => return Ok(None),
-            Err(error) => return Err(error),
-        };
-        let Some(result) = read_leaf(&parent, basename, maximum, Some(maximum))? else {
-            return Ok(None);
-        };
-        if !result.retained_complete {
-            return Err(ConfinedFilesystemError::PostStateMismatch);
-        }
-        let FilePathState::Regular { hash, size } = result.state else {
-            return Err(ConfinedFilesystemError::PostStateMismatch);
-        };
-        self.ensure_root()?;
-        Ok(Some(ConfinedFileRead {
-            content: result.retained,
-            hash,
-            size,
-            mode: result.mode,
-        }))
-    }
-
-    /// Create a descriptor-rooted directory tree without following symlinks.
-    /// The caller must retain [`ConfinedWorkspaceWriteGuard`] for the full
-    /// materialization transaction.
-    pub(crate) fn ensure_directory_tree(
-        &self,
-        _write_guard: &ConfinedWorkspaceWriteGuard,
-        path: &WorkspaceRelativePath,
-    ) -> Result<(), ConfinedFilesystemError> {
-        self.ensure_root()?;
-        validate_not_protected(path)?;
-        let components = collect_components(path)?;
-        let directory = walk_or_create_directories(&self.root, &components)?;
-        let _identity = directory_identity(&directory)?;
-        self.ensure_root_with_committed(true)
-    }
-
-    /// Atomically publish one Harness-managed file using the exact observed
-    /// Preview state as a compare-before-write guard.
-    pub(crate) fn write_bounded_atomic(
-        &self,
-        _write_guard: &ConfinedWorkspaceWriteGuard,
-        path: &WorkspaceRelativePath,
-        expected: FilePathState,
-        content: &[u8],
-        maximum: usize,
-    ) -> Result<FilePathState, ConfinedFilesystemError> {
-        if content.len() > maximum {
-            return Err(ConfinedFilesystemError::WriteTooLarge {
-                actual: content.len(),
-                maximum,
-            });
-        }
-        self.ensure_root()?;
-        let (parent, basename, _) = self.open_parent(path)?;
-        let current = read_leaf(&parent, &basename, maximum, None)?
-            .map_or(FilePathState::Absent, |read| read.state);
-        if current != expected {
-            return Err(ConfinedFilesystemError::StaleWrite);
-        }
-        publish_managed_content(&parent, &basename, current, content)?;
-        self.ensure_root_with_committed(true)?;
-        let post = read_leaf(&parent, &basename, maximum, None)?
-            .map_or(FilePathState::Absent, |read| read.state);
-        let expected_hash = FileContentHash::from_bytes(*blake3::hash(content).as_bytes());
-        let expected_size = FileByteCount::new(u64::try_from(content.len()).map_err(|_| {
-            ConfinedFilesystemError::WriteTooLarge {
-                actual: content.len(),
-                maximum,
-            }
-        })?);
-        if post
-            != (FilePathState::Regular {
-                hash: expected_hash,
-                size: expected_size,
-            })
-        {
-            return Err(ConfinedFilesystemError::CommittedObservationFailed);
-        }
-        Ok(post)
-    }
-
-    /// Delete one Harness-owned regular file under an already-held Workspace
-    /// writer guard. The exact previewed file state is a compare-before-delete
-    /// guard; this helper deliberately does not reacquire the mutation lock.
-    pub(crate) fn delete_bounded_atomic(
-        &self,
-        _write_guard: &ConfinedWorkspaceWriteGuard,
-        path: &WorkspaceRelativePath,
-        expected: FilePathState,
-        maximum: usize,
-    ) -> Result<FilePathState, ConfinedFilesystemError> {
-        if !matches!(expected, FilePathState::Regular { .. }) {
-            return Err(ConfinedFilesystemError::InvalidPayload);
-        }
-        self.ensure_root()?;
-        let (parent, basename, _) = self.open_parent(path)?;
-        let current = read_leaf(&parent, &basename, maximum, None)?
-            .map_or(FilePathState::Absent, |read| read.state);
-        if current != expected {
-            return Err(ConfinedFilesystemError::StaleWrite);
-        }
-        unlinkat(&parent, &basename, AtFlags::empty()).map_err(|source| {
-            ConfinedFilesystemError::Syscall {
-                operation: FilesystemOperation::DeleteLeaf,
-                committed: false,
-                source,
-            }
-        })?;
-        fsync(&parent).map_err(|source| ConfinedFilesystemError::Syscall {
-            operation: FilesystemOperation::SyncParent,
-            committed: true,
-            source,
-        })?;
-        self.ensure_root_with_committed(true)?;
-        let post = read_leaf(&parent, &basename, maximum, None)?
-            .map_or(FilePathState::Absent, |read| read.state);
-        if post != FilePathState::Absent {
-            return Err(ConfinedFilesystemError::CommittedObservationFailed);
-        }
-        Ok(post)
     }
 
     /// Read a checkpoint-sized regular file through the same descriptor-rooted
@@ -520,6 +532,29 @@ impl ConfinedWorkspace {
         Ok(state)
     }
 
+    /// Observe content identity and mode through one descriptor without
+    /// retaining file bytes. Restore must support the full checkpoint bound,
+    /// independently of the smaller UI/read payload limit.
+    pub fn observe_checkpoint(
+        &self,
+        path: &WorkspaceRelativePath,
+    ) -> Result<forge_domain::CheckpointObservedPathState, ConfinedFilesystemError> {
+        use forge_domain::CheckpointObservedPathState;
+        self.ensure_root()?;
+        let (parent, basename, _) = self.open_parent(path)?;
+        let read = read_leaf(&parent, &basename, MAX_HASHED_FILE_BYTES, None)?;
+        self.ensure_root()?;
+        match read {
+            None => Ok(CheckpointObservedPathState::Absent),
+            Some(OpenLeafRead {
+                state: FilePathState::Regular { hash, size },
+                mode,
+                ..
+            }) => Ok(CheckpointObservedPathState::Regular { hash, size, mode }),
+            Some(_) => Err(ConfinedFilesystemError::PostStateMismatch),
+        }
+    }
+
     /// Open the owned Diff artifact directory through the already-validated
     /// Workspace descriptor chain.
     pub fn diff_artifact_store(&self) -> Result<DiffArtifactStore, ConfinedFilesystemError> {
@@ -546,6 +581,7 @@ impl ConfinedWorkspace {
             committed: false,
             source,
         })?;
+        #[cfg(not(target_os = "macos"))]
         let filesystem_root =
             dup(&self.filesystem_root).map_err(|source| ConfinedFilesystemError::Syscall {
                 operation: FilesystemOperation::DuplicateRoot,
@@ -560,7 +596,11 @@ impl ConfinedWorkspace {
         let state_identity = directory_identity(&state)?;
         let diffs_identity = directory_identity(&diffs)?;
         let store = DiffArtifactStore::from_parts(DiffArtifactStoreParts {
+            #[cfg(target_os = "macos")]
+            workspace_root: self.workspace_root.clone(),
+            #[cfg(not(target_os = "macos"))]
             filesystem_root,
+            #[cfg(not(target_os = "macos"))]
             root_components: self.root_components.clone(),
             root,
             root_identity: self.root_identity,
@@ -582,7 +622,78 @@ impl ConfinedWorkspace {
         self.ensure_root()?;
         let lock = self.acquire_mutation_lock()?;
         self.ensure_root()?;
-        Ok(ConfinedWorkspaceWriteGuard { _lock: lock })
+        Ok(ConfinedWorkspaceWriteGuard {
+            _lock: lock,
+            root_identity: self.root_identity,
+            state_identity: self.state_identity,
+        })
+    }
+
+    /// Verify the exact Forge-owned state tree is removable before the caller
+    /// disables its Location. This is descriptor-relative and bounded; it
+    /// follows no symbolic link and leaves the tree unchanged.
+    pub fn preflight_owned_state_removal(
+        &self,
+        gate: &WorkspaceStateExclusiveGate,
+        guard: &ConfinedWorkspaceWriteGuard,
+    ) -> Result<(), ConfinedFilesystemError> {
+        self.ensure_state_removal_binding(gate, guard)?;
+        let state = self.open_owned_state_for_removal()?;
+        let mut entries = 0_usize;
+        inspect_removal_tree(&state, &mut entries, 0)?;
+        self.ensure_state_removal_binding(gate, guard)
+    }
+
+    /// Remove exactly the validated `.heterarchy-forge` child directory.
+    ///
+    /// The exclusive root gate and matching mutation guard are borrowed from
+    /// the caller, retaining both fences for the entire non-atomic recursive
+    /// effect. On an error the caller must report incomplete removal; this
+    /// method never follows a symlink or expands the target beyond state root.
+    pub fn remove_owned_state_directory(
+        &self,
+        gate: &WorkspaceStateExclusiveGate,
+        guard: &ConfinedWorkspaceWriteGuard,
+    ) -> Result<WorkspaceStateRemoval, ConfinedFilesystemError> {
+        self.ensure_state_removal_binding(gate, guard)?;
+        let state = match self.open_owned_state_for_removal() {
+            Ok(state) => state,
+            Err(ConfinedFilesystemError::NotFound) => {
+                return Ok(WorkspaceStateRemoval::AlreadyAbsent);
+            }
+            Err(error) => return Err(error),
+        };
+        let mut entries = 0_usize;
+        remove_removal_tree(&state, &mut entries, 0)?;
+        let current_state = statat(&self.root, STATE_DIRECTORY, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|_| ConfinedFilesystemError::CommittedPathChanged)?;
+        if directory_identity_from_stat(&current_state)? != self.state_identity {
+            return Err(ConfinedFilesystemError::CommittedPathChanged);
+        }
+        unlinkat(&self.root, STATE_DIRECTORY, AtFlags::REMOVEDIR).map_err(|source| {
+            ConfinedFilesystemError::Syscall {
+                operation: FilesystemOperation::RemoveStateRoot,
+                committed: true,
+                source,
+            }
+        })?;
+        fsync(&self.root).map_err(|source| ConfinedFilesystemError::Syscall {
+            operation: FilesystemOperation::SyncWorkspaceRoot,
+            committed: true,
+            source,
+        })?;
+        self.ensure_workspace_root_after_state_removal()?;
+        gate.ensure_root_binding(&self.workspace_root, self.root_identity.fingerprint())
+            .map_err(|_| ConfinedFilesystemError::CommittedPathChanged)?;
+        match statat(&self.root, STATE_DIRECTORY, AtFlags::SYMLINK_NOFOLLOW) {
+            Err(source) if source == Errno::NOENT => Ok(WorkspaceStateRemoval::Removed),
+            Ok(_) => Err(ConfinedFilesystemError::CommittedObservationFailed),
+            Err(source) => Err(ConfinedFilesystemError::Syscall {
+                operation: FilesystemOperation::InspectStateDirectory,
+                committed: true,
+                source,
+            }),
+        }
     }
 
     /// Acquire the cross-process Forge-writer lock and retain the exact parent
@@ -593,6 +704,24 @@ impl ConfinedWorkspace {
     ) -> Result<PreparedFileMutation, ConfinedFilesystemError> {
         self.ensure_root()?;
         let mutation_lock = self.acquire_mutation_lock()?;
+        self.prepare_mutation_with_lock(plan, Some(mutation_lock))
+    }
+
+    /// Prepare one file mutation while an aggregate Source Tree Transaction
+    /// already retains the Workspace writer lock.
+    fn prepare_mutation_under_held_lock(
+        &self,
+        plan: &FileMutationPlan,
+    ) -> Result<PreparedFileMutation, ConfinedFilesystemError> {
+        self.ensure_root()?;
+        self.prepare_mutation_with_lock(plan, None)
+    }
+
+    fn prepare_mutation_with_lock(
+        &self,
+        plan: &FileMutationPlan,
+        mutation_lock: Option<MutationLock>,
+    ) -> Result<PreparedFileMutation, ConfinedFilesystemError> {
         let (parent, basename, parent_components) = self.open_parent(plan.path())?;
         let parent_identity = directory_identity(&parent)?;
         let captured = read_leaf(
@@ -621,15 +750,22 @@ impl ConfinedWorkspace {
             committed: false,
             source,
         })?;
+        #[cfg(not(target_os = "macos"))]
         let filesystem_root =
             dup(&self.filesystem_root).map_err(|source| ConfinedFilesystemError::Syscall {
                 operation: FilesystemOperation::DuplicateRoot,
                 committed: false,
                 source,
             })?;
+        #[cfg(not(target_os = "macos"))]
+        let root_components = self.root_components.clone();
         Ok(PreparedFileMutation {
+            #[cfg(target_os = "macos")]
+            workspace_root: self.workspace_root.clone(),
+            #[cfg(not(target_os = "macos"))]
             filesystem_root,
-            root_components: self.root_components.clone(),
+            #[cfg(not(target_os = "macos"))]
+            root_components,
             root,
             root_identity: self.root_identity,
             parent,
@@ -640,6 +776,119 @@ impl ConfinedWorkspace {
             precondition: plan.precondition(),
             pre_state,
             pre_source,
+            _mutation_lock: mutation_lock,
+        })
+    }
+
+    /// Acquire the Workspace writer lock and observe both endpoints of one
+    /// atomic move. The source must match the caller-observed whole-file hash
+    /// and the destination must not exist.
+    pub fn prepare_move(
+        &self,
+        source: &WorkspaceRelativePath,
+        expected_source_hash: FileContentHash,
+        destination: &WorkspaceRelativePath,
+    ) -> Result<PreparedFileMove, ConfinedFilesystemError> {
+        if source == destination {
+            return Err(ConfinedFilesystemError::PathConflict);
+        }
+        self.ensure_root()?;
+        let mutation_lock = self.acquire_mutation_lock()?;
+        self.prepare_move_with_lock(
+            source,
+            expected_source_hash,
+            destination,
+            Some(mutation_lock),
+        )
+    }
+
+    fn prepare_move_under_held_lock(
+        &self,
+        source: &WorkspaceRelativePath,
+        expected_source_hash: FileContentHash,
+        destination: &WorkspaceRelativePath,
+    ) -> Result<PreparedFileMove, ConfinedFilesystemError> {
+        if source == destination {
+            return Err(ConfinedFilesystemError::PathConflict);
+        }
+        self.ensure_root()?;
+        self.prepare_move_with_lock(source, expected_source_hash, destination, None)
+    }
+
+    fn prepare_move_with_lock(
+        &self,
+        source: &WorkspaceRelativePath,
+        expected_source_hash: FileContentHash,
+        destination: &WorkspaceRelativePath,
+        mutation_lock: Option<MutationLock>,
+    ) -> Result<PreparedFileMove, ConfinedFilesystemError> {
+        let (source_parent, source_basename, source_parent_components) =
+            self.open_parent(source)?;
+        let source_parent_identity = directory_identity(&source_parent)?;
+        let captured = read_leaf(
+            &source_parent,
+            &source_basename,
+            MAX_HASHED_FILE_BYTES,
+            Some(MAX_DIFF_SOURCE_BYTES),
+        )?
+        .ok_or(ConfinedFilesystemError::NotFound)?;
+        let FilePathState::Regular {
+            hash: observed_hash,
+            size: source_size,
+        } = captured.state
+        else {
+            return Err(ConfinedFilesystemError::NonRegularLeaf);
+        };
+        if observed_hash != expected_source_hash {
+            return Err(ConfinedFilesystemError::StaleWrite);
+        }
+        let source_pre_source = CapturedDiffSource::from_retained(
+            captured.retained,
+            source_size,
+            captured.retained_complete,
+        );
+
+        let (destination_parent, destination_basename, destination_parent_components) =
+            self.open_parent(destination)?;
+        let destination_parent_identity = directory_identity(&destination_parent)?;
+        if observe_leaf(&destination_parent, &destination_basename)? != FilePathState::Absent {
+            return Err(ConfinedFilesystemError::PathConflict);
+        }
+
+        let root = dup(&self.root).map_err(|source| ConfinedFilesystemError::Syscall {
+            operation: FilesystemOperation::DuplicateRoot,
+            committed: false,
+            source,
+        })?;
+        #[cfg(not(target_os = "macos"))]
+        let filesystem_root =
+            dup(&self.filesystem_root).map_err(|source| ConfinedFilesystemError::Syscall {
+                operation: FilesystemOperation::DuplicateRoot,
+                committed: false,
+                source,
+            })?;
+        #[cfg(not(target_os = "macos"))]
+        let root_components = self.root_components.clone();
+        Ok(PreparedFileMove {
+            #[cfg(target_os = "macos")]
+            workspace_root: self.workspace_root.clone(),
+            #[cfg(not(target_os = "macos"))]
+            filesystem_root,
+            #[cfg(not(target_os = "macos"))]
+            root_components,
+            root,
+            root_identity: self.root_identity,
+            source_parent,
+            source_parent_identity,
+            source_parent_components,
+            source_basename,
+            source_pre_state: captured.state,
+            source_pre_source,
+            destination_parent,
+            destination_parent_identity,
+            destination_parent_components,
+            destination_basename,
+            destination_pre_state: FilePathState::Absent,
             _mutation_lock: mutation_lock,
         })
     }
@@ -676,6 +925,54 @@ impl ConfinedWorkspace {
         Err(ConfinedFilesystemError::LockBusy)
     }
 
+    fn ensure_state_removal_binding(
+        &self,
+        gate: &WorkspaceStateExclusiveGate,
+        guard: &ConfinedWorkspaceWriteGuard,
+    ) -> Result<(), ConfinedFilesystemError> {
+        if guard.root_identity != self.root_identity || guard.state_identity != self.state_identity
+        {
+            return Err(ConfinedFilesystemError::PathChanged);
+        }
+        if self.state_identity.device != self.root_identity.device {
+            return Err(ConfinedFilesystemError::ProtectedPath);
+        }
+        gate.ensure_root_binding(&self.workspace_root, self.root_identity.fingerprint())
+            .map_err(|_| ConfinedFilesystemError::WorkspaceUnavailable)?;
+        self.ensure_root()
+    }
+
+    fn open_owned_state_for_removal(&self) -> Result<OwnedFd, ConfinedFilesystemError> {
+        let state = openat(
+            &self.root,
+            STATE_DIRECTORY,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|source| {
+            if source == Errno::NOENT {
+                ConfinedFilesystemError::NotFound
+            } else {
+                ConfinedFilesystemError::Syscall {
+                    operation: FilesystemOperation::OpenStateDirectory,
+                    committed: false,
+                    source,
+                }
+            }
+        })?;
+        ensure_directory_identity(&state, self.state_identity, false)?;
+        Ok(state)
+    }
+
+    fn ensure_workspace_root_after_state_removal(&self) -> Result<(), ConfinedFilesystemError> {
+        ensure_directory_identity(&self.root, self.root_identity, true)?;
+        #[cfg(target_os = "macos")]
+        let reopened = reopen_workspace_root(&self.workspace_root, true)?;
+        #[cfg(not(target_os = "macos"))]
+        let reopened = reopen_workspace_root(&self.filesystem_root, &self.root_components, true)?;
+        ensure_directory_identity(&reopened, self.root_identity, true)
+    }
+
     fn open_parent(
         &self,
         path: &WorkspaceRelativePath,
@@ -695,7 +992,11 @@ impl ConfinedWorkspace {
 
     fn ensure_root_with_committed(&self, committed: bool) -> Result<(), ConfinedFilesystemError> {
         ensure_directory_identity(&self.root, self.root_identity, committed)?;
-        let reopened = walk_directories(&self.filesystem_root, &self.root_components, committed)?;
+        #[cfg(target_os = "macos")]
+        let reopened = reopen_workspace_root(&self.workspace_root, committed)?;
+        #[cfg(not(target_os = "macos"))]
+        let reopened =
+            reopen_workspace_root(&self.filesystem_root, &self.root_components, committed)?;
         ensure_directory_identity(&reopened, self.root_identity, committed)?;
         let state = openat(
             &self.root,
@@ -736,159 +1037,16 @@ fn open_mutation_lock_file(state_directory: &OwnedFd) -> Result<OwnedFd, Confine
     Err(ConfinedFilesystemError::LockBusy)
 }
 
-fn walk_or_create_directories(
-    root: &OwnedFd,
-    components: &[OsString],
-) -> Result<OwnedFd, ConfinedFilesystemError> {
-    let mut current = dup(root).map_err(pre_syscall)?;
-    for component in components {
-        let opened = openat(
-            &current,
-            component,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        );
-        current = match opened {
-            Ok(directory) => directory,
-            Err(source) if source == Errno::NOENT => {
-                match mkdirat(&current, component, Mode::from_raw_mode(0o755)) {
-                    Ok(()) => {
-                        fsync(&current).map_err(|source| ConfinedFilesystemError::Syscall {
-                            operation: FilesystemOperation::SyncParent,
-                            committed: true,
-                            source,
-                        })?;
-                    }
-                    Err(source) if source == Errno::EXIST => {}
-                    Err(source) => {
-                        return Err(ConfinedFilesystemError::Syscall {
-                            operation: FilesystemOperation::CreateDirectory,
-                            committed: false,
-                            source,
-                        });
-                    }
-                }
-                openat(
-                    &current,
-                    component,
-                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                    Mode::empty(),
-                )
-                .map_err(|source| ConfinedFilesystemError::Syscall {
-                    operation: FilesystemOperation::OpenAncestor,
-                    committed: true,
-                    source,
-                })?
-            }
-            Err(source) if source == Errno::LOOP => {
-                return Err(ConfinedFilesystemError::SymlinkRejected);
-            }
-            Err(source) if source == Errno::NOTDIR => {
-                return Err(ConfinedFilesystemError::NonDirectoryAncestor);
-            }
-            Err(source) => {
-                return Err(ConfinedFilesystemError::Syscall {
-                    operation: FilesystemOperation::OpenAncestor,
-                    committed: false,
-                    source,
-                });
-            }
-        };
-        if !FileType::from_raw_mode(fstat(&current).map_err(pre_syscall)?.st_mode).is_dir() {
-            return Err(ConfinedFilesystemError::NonDirectoryAncestor);
-        }
-    }
-    Ok(current)
-}
-
-fn publish_managed_content(
-    parent: &OwnedFd,
-    basename: &OsStr,
-    pre_state: FilePathState,
-    content: &[u8],
-) -> Result<(), ConfinedFilesystemError> {
-    let serial = NEXT_MANAGED_TEMP.fetch_add(1, Ordering::Relaxed);
-    let temporary = OsString::from(format!(
-        "{MANAGED_TEMP_PREFIX}{}-{serial}",
-        std::process::id()
-    ));
-    let mode = match pre_state {
-        FilePathState::Absent => Mode::from_raw_mode(0o644),
-        FilePathState::Regular { .. } => {
-            let leaf =
-                open_regular_leaf(parent, basename)?.ok_or(ConfinedFilesystemError::StaleWrite)?;
-            Mode::from_raw_mode(fstat(&leaf).map_err(pre_syscall)?.st_mode)
-        }
-    };
-    let temporary_fd = openat(
-        parent,
-        &temporary,
-        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        mode,
-    )
-    .map_err(map_create_temp_error)?;
-    require_regular_single_link(&temporary_fd)?;
-    if let Err(source) = fchmod(&temporary_fd, sanitized_file_mode(mode)) {
-        return cleanup_after_syscall_error(
-            parent,
-            &temporary,
-            FilesystemOperation::SetTemporaryMode,
-            source,
-        );
-    }
-    let mut temporary_file = File::from(temporary_fd);
-    if let Err(source) = temporary_file.write_all(content) {
-        return cleanup_after_std_error(
-            parent,
-            &temporary,
-            FilesystemOperation::WriteTemporary,
-            source,
-        );
-    }
-    if let Err(source) = sync_file(&temporary_file) {
-        return cleanup_after_syscall_error(
-            parent,
-            &temporary,
-            FilesystemOperation::SyncTemporary,
-            source,
-        );
-    }
-    drop(temporary_file);
-    let publish = match pre_state {
-        FilePathState::Absent => {
-            renameat_with(parent, &temporary, parent, basename, RenameFlags::NOREPLACE)
-        }
-        FilePathState::Regular { .. } => renameat(parent, &temporary, parent, basename),
-    };
-    if let Err(source) = publish {
-        cleanup_temp(parent, &temporary)?;
-        if matches!(pre_state, FilePathState::Absent) && source == Errno::EXIST {
-            return Err(ConfinedFilesystemError::StaleWrite);
-        }
-        if matches!(pre_state, FilePathState::Absent)
-            && matches!(source, Errno::NOTSUP | Errno::OPNOTSUPP | Errno::NOSYS)
-        {
-            return Err(ConfinedFilesystemError::AtomicCreateUnsupported);
-        }
-        return Err(ConfinedFilesystemError::Syscall {
-            operation: FilesystemOperation::PublishTemporary,
-            committed: false,
-            source,
-        });
-    }
-    fsync(parent).map_err(|source| ConfinedFilesystemError::Syscall {
-        operation: FilesystemOperation::SyncParent,
-        committed: true,
-        source,
-    })
-}
-
 /// Prepared single-file effect. It is intentionally neither `Clone` nor
 /// `Copy`: dropping it releases the Forge-writer lock without performing an
 /// effect or changing the durable intent.
 #[derive(Debug)]
 pub struct PreparedFileMutation {
+    #[cfg(target_os = "macos")]
+    workspace_root: std::path::PathBuf,
+    #[cfg(not(target_os = "macos"))]
     filesystem_root: OwnedFd,
+    #[cfg(not(target_os = "macos"))]
     root_components: Vec<OsString>,
     root: OwnedFd,
     root_identity: DirectoryIdentity,
@@ -900,7 +1058,138 @@ pub struct PreparedFileMutation {
     precondition: FilePrecondition,
     pre_state: FilePathState,
     pre_source: CapturedDiffSource,
-    _mutation_lock: MutationLock,
+    _mutation_lock: Option<MutationLock>,
+}
+
+/// Prepared atomic move retaining both endpoint descriptors and the shared
+/// Workspace writer lock until the effect completes or is abandoned.
+#[derive(Debug)]
+pub struct PreparedFileMove {
+    #[cfg(target_os = "macos")]
+    workspace_root: std::path::PathBuf,
+    #[cfg(not(target_os = "macos"))]
+    filesystem_root: OwnedFd,
+    #[cfg(not(target_os = "macos"))]
+    root_components: Vec<OsString>,
+    root: OwnedFd,
+    root_identity: DirectoryIdentity,
+    source_parent: OwnedFd,
+    source_parent_identity: DirectoryIdentity,
+    source_parent_components: Vec<OsString>,
+    source_basename: OsString,
+    source_pre_state: FilePathState,
+    source_pre_source: CapturedDiffSource,
+    destination_parent: OwnedFd,
+    destination_parent_identity: DirectoryIdentity,
+    destination_parent_components: Vec<OsString>,
+    destination_basename: OsString,
+    destination_pre_state: FilePathState,
+    _mutation_lock: Option<MutationLock>,
+}
+
+impl PreparedFileMove {
+    pub const fn source_pre_state(&self) -> FilePathState {
+        self.source_pre_state
+    }
+
+    pub const fn destination_pre_state(&self) -> FilePathState {
+        self.destination_pre_state
+    }
+
+    pub const fn source_pre_source(&self) -> &CapturedDiffSource {
+        &self.source_pre_source
+    }
+
+    /// Atomically rename the observed source into the absent destination.
+    /// Any error after the rename is classified as potentially committed so
+    /// durable recovery can inspect both endpoints instead of replaying.
+    pub fn apply(self) -> Result<AppliedFileMove, ConfinedFilesystemError> {
+        self.ensure_absolute_root(false)?;
+        self.ensure_source_parent(false)?;
+        self.ensure_destination_parent(false)?;
+
+        let source_current = observe_leaf(&self.source_parent, &self.source_basename)?;
+        if source_current != self.source_pre_state {
+            return Err(ConfinedFilesystemError::StaleWrite);
+        }
+        let destination_current =
+            observe_leaf(&self.destination_parent, &self.destination_basename)?;
+        if destination_current != self.destination_pre_state {
+            return Err(ConfinedFilesystemError::PathConflict);
+        }
+
+        if let Err(source) = renameat_with(
+            &self.source_parent,
+            &self.source_basename,
+            &self.destination_parent,
+            &self.destination_basename,
+            RenameFlags::NOREPLACE,
+        ) {
+            if source == Errno::EXIST {
+                return Err(ConfinedFilesystemError::PathConflict);
+            }
+            if [Errno::NOTSUP, Errno::OPNOTSUPP, Errno::NOSYS].contains(&source) {
+                return Err(ConfinedFilesystemError::AtomicMoveUnsupported);
+            }
+            return Err(ConfinedFilesystemError::Syscall {
+                operation: FilesystemOperation::MoveLeaf,
+                committed: false,
+                source,
+            });
+        }
+
+        fsync(&self.source_parent).map_err(|source| ConfinedFilesystemError::Syscall {
+            operation: FilesystemOperation::SyncMoveSourceParent,
+            committed: true,
+            source,
+        })?;
+        if self.destination_parent_identity != self.source_parent_identity {
+            fsync(&self.destination_parent).map_err(|source| ConfinedFilesystemError::Syscall {
+                operation: FilesystemOperation::SyncMoveDestinationParent,
+                committed: true,
+                source,
+            })?;
+        }
+
+        self.ensure_absolute_root(true)?;
+        self.ensure_source_parent(true)?;
+        self.ensure_destination_parent(true)?;
+        let source_post = observe_leaf(&self.source_parent, &self.source_basename)
+            .map_err(|error| error.with_committed(true))?;
+        let destination_post = observe_leaf(&self.destination_parent, &self.destination_basename)
+            .map_err(|error| error.with_committed(true))?;
+        if source_post != FilePathState::Absent || destination_post != self.source_pre_state {
+            return Err(ConfinedFilesystemError::CommittedObservationFailed);
+        }
+        Ok(AppliedFileMove {
+            source_pre_state: self.source_pre_state,
+            source_post_state: source_post,
+            destination_pre_state: self.destination_pre_state,
+            destination_post_state: destination_post,
+            source_pre_source: self.source_pre_source,
+        })
+    }
+
+    fn ensure_source_parent(&self, committed: bool) -> Result<(), ConfinedFilesystemError> {
+        let reopened = walk_directories(&self.root, &self.source_parent_components, committed)?;
+        ensure_directory_identity(&reopened, self.source_parent_identity, committed)
+    }
+
+    fn ensure_destination_parent(&self, committed: bool) -> Result<(), ConfinedFilesystemError> {
+        let reopened =
+            walk_directories(&self.root, &self.destination_parent_components, committed)?;
+        ensure_directory_identity(&reopened, self.destination_parent_identity, committed)
+    }
+
+    fn ensure_absolute_root(&self, committed: bool) -> Result<(), ConfinedFilesystemError> {
+        ensure_directory_identity(&self.root, self.root_identity, committed)?;
+        #[cfg(target_os = "macos")]
+        let reopened = reopen_workspace_root(&self.workspace_root, committed)?;
+        #[cfg(not(target_os = "macos"))]
+        let reopened =
+            reopen_workspace_root(&self.filesystem_root, &self.root_components, committed)?;
+        ensure_directory_identity(&reopened, self.root_identity, committed)
+    }
 }
 
 impl PreparedFileMutation {
@@ -917,15 +1206,49 @@ impl PreparedFileMutation {
         &self,
         content: Option<&[u8]>,
     ) -> Result<CapturedDiffSource, ConfinedFilesystemError> {
+        self.intended_post_source_with_limit(content, MAX_FILE_WRITE_BYTES)
+    }
+
+    /// Retain only the ordinary Diff prefix of a bounded binary import.
+    pub fn intended_binary_post_source(
+        &self,
+        content: &[u8],
+    ) -> Result<CapturedDiffSource, ConfinedFilesystemError> {
+        if !matches!(
+            self.kind,
+            FileMutationKind::Create | FileMutationKind::Replace
+        ) {
+            return Err(ConfinedFilesystemError::InvalidPayload);
+        }
+        if content.len() > MAX_BINARY_IMPORT_BYTES {
+            return Err(ConfinedFilesystemError::WriteTooLarge {
+                actual: content.len(),
+                maximum: MAX_BINARY_IMPORT_BYTES,
+            });
+        }
+        Ok(CapturedDiffSource::Binary {
+            size: FileByteCount::new(content.len() as u64),
+        })
+    }
+
+    fn intended_post_source_with_limit(
+        &self,
+        content: Option<&[u8]>,
+        maximum: usize,
+    ) -> Result<CapturedDiffSource, ConfinedFilesystemError> {
         match (self.kind, content) {
             (FileMutationKind::Create | FileMutationKind::Replace, Some(content)) => {
-                if content.len() > MAX_FILE_WRITE_BYTES {
+                if content.len() > maximum {
                     return Err(ConfinedFilesystemError::WriteTooLarge {
                         actual: content.len(),
-                        maximum: MAX_FILE_WRITE_BYTES,
+                        maximum,
                     });
                 }
-                Ok(CapturedDiffSource::from_payload(content))
+                Ok(CapturedDiffSource::from_retained(
+                    content[..content.len().min(MAX_DIFF_SOURCE_BYTES)].to_vec(),
+                    FileByteCount::new(content.len() as u64),
+                    content.len() <= MAX_DIFF_SOURCE_BYTES,
+                ))
             }
             (FileMutationKind::Delete, None) => Ok(CapturedDiffSource::Absent),
             (FileMutationKind::Create | FileMutationKind::Replace, None)
@@ -941,7 +1264,27 @@ impl PreparedFileMutation {
         mutation_id: FileMutationId,
         content: Option<&[u8]>,
     ) -> Result<AppliedFileMutation, ConfinedFilesystemError> {
-        self.apply_inner(mutation_id, content, None)
+        self.apply_inner(mutation_id, content, None, MAX_FILE_WRITE_BYTES)
+    }
+
+    /// Apply a validated source patch through the same descriptor-rooted
+    /// atomic mutation effect, using the larger explicit source-patch bound.
+    pub fn apply_source_patch(
+        self,
+        mutation_id: FileMutationId,
+        content: &[u8],
+    ) -> Result<AppliedFileMutation, ConfinedFilesystemError> {
+        self.apply_inner(mutation_id, Some(content), None, MAX_SOURCE_PATCH_BYTES)
+    }
+
+    /// Apply an explicitly admitted binary import through the same atomic
+    /// descriptor-rooted effect and exact PRE/POST comparison.
+    pub fn apply_binary_import(
+        self,
+        mutation_id: FileMutationId,
+        content: &[u8],
+    ) -> Result<AppliedFileMutation, ConfinedFilesystemError> {
+        self.apply_inner(mutation_id, Some(content), None, MAX_BINARY_IMPORT_BYTES)
     }
 
     /// Apply a checkpoint restore create/replace while restoring the exact
@@ -958,7 +1301,12 @@ impl PreparedFileMutation {
         ) {
             return Err(ConfinedFilesystemError::InvalidPayload);
         }
-        self.apply_inner(mutation_id, Some(content), Some(mode))
+        self.apply_inner(
+            mutation_id,
+            Some(content),
+            Some(mode),
+            MAX_HASHED_FILE_BYTES,
+        )
     }
 
     fn apply_inner(
@@ -966,6 +1314,7 @@ impl PreparedFileMutation {
         mutation_id: FileMutationId,
         content: Option<&[u8]>,
         restored_mode: Option<CheckpointFileMode>,
+        maximum: usize,
     ) -> Result<AppliedFileMutation, ConfinedFilesystemError> {
         self.ensure_absolute_root(false)?;
         self.ensure_parent_path(false)?;
@@ -977,13 +1326,13 @@ impl PreparedFileMutation {
 
         match (self.kind, content) {
             (FileMutationKind::Create | FileMutationKind::Replace, Some(content)) => {
-                if content.len() > MAX_FILE_WRITE_BYTES {
+                if content.len() > maximum {
                     return Err(ConfinedFilesystemError::WriteTooLarge {
                         actual: content.len(),
-                        maximum: MAX_FILE_WRITE_BYTES,
+                        maximum,
                     });
                 }
-                self.apply_content(mutation_id, content, restored_mode)?;
+                self.apply_content(mutation_id, content, restored_mode, maximum)?;
             }
             (FileMutationKind::Delete, None) if restored_mode.is_none() => self.apply_delete()?,
             (FileMutationKind::Create | FileMutationKind::Replace, None)
@@ -998,9 +1347,9 @@ impl PreparedFileMutation {
             .map_err(|_| ConfinedFilesystemError::CommittedObservationFailed)?;
         validate_post_state(self.kind, post_state)
             .map_err(|_| ConfinedFilesystemError::CommittedObservationFailed)?;
-        validate_post_content(self.kind, content, post_state)
+        validate_post_content(self.kind, content, post_state, maximum)
             .map_err(|_| ConfinedFilesystemError::CommittedObservationFailed)?;
-        let post_source = self.intended_post_source(content)?;
+        let post_source = self.intended_post_source_with_limit(content, maximum)?;
         Ok(AppliedFileMutation {
             pre_state: self.pre_state,
             post_state,
@@ -1014,10 +1363,15 @@ impl PreparedFileMutation {
         mutation_id: FileMutationId,
         content: &[u8],
         restored_mode: Option<CheckpointFileMode>,
+        _maximum: usize,
     ) -> Result<(), ConfinedFilesystemError> {
         let temporary = OsString::from(format!("{TEMP_PREFIX}{mutation_id}"));
         let mode = if let Some(restored_mode) = restored_mode {
-            Mode::from_raw_mode(restored_mode.get())
+            // mode_t is u16 on macOS and u32 on Linux.
+            let raw_mode = restored_mode.get();
+            #[cfg(target_os = "linux")]
+            let raw_mode = u32::from(raw_mode);
+            Mode::from_raw_mode(raw_mode)
         } else {
             match self.pre_state {
                 FilePathState::Absent => Mode::RUSR | Mode::WUSR,
@@ -1082,7 +1436,7 @@ impl PreparedFileMutation {
                 return Err(ConfinedFilesystemError::PathConflict);
             }
             if self.kind == FileMutationKind::Create
-                && matches!(source, Errno::NOTSUP | Errno::OPNOTSUPP | Errno::NOSYS)
+                && [Errno::NOTSUP, Errno::OPNOTSUPP, Errno::NOSYS].contains(&source)
             {
                 return Err(ConfinedFilesystemError::AtomicCreateUnsupported);
             }
@@ -1121,7 +1475,11 @@ impl PreparedFileMutation {
 
     fn ensure_absolute_root(&self, committed: bool) -> Result<(), ConfinedFilesystemError> {
         ensure_directory_identity(&self.root, self.root_identity, committed)?;
-        let reopened = walk_directories(&self.filesystem_root, &self.root_components, committed)?;
+        #[cfg(target_os = "macos")]
+        let reopened = reopen_workspace_root(&self.workspace_root, committed)?;
+        #[cfg(not(target_os = "macos"))]
+        let reopened =
+            reopen_workspace_root(&self.filesystem_root, &self.root_components, committed)?;
         ensure_directory_identity(&reopened, self.root_identity, committed)
     }
 }
@@ -1131,10 +1489,20 @@ struct MutationLock {
     _file: OwnedFd,
 }
 
+/// Terminal descriptor-relative result of removing Forge-local state.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceStateRemoval {
+    Removed,
+    AlreadyAbsent,
+}
+
 /// Non-cloneable cross-process Workspace writer guard.
 #[derive(Debug)]
 pub struct ConfinedWorkspaceWriteGuard {
     _lock: MutationLock,
+    root_identity: DirectoryIdentity,
+    state_identity: DirectoryIdentity,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1158,6 +1526,169 @@ impl DirectoryIdentity {
     }
 }
 
+fn removal_entry_names(
+    directory: &OwnedFd,
+    entries: &mut usize,
+    committed: bool,
+) -> Result<Vec<OsString>, ConfinedFilesystemError> {
+    let stream = Dir::read_from(directory).map_err(|source| ConfinedFilesystemError::Syscall {
+        operation: FilesystemOperation::OpenDirectoryStream,
+        committed,
+        source,
+    })?;
+    let mut names = Vec::new();
+    for entry in stream {
+        let entry = entry.map_err(|source| ConfinedFilesystemError::Syscall {
+            operation: FilesystemOperation::ReadDirectory,
+            committed,
+            source,
+        })?;
+        let name = entry.file_name();
+        let bytes = name.to_bytes();
+        if bytes == b"." || bytes == b".." {
+            continue;
+        }
+        *entries = entries
+            .checked_add(1)
+            .ok_or(ConfinedFilesystemError::StateRemovalTooLarge {
+                maximum: MAX_STATE_REMOVAL_ENTRIES,
+            })?;
+        if *entries > MAX_STATE_REMOVAL_ENTRIES {
+            return Err(ConfinedFilesystemError::StateRemovalTooLarge {
+                maximum: MAX_STATE_REMOVAL_ENTRIES,
+            });
+        }
+        names.push(OsString::from_vec(bytes.to_vec()));
+    }
+    Ok(names)
+}
+
+fn inspect_removal_tree(
+    directory: &OwnedFd,
+    entries: &mut usize,
+    depth: usize,
+) -> Result<(), ConfinedFilesystemError> {
+    if depth > MAX_STATE_REMOVAL_DEPTH {
+        return Err(ConfinedFilesystemError::StateRemovalTooDeep {
+            maximum: MAX_STATE_REMOVAL_DEPTH,
+        });
+    }
+    let parent_identity = directory_identity(directory)?;
+    for name in removal_entry_names(directory, entries, false)? {
+        let metadata = statat(directory, &name, AtFlags::SYMLINK_NOFOLLOW).map_err(|source| {
+            ConfinedFilesystemError::Syscall {
+                operation: FilesystemOperation::InspectDirectoryEntry,
+                committed: false,
+                source,
+            }
+        })?;
+        if FileType::from_raw_mode(metadata.st_mode).is_dir() {
+            if directory_identity_from_stat(&metadata)?.device != parent_identity.device {
+                return Err(ConfinedFilesystemError::ProtectedPath);
+            }
+            let child = openat(
+                directory,
+                &name,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(|source| ConfinedFilesystemError::Syscall {
+                operation: FilesystemOperation::OpenAncestor,
+                committed: false,
+                source,
+            })?;
+            ensure_directory_identity(&child, directory_identity_from_stat(&metadata)?, false)?;
+            inspect_removal_tree(&child, entries, depth + 1)?;
+        }
+    }
+    Ok(())
+}
+
+fn remove_removal_tree(
+    directory: &OwnedFd,
+    entries: &mut usize,
+    depth: usize,
+) -> Result<(), ConfinedFilesystemError> {
+    if depth > MAX_STATE_REMOVAL_DEPTH {
+        return Err(ConfinedFilesystemError::StateRemovalTooDeep {
+            maximum: MAX_STATE_REMOVAL_DEPTH,
+        });
+    }
+    let parent_identity = directory_identity(directory)?;
+    for name in removal_entry_names(directory, entries, true)? {
+        let metadata = statat(directory, &name, AtFlags::SYMLINK_NOFOLLOW).map_err(|source| {
+            ConfinedFilesystemError::Syscall {
+                operation: FilesystemOperation::InspectDirectoryEntry,
+                committed: true,
+                source,
+            }
+        })?;
+        if FileType::from_raw_mode(metadata.st_mode).is_dir() {
+            let expected_child = directory_identity_from_stat(&metadata)?;
+            if expected_child.device != parent_identity.device {
+                return Err(ConfinedFilesystemError::ProtectedPath);
+            }
+            let child = openat(
+                directory,
+                &name,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(|source| ConfinedFilesystemError::Syscall {
+                operation: FilesystemOperation::OpenAncestor,
+                committed: true,
+                source,
+            })?;
+            ensure_directory_identity(&child, directory_identity_from_stat(&metadata)?, true)?;
+            remove_removal_tree(&child, entries, depth + 1)?;
+            let current_child = statat(directory, &name, AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(|_| ConfinedFilesystemError::CommittedPathChanged)?;
+            if directory_identity_from_stat(&current_child)? != expected_child {
+                return Err(ConfinedFilesystemError::CommittedPathChanged);
+            }
+            unlinkat(directory, &name, AtFlags::REMOVEDIR).map_err(|source| {
+                ConfinedFilesystemError::Syscall {
+                    operation: FilesystemOperation::RemoveStateEntry,
+                    committed: true,
+                    source,
+                }
+            })?;
+        } else {
+            unlinkat(directory, &name, AtFlags::empty()).map_err(|source| {
+                ConfinedFilesystemError::Syscall {
+                    operation: FilesystemOperation::RemoveStateEntry,
+                    committed: true,
+                    source,
+                }
+            })?;
+        }
+    }
+    Ok(())
+}
+
+// Shared callers retain the fallible signed-device conversion on macOS.
+// Linux's native device value is already u64; keep the same error contract.
+#[cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "the shared signature preserves macOS negative-device rejection"
+    )
+)]
+fn directory_identity_from_stat(
+    metadata: &rustix::fs::Stat,
+) -> Result<DirectoryIdentity, ConfinedFilesystemError> {
+    #[cfg(target_os = "linux")]
+    let device = metadata.st_dev;
+    #[cfg(not(target_os = "linux"))]
+    let device = u64::try_from(metadata.st_dev)
+        .map_err(|_| ConfinedFilesystemError::WorkspaceUnavailable)?;
+    Ok(DirectoryIdentity {
+        device,
+        inode: metadata.st_ino,
+    })
+}
+
 pub(crate) fn directory_identity(
     fd: &OwnedFd,
 ) -> Result<DirectoryIdentity, ConfinedFilesystemError> {
@@ -1165,9 +1696,13 @@ pub(crate) fn directory_identity(
     if !FileType::from_raw_mode(stat.st_mode).is_dir() {
         return Err(ConfinedFilesystemError::NonDirectoryAncestor);
     }
+    #[cfg(target_os = "linux")]
+    let device = stat.st_dev;
+    #[cfg(not(target_os = "linux"))]
+    let device =
+        u64::try_from(stat.st_dev).map_err(|_| ConfinedFilesystemError::WorkspaceUnavailable)?;
     Ok(DirectoryIdentity {
-        device: u64::try_from(stat.st_dev)
-            .map_err(|_| ConfinedFilesystemError::WorkspaceUnavailable)?,
+        device,
         inode: stat.st_ino,
     })
 }
@@ -1228,6 +1763,7 @@ fn collect_components(
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 fn collect_absolute_components(path: &Path) -> Result<Vec<OsString>, ConfinedFilesystemError> {
     if !path.is_absolute() {
         return Err(ConfinedFilesystemError::WorkspaceUnavailable);
@@ -1273,6 +1809,102 @@ pub(crate) fn walk_directories(
     committed: bool,
 ) -> Result<OwnedFd, ConfinedFilesystemError> {
     let mut current = dup(root).map_err(|source| ConfinedFilesystemError::Syscall {
+        operation: FilesystemOperation::DuplicateRoot,
+        committed,
+        source,
+    })?;
+    for component in components {
+        let stat = statat(&current, component, AtFlags::SYMLINK_NOFOLLOW).map_err(|source| {
+            ConfinedFilesystemError::Syscall {
+                operation: FilesystemOperation::InspectAncestor,
+                committed,
+                source,
+            }
+        })?;
+        let actual = file_entry_kind(FileType::from_raw_mode(stat.st_mode));
+        if actual != FileEntryKind::Directory {
+            return if committed {
+                Err(ConfinedFilesystemError::CommittedPathChanged)
+            } else {
+                Err(ConfinedFilesystemError::InvalidPathKind {
+                    expected: FileEntryKind::Directory,
+                    actual,
+                })
+            };
+        }
+        current = openat(
+            &current,
+            component,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|source| ConfinedFilesystemError::Syscall {
+            operation: FilesystemOperation::OpenAncestor,
+            committed,
+            source,
+        })?;
+    }
+    Ok(current)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn reopen_workspace_root(
+    workspace_root: &Path,
+    committed: bool,
+) -> Result<OwnedFd, ConfinedFilesystemError> {
+    let root = open(
+        workspace_root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|source| ConfinedFilesystemError::Syscall {
+        operation: FilesystemOperation::OpenWorkspaceRoot,
+        committed,
+        source,
+    })?;
+    verify_resolved_workspace_root(&root, workspace_root, committed)?;
+    Ok(root)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn reopen_workspace_root(
+    filesystem_root: &OwnedFd,
+    components: &[OsString],
+    committed: bool,
+) -> Result<OwnedFd, ConfinedFilesystemError> {
+    walk_workspace_root_without_symlinks(filesystem_root, components, committed)
+}
+
+#[cfg(target_os = "macos")]
+fn verify_resolved_workspace_root(
+    root: &OwnedFd,
+    expected_path: &Path,
+    committed: bool,
+) -> Result<(), ConfinedFilesystemError> {
+    let resolved = rustix::fs::getpath(root).map_err(|source| ConfinedFilesystemError::StdIo {
+        operation: FilesystemOperation::ResolveWorkspaceRoot,
+        committed,
+        source: source.into(),
+    })?;
+    if resolved.as_bytes() == expected_path.as_os_str().as_bytes() {
+        Ok(())
+    } else if committed {
+        Err(ConfinedFilesystemError::CommittedPathChanged)
+    } else {
+        Err(ConfinedFilesystemError::PathChanged)
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn walk_workspace_root_without_symlinks(
+    filesystem_root: &OwnedFd,
+    components: &[OsString],
+    committed: bool,
+) -> Result<OwnedFd, ConfinedFilesystemError> {
+    if components.is_empty() {
+        return Err(ConfinedFilesystemError::InvalidPath);
+    }
+    let mut current = dup(filesystem_root).map_err(|source| ConfinedFilesystemError::Syscall {
         operation: FilesystemOperation::DuplicateRoot,
         committed,
         source,
@@ -1414,7 +2046,10 @@ fn open_regular_leaf(
             Ok(Some(fd))
         }
         Err(source) if source == Errno::NOENT => Ok(None),
-        Err(source) if source == Errno::LOOP => Err(ConfinedFilesystemError::SymlinkRejected),
+        Err(source) if source == Errno::LOOP => Err(ConfinedFilesystemError::InvalidPathKind {
+            expected: FileEntryKind::RegularFile,
+            actual: FileEntryKind::SymbolicLink,
+        }),
         Err(source) => Err(ConfinedFilesystemError::Syscall {
             operation: FilesystemOperation::OpenLeaf,
             committed: false,
@@ -1425,13 +2060,29 @@ fn open_regular_leaf(
 
 pub(crate) fn require_regular_single_link(fd: &OwnedFd) -> Result<(), ConfinedFilesystemError> {
     let stat = fstat(fd).map_err(pre_syscall)?;
-    if !FileType::from_raw_mode(stat.st_mode).is_file() {
-        return Err(ConfinedFilesystemError::NonRegularLeaf);
+    let actual = file_entry_kind(FileType::from_raw_mode(stat.st_mode));
+    if actual != FileEntryKind::RegularFile {
+        return Err(ConfinedFilesystemError::InvalidPathKind {
+            expected: FileEntryKind::RegularFile,
+            actual,
+        });
     }
     if stat.st_nlink != 1 {
         return Err(ConfinedFilesystemError::HardlinkRejected);
     }
     Ok(())
+}
+
+fn file_entry_kind(file_type: FileType) -> FileEntryKind {
+    if file_type.is_dir() {
+        FileEntryKind::Directory
+    } else if file_type.is_file() {
+        FileEntryKind::RegularFile
+    } else if file_type.is_symlink() {
+        FileEntryKind::SymbolicLink
+    } else {
+        FileEntryKind::Other
+    }
 }
 
 fn validate_precondition(
@@ -1479,13 +2130,26 @@ fn validate_post_content(
     kind: FileMutationKind,
     content: Option<&[u8]>,
     state: FilePathState,
+    maximum: usize,
 ) -> Result<(), ConfinedFilesystemError> {
     match (kind, content, state) {
         (
             FileMutationKind::Create | FileMutationKind::Replace,
             Some(content),
             FilePathState::Regular { hash, .. },
-        ) if bounded_write_content_hash(content)? == hash => Ok(()),
+        ) if content.len() <= maximum
+            && FileContentHash::from_bytes(*blake3::hash(content).as_bytes()) == hash =>
+        {
+            Ok(())
+        }
+        (
+            FileMutationKind::Create | FileMutationKind::Replace,
+            Some(content),
+            FilePathState::Regular { .. },
+        ) if content.len() > maximum => Err(ConfinedFilesystemError::WriteTooLarge {
+            actual: content.len(),
+            maximum,
+        }),
         (FileMutationKind::Delete, None, FilePathState::Absent) => Ok(()),
         _ => Err(ConfinedFilesystemError::PostStateMismatch),
     }
@@ -1564,6 +2228,8 @@ fn pre_syscall(source: Errno) -> ConfinedFilesystemError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilesystemOperation {
     OpenFilesystemRoot,
+    OpenWorkspaceRoot,
+    ResolveWorkspaceRoot,
     DuplicateRoot,
     OpenAncestor,
     InspectAncestor,
@@ -1571,6 +2237,10 @@ pub enum FilesystemOperation {
     ReadLeaf,
     InspectDescriptor,
     OpenStateDirectory,
+    InspectStateDirectory,
+    RemoveStateEntry,
+    RemoveStateRoot,
+    SyncWorkspaceRoot,
     OpenDiffDirectory,
     OpenCheckpointStore,
     OpenMutationLock,
@@ -1583,7 +2253,16 @@ pub enum FilesystemOperation {
     PublishTemporary,
     CleanupTemporary,
     DeleteLeaf,
+    MoveLeaf,
     SyncParent,
+    SyncMoveSourceParent,
+    SyncMoveDestinationParent,
+    OpenDirectoryStream,
+    ReadDirectory,
+    InspectDirectoryEntry,
+    ReadSourceSlice,
+    ReadSourcePatch,
+    ReadSearchFile,
 }
 
 /// Typed failure from the descriptor-relative filesystem boundary.
@@ -1599,12 +2278,19 @@ pub enum ConfinedFilesystemError {
     WorkspaceRootTooDeep,
     #[error("protected Workspace path is inaccessible")]
     ProtectedPath,
+    #[error("generated or Forge-owned path is excluded from source operations")]
+    GeneratedPath,
     #[error("a symbolic link was rejected")]
     SymlinkRejected,
     #[error("an ancestor is not a directory")]
     NonDirectoryAncestor,
     #[error("the target is not a regular file")]
     NonRegularLeaf,
+    #[error("path kind mismatch: expected {expected:?}, actual {actual:?}")]
+    InvalidPathKind {
+        expected: FileEntryKind,
+        actual: FileEntryKind,
+    },
     #[error("hard-linked files are rejected")]
     HardlinkRejected,
     #[error("the target was not found")]
@@ -1625,10 +2311,32 @@ pub enum ConfinedFilesystemError {
     InvalidPayload,
     #[error("exclusive atomic create is unsupported on this filesystem")]
     AtomicCreateUnsupported,
+    #[error("exclusive atomic move is unsupported on this filesystem")]
+    AtomicMoveUnsupported,
     #[error("the bounded Forge-writer lock is busy")]
     LockBusy,
+    #[error("Forge state removal exceeds its {maximum} entry bound")]
+    StateRemovalTooLarge { maximum: usize },
+    #[error("Forge state removal exceeds its {maximum} directory-depth bound")]
+    StateRemovalTooDeep { maximum: usize },
     #[error("the observed POST state does not match the requested mutation")]
     PostStateMismatch,
+    #[error("source patch was rejected: {0}")]
+    SourcePatch(#[source] forge_domain::FilePatchError),
+    #[error("source slice was rejected: {0}")]
+    SourceSlice(#[source] forge_domain::FileReadSliceError),
+    #[error("source search query produced invalid text")]
+    SourceSearchNonUtf8,
+    #[error("source search line count overflowed")]
+    SourceSearchLineOverflow,
+    #[error("source search result contains an invalid match")]
+    TextSearchMatch(#[source] forge_domain::TextSearchMatchError),
+    #[error("source search result is invalid")]
+    TextSearchResult(#[source] forge_domain::TextSearchResultError),
+    #[error("file-list result is invalid")]
+    FileListResult(#[source] forge_domain::FileListResultError),
+    #[error("filesystem operation output has {actual} bytes; maximum is {maximum}")]
+    OutputTooLarge { actual: usize, maximum: usize },
     #[error("the filesystem effect committed but its POST state could not be confirmed")]
     CommittedObservationFailed,
     #[error("filesystem operation {operation:?} failed")]
@@ -1657,9 +2365,11 @@ impl ConfinedFilesystemError {
             | Self::TooManyComponents
             | Self::WorkspaceRootTooDeep
             | Self::ProtectedPath
+            | Self::GeneratedPath
             | Self::SymlinkRejected
             | Self::NonDirectoryAncestor
             | Self::NonRegularLeaf
+            | Self::InvalidPathKind { .. }
             | Self::HardlinkRejected
             | Self::NotFound
             | Self::PathConflict
@@ -1669,15 +2379,26 @@ impl ConfinedFilesystemError {
             | Self::WriteTooLarge { .. }
             | Self::InvalidPayload
             | Self::AtomicCreateUnsupported
+            | Self::AtomicMoveUnsupported
             | Self::LockBusy
-            | Self::PostStateMismatch => false,
+            | Self::StateRemovalTooLarge { .. }
+            | Self::StateRemovalTooDeep { .. }
+            | Self::PostStateMismatch
+            | Self::SourcePatch(_)
+            | Self::SourceSlice(_)
+            | Self::SourceSearchNonUtf8
+            | Self::SourceSearchLineOverflow
+            | Self::TextSearchMatch(_)
+            | Self::TextSearchResult(_)
+            | Self::FileListResult(_)
+            | Self::OutputTooLarge { .. } => false,
         }
     }
 
     pub const fn failure_code(&self) -> FileMutationFailureCode {
         match self {
             Self::InvalidPath | Self::TooManyComponents => FileMutationFailureCode::InvalidPath,
-            Self::ProtectedPath => FileMutationFailureCode::ProtectedPath,
+            Self::ProtectedPath | Self::GeneratedPath => FileMutationFailureCode::ProtectedPath,
             Self::NotFound
             | Self::PathConflict
             | Self::PathChanged
@@ -1685,17 +2406,29 @@ impl ConfinedFilesystemError {
             | Self::CommittedObservationFailed
             | Self::PostStateMismatch => FileMutationFailureCode::PathConflict,
             Self::StaleWrite => FileMutationFailureCode::StaleWrite,
-            Self::FileTooLarge { .. } | Self::WriteTooLarge { .. } | Self::LockBusy => {
-                FileMutationFailureCode::CapacityExceeded
-            }
+            Self::FileTooLarge { .. }
+            | Self::WriteTooLarge { .. }
+            | Self::LockBusy
+            | Self::StateRemovalTooLarge { .. }
+            | Self::StateRemovalTooDeep { .. }
+            | Self::OutputTooLarge { .. } => FileMutationFailureCode::CapacityExceeded,
             Self::WorkspaceUnavailable
             | Self::WorkspaceRootTooDeep
             | Self::SymlinkRejected
             | Self::NonDirectoryAncestor
             | Self::NonRegularLeaf
+            | Self::InvalidPathKind { .. }
             | Self::HardlinkRejected
             | Self::InvalidPayload
             | Self::AtomicCreateUnsupported
+            | Self::AtomicMoveUnsupported
+            | Self::SourcePatch(_)
+            | Self::SourceSlice(_)
+            | Self::SourceSearchNonUtf8
+            | Self::SourceSearchLineOverflow
+            | Self::TextSearchMatch(_)
+            | Self::TextSearchResult(_)
+            | Self::FileListResult(_)
             | Self::Syscall { .. }
             | Self::StdIo { .. } => FileMutationFailureCode::IoFailure,
         }
@@ -1725,6 +2458,7 @@ impl ConfinedFilesystemError {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
     use std::fs;
     use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::{PermissionsExt, symlink};
@@ -1734,7 +2468,11 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::WorkspaceStateLayout;
+    use crate::{WorkspaceStateExclusiveGate, WorkspaceStateLayout};
+    use forge_domain::{
+        FileListOptions, FilePatch, FilePatchHunk, SourceEol, SourceLineRange, SourceRangeHash,
+        TextSearchOptions, TextSearchQuery,
+    };
 
     fn root(label: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
         let unique = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
@@ -1758,6 +2496,67 @@ mod tests {
 
     fn mutation_id(value: u128) -> FileMutationId {
         FileMutationId::from_uuid(Uuid::from_u128(value))
+    }
+
+    #[test]
+    fn state_removal_unlinks_a_symlink_without_touching_its_target()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let workspace_root = root("state-removal-symlink")?;
+        let outside = root("state-removal-outside")?;
+        let outside_file = outside.join("preserved.txt");
+        fs::write(&outside_file, b"preserved")?;
+        let layout = WorkspaceStateLayout::initialize(&workspace_root)?;
+        let existing =
+            WorkspaceStateLayout::inspect_existing(&workspace_root)?.ok_or("missing layout")?;
+        symlink(&outside, existing.state_root().join("outside-link"))?;
+        let confined = ConfinedWorkspace::open(&existing)?;
+        let gate = WorkspaceStateExclusiveGate::acquire(
+            layout.workspace_root(),
+            layout.root_fingerprint()?,
+        )?;
+        let guard = confined.acquire_write_guard()?;
+        confined.preflight_owned_state_removal(&gate, &guard)?;
+        assert_eq!(
+            confined.remove_owned_state_directory(&gate, &guard)?,
+            WorkspaceStateRemoval::Removed
+        );
+        assert_eq!(fs::read(&outside_file)?, b"preserved");
+        assert!(!existing.state_root().exists());
+        drop(guard);
+        drop(gate);
+        fs::remove_dir_all(workspace_root)?;
+        fs::remove_dir_all(outside)?;
+        Ok(())
+    }
+
+    #[test]
+    fn state_removal_rejects_a_write_guard_from_another_workspace()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let first_root = root("state-removal-first")?;
+        let second_root = root("state-removal-second")?;
+        let first_layout = WorkspaceStateLayout::initialize(&first_root)?;
+        let second_layout = WorkspaceStateLayout::initialize(&second_root)?;
+        let first_existing =
+            WorkspaceStateLayout::inspect_existing(&first_root)?.ok_or("missing first layout")?;
+        let second_existing =
+            WorkspaceStateLayout::inspect_existing(&second_root)?.ok_or("missing second layout")?;
+        let first = ConfinedWorkspace::open(&first_existing)?;
+        let second = ConfinedWorkspace::open(&second_existing)?;
+        let gate = WorkspaceStateExclusiveGate::acquire(
+            first_layout.workspace_root(),
+            first_layout.root_fingerprint()?,
+        )?;
+        let foreign_guard = second.acquire_write_guard()?;
+        assert!(matches!(
+            first.preflight_owned_state_removal(&gate, &foreign_guard),
+            Err(ConfinedFilesystemError::PathChanged)
+        ));
+        drop(foreign_guard);
+        drop(gate);
+        drop(second_layout);
+        fs::remove_dir_all(first_root)?;
+        fs::remove_dir_all(second_root)?;
+        Ok(())
     }
 
     #[test]
@@ -1808,7 +2607,10 @@ mod tests {
         symlink(outside.join("secret"), root.join("leaf-link"))?;
         assert!(matches!(
             confined.observe(&relative("leaf-link")?),
-            Err(ConfinedFilesystemError::SymlinkRejected)
+            Err(ConfinedFilesystemError::InvalidPathKind {
+                expected: FileEntryKind::RegularFile,
+                actual: FileEntryKind::SymbolicLink,
+            })
         ));
         fs::hard_link(outside.join("secret"), root.join("hard"))?;
         assert!(matches!(
@@ -1821,7 +2623,7 @@ mod tests {
     }
 
     #[test]
-    fn create_replace_delete_are_atomic_and_hash_cas_bound()
+    fn create_replace_restore_delete_are_atomic_and_hash_cas_bound()
     -> Result<(), Box<dyn std::error::Error>> {
         let root = root("mutations")?;
         let (_layout, confined) = confined(&root)?;
@@ -1854,16 +2656,198 @@ mod tests {
             0o666
         );
 
+        let restore_plan = FileMutationPlan::new(
+            path.clone(),
+            FileMutationKind::Replace,
+            FilePrecondition::Matches(replaced_hash),
+        );
+        let restored = confined
+            .prepare_mutation(&restore_plan)?
+            .apply_restored_content(mutation_id(3), b"restored", CheckpointFileMode::new(0o751)?)?;
+        let restored_hash = restored.post_state().hash().ok_or("hash missing")?;
+        assert_eq!(fs::read(root.join("file.txt"))?, b"restored");
+        assert_eq!(
+            fs::metadata(root.join("file.txt"))?.permissions().mode() & 0o777,
+            0o751
+        );
+
         let delete_plan = FileMutationPlan::new(
             path,
             FileMutationKind::Delete,
-            FilePrecondition::Matches(replaced_hash),
+            FilePrecondition::Matches(restored_hash),
         );
         let deleted = confined
             .prepare_mutation(&delete_plan)?
-            .apply(mutation_id(3), None)?;
+            .apply(mutation_id(4), None)?;
         assert_eq!(deleted.post_state(), FilePathState::Absent);
         assert!(!root.join("file.txt").exists());
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_mutation_revalidates_a_deep_absolute_root() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let base = root("deep-absolute-root")?;
+        let workspace_root = base.join("outer/inner/workspace");
+        fs::create_dir_all(&workspace_root)?;
+        let (_layout, confined) = confined(&workspace_root)?;
+        fs::create_dir(workspace_root.join("nested"))?;
+
+        let path = relative("nested/probe.txt")?;
+        let created = confined
+            .prepare_mutation(&FileMutationPlan::new(
+                path.clone(),
+                FileMutationKind::Create,
+                FilePrecondition::Absent,
+            ))?
+            .apply(mutation_id(11), Some(b"one"))?;
+        let created_hash = created.post_state().hash().ok_or("created hash missing")?;
+
+        let replaced = confined
+            .prepare_mutation(&FileMutationPlan::new(
+                path.clone(),
+                FileMutationKind::Replace,
+                FilePrecondition::Matches(created_hash),
+            ))?
+            .apply(mutation_id(12), Some(b"two"))?;
+        let replaced_hash = replaced
+            .post_state()
+            .hash()
+            .ok_or("replaced hash missing")?;
+
+        let deleted = confined
+            .prepare_mutation(&FileMutationPlan::new(
+                path,
+                FileMutationKind::Delete,
+                FilePrecondition::Matches(replaced_hash),
+            ))?
+            .apply(mutation_id(13), None)?;
+        assert_eq!(deleted.post_state(), FilePathState::Absent);
+        assert!(!workspace_root.join("nested/probe.txt").exists());
+
+        fs::remove_dir_all(base)?;
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_move_revalidates_a_deep_absolute_root() -> Result<(), Box<dyn std::error::Error>> {
+        let base = root("deep-absolute-move")?;
+        let workspace_root = base.join("outer/inner/workspace");
+        fs::create_dir_all(workspace_root.join("from"))?;
+        fs::create_dir(workspace_root.join("to"))?;
+        fs::write(workspace_root.join("from/source.txt"), b"source")?;
+        let (_layout, confined) = confined(&workspace_root)?;
+
+        let source = relative("from/source.txt")?;
+        let destination = relative("to/destination.txt")?;
+        let expected = confined
+            .observe(&source)?
+            .hash()
+            .ok_or("source hash missing")?;
+        let applied = confined
+            .prepare_move(&source, expected, &destination)?
+            .apply()?;
+
+        assert_eq!(applied.source_post_state(), FilePathState::Absent);
+        assert_eq!(applied.destination_post_state().hash(), Some(expected));
+        assert_eq!(
+            fs::read(workspace_root.join("to/destination.txt"))?,
+            b"source"
+        );
+
+        fs::remove_dir_all(base)?;
+        Ok(())
+    }
+
+    #[test]
+    fn move_is_atomic_hash_cas_bound_and_never_replaces_destination()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = root("move")?;
+        let (_layout, confined) = confined(&root)?;
+        fs::create_dir(root.join("from"))?;
+        fs::create_dir(root.join("to"))?;
+        fs::write(root.join("from/source.rs"), b"fn moved() {}\n")?;
+        fs::set_permissions(
+            root.join("from/source.rs"),
+            fs::Permissions::from_mode(0o640),
+        )?;
+
+        let source = relative("from/source.rs")?;
+        let destination = relative("to/destination.rs")?;
+        let expected = confined.observe(&source)?.hash().ok_or("hash missing")?;
+        let applied = confined
+            .prepare_move(&source, expected, &destination)?
+            .apply()?;
+
+        assert_eq!(applied.source_pre_state().hash(), Some(expected));
+        assert_eq!(applied.source_post_state(), FilePathState::Absent);
+        assert_eq!(applied.destination_pre_state(), FilePathState::Absent);
+        assert_eq!(applied.destination_post_state().hash(), Some(expected));
+        assert_eq!(applied.source_pre_source().text(), Some("fn moved() {}\n"));
+        assert!(!root.join("from/source.rs").exists());
+        assert_eq!(
+            fs::read(root.join("to/destination.rs"))?,
+            b"fn moved() {}\n"
+        );
+        assert_eq!(
+            fs::metadata(root.join("to/destination.rs"))?
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640
+        );
+
+        fs::write(root.join("from/second.rs"), b"second")?;
+        fs::write(root.join("to/existing.rs"), b"existing")?;
+        let second = relative("from/second.rs")?;
+        let existing = relative("to/existing.rs")?;
+        let second_hash = confined.observe(&second)?.hash().ok_or("hash missing")?;
+        assert!(matches!(
+            confined.prepare_move(&second, second_hash, &existing),
+            Err(ConfinedFilesystemError::PathConflict)
+        ));
+        assert_eq!(fs::read(root.join("from/second.rs"))?, b"second");
+        assert_eq!(fs::read(root.join("to/existing.rs"))?, b"existing");
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn move_revalidates_both_endpoints_before_effect() -> Result<(), Box<dyn std::error::Error>> {
+        let root = root("move-stale")?;
+        let (_layout, confined) = confined(&root)?;
+        fs::create_dir(root.join("from"))?;
+        fs::create_dir(root.join("to"))?;
+        fs::write(root.join("from/source.rs"), b"original")?;
+        let source = relative("from/source.rs")?;
+        let destination = relative("to/destination.rs")?;
+        let expected = confined.observe(&source)?.hash().ok_or("hash missing")?;
+        let prepared = confined.prepare_move(&source, expected, &destination)?;
+
+        fs::write(root.join("to/destination.rs"), b"external")?;
+        assert!(matches!(
+            prepared.apply(),
+            Err(ConfinedFilesystemError::PathConflict)
+        ));
+        assert_eq!(fs::read(root.join("from/source.rs"))?, b"original");
+        assert_eq!(fs::read(root.join("to/destination.rs"))?, b"external");
+
+        let other_destination = relative("to/other.rs")?;
+        let prepared = confined.prepare_move(&source, expected, &other_destination)?;
+        fs::write(root.join("from/source.rs"), b"changed")?;
+        assert!(matches!(
+            prepared.apply(),
+            Err(ConfinedFilesystemError::StaleWrite)
+        ));
+        assert_eq!(fs::read(root.join("from/source.rs"))?, b"changed");
+        assert!(!root.join("to/other.rs").exists());
+
+        assert!(matches!(
+            confined.prepare_move(&source, expected, &source),
+            Err(ConfinedFilesystemError::PathConflict)
+        ));
         fs::remove_dir_all(root)?;
         Ok(())
     }
@@ -2003,8 +2987,157 @@ mod tests {
             size: FileByteCount::new(5),
         };
         assert!(matches!(
-            validate_post_content(FileMutationKind::Replace, Some(intended), other),
+            validate_post_content(
+                FileMutationKind::Replace,
+                Some(intended),
+                other,
+                MAX_FILE_WRITE_BYTES,
+            ),
             Err(ConfinedFilesystemError::PostStateMismatch)
         ));
+    }
+
+    #[test]
+    fn file_list_is_one_directory_bounded_sorted_and_filters_generated_entries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = root("list-source")?;
+        let (_layout, confined) = confined(&root)?;
+        fs::write(root.join("z.rs"), b"z")?;
+        fs::write(root.join("a.rs"), b"a")?;
+        fs::create_dir(root.join("src"))?;
+        fs::create_dir(root.join("target"))?;
+        fs::create_dir(root.join(".git"))?;
+        fs::create_dir(root.join(".cache"))?;
+        fs::create_dir(root.join(".ruff_cache"))?;
+        let result = confined.file_list(None, FileListOptions::default())?;
+        let names: Vec<_> = result
+            .entries()
+            .iter()
+            .map(|entry| entry.path().as_path().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["a.rs", "src", "z.rs"]);
+        assert!(!result.truncated());
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn text_search_is_literal_recursive_and_does_not_follow_symlinks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = root("search-source")?;
+        let (_layout, confined) = confined(&root)?;
+        fs::create_dir(root.join("src"))?;
+        fs::write(root.join("src/nested.rs"), b"needle[here]\nother\n")?;
+        fs::write(root.join("literal.rs"), b"needle.*not-regex\n")?;
+        fs::create_dir_all(root.join(".ruff_cache/0.15.12"))?;
+        fs::write(
+            root.join(".ruff_cache/0.15.12/cache.db"),
+            b"needle[cache]\n",
+        )?;
+        let outside = root.with_extension("search-outside");
+        fs::create_dir_all(&outside)?;
+        fs::write(outside.join("secret.rs"), b"needle[secret]\n")?;
+        symlink(&outside, root.join("linked"))?;
+        let query = TextSearchQuery::new("needle[".to_owned())?;
+        let result = confined.text_search(None, &query, TextSearchOptions::default())?;
+        assert_eq!(result.matches().len(), 1);
+        assert_eq!(
+            result.matches()[0].path().as_path(),
+            Path::new("src/nested.rs")
+        );
+        assert_eq!(result.matches()[0].line(), 1);
+        assert!(!result.truncated());
+        fs::remove_dir_all(root)?;
+        fs::remove_dir_all(outside)?;
+        Ok(())
+    }
+
+    #[test]
+    fn file_read_slice_streams_large_source_and_preserves_line_metadata()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = root("slice-source")?;
+        let (_layout, confined) = confined(&root)?;
+        let mut source = String::new();
+        for index in 0..20_000 {
+            let _ = writeln!(source, "line-{index}");
+        }
+        fs::write(root.join("large.rs"), source.as_bytes())?;
+        let slice = confined.file_read_slice(
+            &relative("large.rs")?,
+            SourceLineRange::new(10_000, 10_002)?,
+        )?;
+        assert_eq!(slice.start_line(), 10_000);
+        assert_eq!(slice.end_line(), 10_002);
+        assert_eq!(slice.total_lines(), 20_000);
+        assert_eq!(slice.eol(), SourceEol::Lf);
+        assert!(slice.has_final_newline());
+        assert_eq!(slice.content(), b"line-9999\nline-10000\nline-10001\n");
+        assert_eq!(
+            slice.range_hash(),
+            SourceRangeHash::from_bytes(*blake3::hash(slice.content()).as_bytes())
+        );
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn source_file_read_reports_typed_directory_path_kind() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let root = root("path-kind")?;
+        let (_layout, confined) = confined(&root)?;
+        fs::create_dir(root.join("directory"))?;
+        let Err(error) =
+            confined.file_read_slice(&relative("directory")?, SourceLineRange::new(1, 1)?)
+        else {
+            return Err("directory path must not be read as a source file".into());
+        };
+        assert!(matches!(
+            error,
+            ConfinedFilesystemError::InvalidPathKind {
+                expected: FileEntryKind::RegularFile,
+                actual: FileEntryKind::Directory,
+            }
+        ));
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn compile_file_patch_reads_large_source_and_rejects_stale_hash()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = root("patch-source")?;
+        let (_layout, confined) = confined(&root)?;
+        let source = vec![b'a'; 16 * 1024];
+        fs::write(root.join("large.rs"), &source)?;
+        let whole_hash = FileContentHash::from_bytes(*blake3::hash(&source).as_bytes());
+        let range_hash = SourceRangeHash::from_bytes(*blake3::hash(&source).as_bytes());
+        let patch = FilePatch::new(
+            whole_hash,
+            vec![FilePatchHunk::new(
+                SourceLineRange::new(1, 1)?,
+                range_hash,
+                b"replacement".to_vec(),
+            )?],
+        )?;
+        let (compiled, _review) = confined
+            .compile_file_patch(&relative("large.rs")?, &patch)?
+            .into_parts();
+        assert_eq!(compiled.content(), b"replacement");
+        let stale = FilePatch::new(
+            FileContentHash::from_bytes([3; FileContentHash::BYTE_LEN]),
+            vec![FilePatchHunk::new(
+                SourceLineRange::new(1, 1)?,
+                range_hash,
+                b"replacement".to_vec(),
+            )?],
+        )?;
+        assert!(matches!(
+            confined.compile_file_patch(&relative("large.rs")?, &stale),
+            Err(ConfinedFilesystemError::SourcePatch(
+                forge_domain::FilePatchError::StaleWholeFileHash
+            ))
+        ));
+        fs::remove_dir_all(root)?;
+        Ok(())
     }
 }

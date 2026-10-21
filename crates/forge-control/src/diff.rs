@@ -1,6 +1,6 @@
 use forge_domain::{
-    ActivityId, ChangeSetId, ChangeSetState, DiffArtifactHealth, DiffId, DiffListLimit,
-    DiffPayloadProjection, RegisteredDiffEvidence,
+    ActivityId, DiffArtifactHealth, DiffId, DiffListLimit, DiffPayloadProjection,
+    RegisteredDiffEvidence,
 };
 use forge_persistence::WorkspaceStore;
 use forge_workspace::{ConfinedWorkspace, DiffArtifactExpectation, ExistingWorkspaceStateLayout};
@@ -190,22 +190,10 @@ fn require_diff(
     id: DiffId,
     workspace_id: forge_domain::WorkspaceId,
 ) -> Result<RegisteredDiffEvidence, ControlError> {
-    let Some(evidence) = store.get_diff(id).map_err(map_activity_store_error)? else {
-        let change_set_id = ChangeSetId::from_uuid(id.into_uuid());
-        let legacy = store
-            .get_file_mutation(change_set_id)
-            .map_err(map_activity_store_error)?
-            .is_some_and(|record| {
-                record.change_set().workspace_id() == workspace_id
-                    && record.change_set().state() == ChangeSetState::Applied
-            });
-        let code = if legacy {
-            ControlErrorCode::DiffLegacyUnavailable
-        } else {
-            ControlErrorCode::DiffNotFound
-        };
-        return Err(ControlError::new(code));
-    };
+    let evidence = store
+        .get_diff(id)
+        .map_err(map_activity_store_error)?
+        .ok_or_else(|| ControlError::new(ControlErrorCode::DiffNotFound))?;
     if evidence.workspace_id() != workspace_id {
         return Err(ControlError::new(ControlErrorCode::DiffNotFound));
     }

@@ -15,8 +15,9 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, Rows, TransactionB
 use thiserror::Error;
 use uuid::Uuid;
 
+mod relocation;
+
 const CURRENT_SCHEMA_VERSION: i64 = 2;
-const V1_SCHEMA_VERSION: i64 = 1;
 const APPLICATION_ID: i64 = 0x4846_4752;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_SCHEMA_SQL_BYTES: usize = 16 * 1024;
@@ -39,19 +40,10 @@ const LOCATION_BY_ID_QUERY: &str = "SELECT length(CAST(location_id AS BLOB)),
                                     FROM locations
                                     WHERE location_id = ?1";
 const REQUIRED_INDEX_NAME: &str = "locations_state_name_idx";
-const EXPECTED_LOCATIONS_TABLE_V1_SQL: &str = "CREATE TABLE locations (location_id BLOB PRIMARY KEY NOT NULL CHECK(length(location_id) = 16), display_name TEXT NOT NULL CHECK(length(display_name) BETWEEN 1 AND 128), root_path BLOB NOT NULL UNIQUE, state INTEGER NOT NULL CHECK(state IN (0, 1)), created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0), updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= 0))";
 const EXPECTED_LOCATIONS_TABLE_V2_SQL: &str = "CREATE TABLE locations (location_id BLOB PRIMARY KEY NOT NULL CHECK(length(location_id) = 16), display_name TEXT NOT NULL CHECK(length(display_name) BETWEEN 1 AND 128), root_path BLOB NOT NULL UNIQUE, state INTEGER NOT NULL CHECK(state IN (0, 1)), created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0), updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= 0), revision INTEGER NOT NULL DEFAULT 1 CHECK(revision >= 1))";
 const EXPECTED_LOCATIONS_INDEX_SQL: &str =
     "CREATE INDEX locations_state_name_idx ON locations(state, display_name COLLATE NOCASE)";
 
-const EXPECTED_LOCATION_COLUMNS_V1: [(&str, &str, i64, i64); 6] = [
-    ("location_id", "BLOB", 1, 1),
-    ("display_name", "TEXT", 1, 0),
-    ("root_path", "BLOB", 1, 0),
-    ("state", "INTEGER", 1, 0),
-    ("created_at_ms", "INTEGER", 1, 0),
-    ("updated_at_ms", "INTEGER", 1, 0),
-];
 const EXPECTED_LOCATION_COLUMNS_V2: [(&str, &str, i64, i64); 7] = [
     ("location_id", "BLOB", 1, 1),
     ("display_name", "TEXT", 1, 0),
@@ -142,9 +134,22 @@ impl fmt::Debug for GlobalRegistry {
 }
 
 impl GlobalRegistry {
+    /// Observed canonical database path, without exposing the `SQLite` handle.
+    pub fn database_path(&self) -> &Path {
+        &self.path
+    }
+
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, RegistryError> {
         let path = path.into();
         Self::open_with_timeout(&path, BUSY_TIMEOUT)
+    }
+
+    /// Open an already-owned Registry without creating a parent directory or
+    /// `SQLite` database. This is the non-creating startup path for standalone
+    /// consumers that must fail closed when the Registry is absent or fresh.
+    pub fn open_existing(path: impl Into<PathBuf>) -> Result<Self, RegistryError> {
+        let path = path.into();
+        Self::open_with_mode(&path, BUSY_TIMEOUT, RegistryOpenMode::ExistingOnly)
     }
 
     /// Inspect an already-created Registry without creating or mutating it.
@@ -152,7 +157,7 @@ impl GlobalRegistry {
     /// Doctor and other diagnostic callers must not turn an absent Registry
     /// into a durable application state. This path resolves the existing
     /// parent, opens `SQLite` through a read-only `file:` URI with `NOFOLLOW`,
-    /// and never runs startup configuration or migration. The database and
+    /// and never runs startup configuration or schema rewriting. The database and
     /// both `SQLite` sidecars are identity-checked before and after inspection
     /// so a replacement or unexpected side effect is reported rather than
     /// hidden.
@@ -169,14 +174,28 @@ impl GlobalRegistry {
         requested_path: &Path,
         busy_timeout: Duration,
     ) -> Result<Self, RegistryError> {
+        Self::open_with_mode(
+            requested_path,
+            busy_timeout,
+            RegistryOpenMode::CreateIfMissing,
+        )
+    }
+
+    fn open_with_mode(
+        requested_path: &Path,
+        busy_timeout: Duration,
+        mode: RegistryOpenMode,
+    ) -> Result<Self, RegistryError> {
         let parent = requested_path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .ok_or_else(|| RegistryError::MissingParent(requested_path.to_path_buf()))?;
-        fs::create_dir_all(parent).map_err(|source| RegistryError::CreateParent {
-            path: parent.to_path_buf(),
-            source,
-        })?;
+        if mode == RegistryOpenMode::CreateIfMissing {
+            fs::create_dir_all(parent).map_err(|source| RegistryError::CreateParent {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
         let canonical_parent =
             fs::canonicalize(parent).map_err(|source| RegistryError::DatabaseParentMetadata {
                 path: parent.to_path_buf(),
@@ -200,9 +219,22 @@ impl GlobalRegistry {
             if shm_before.is_some() {
                 return Err(RegistryError::DatabaseSidecarWithoutMain(shm_path));
             }
+            if mode == RegistryOpenMode::ExistingOnly {
+                return Err(RegistryError::DatabasePathInvariant {
+                    path: path.clone(),
+                    detail: "existing Registry database is missing",
+                });
+            }
         }
 
-        let flags = OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+        let flags = match mode {
+            RegistryOpenMode::CreateIfMissing => {
+                OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW
+            }
+            RegistryOpenMode::ExistingOnly => {
+                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW
+            }
+        };
         let connection =
             Connection::open_with_flags(&path, flags).map_err(|source| RegistryError::Open {
                 path: path.clone(),
@@ -231,18 +263,15 @@ impl GlobalRegistry {
         };
         match inspect_database(&registry.connection)? {
             DatabaseOwnership::Fresh => {
+                if mode == RegistryOpenMode::ExistingOnly {
+                    return Err(RegistryError::UnownedDatabase);
+                }
                 configure_connection(&registry.connection, busy_timeout)?;
                 migrate_fresh(&mut registry.connection)?;
-                validate_schema_shape(&registry.connection, SchemaVersion::V2)?;
+                validate_schema_shape(&registry.connection)?;
             }
-            DatabaseOwnership::OwnedV1 => {
-                validate_schema_shape(&registry.connection, SchemaVersion::V1)?;
-                configure_connection(&registry.connection, busy_timeout)?;
-                migrate_v1_to_v2(&mut registry.connection)?;
-                validate_schema_shape(&registry.connection, SchemaVersion::V2)?;
-            }
-            DatabaseOwnership::OwnedV2 => {
-                validate_schema_shape(&registry.connection, SchemaVersion::V2)?;
+            DatabaseOwnership::Current => {
+                validate_schema_shape(&registry.connection)?;
                 configure_connection(&registry.connection, busy_timeout)?;
             }
         }
@@ -290,6 +319,25 @@ impl GlobalRegistry {
         };
         self.ensure_live_binding()?;
         Ok(health)
+    }
+
+    /// Compare-and-set the persisted root of one Location without filesystem effects.
+    pub fn relocate_location_root(
+        &mut self,
+        id: LocationId,
+        expected_revision: LocationRevision,
+        expected_root: &LocationRoot,
+        new_root: &LocationRoot,
+        observed_at: TimestampMillis,
+    ) -> Result<RegisteredLocation, RegistryError> {
+        relocation::relocate_location_root(
+            self,
+            id,
+            expected_revision,
+            expected_root,
+            new_root,
+            observed_at,
+        )
     }
 
     fn register_location(
@@ -405,6 +453,17 @@ impl GlobalRegistry {
         &mut self,
         command: &SetLocationState,
     ) -> Result<RegisteredLocation, RegistryError> {
+        self.set_location_state_with_hook(command, |_| {})
+    }
+
+    fn set_location_state_with_hook<F>(
+        &mut self,
+        command: &SetLocationState,
+        after_commit: F,
+    ) -> Result<RegisteredLocation, RegistryError>
+    where
+        F: FnOnce(&mut Self),
+    {
         self.ensure_live_binding()?;
         let transaction = self
             .connection
@@ -459,11 +518,34 @@ impl GlobalRegistry {
             self.wal_identity,
             self.shm_identity,
         )?;
-        transaction.commit()?;
-        self.ensure_live_binding()?;
-        self.capture_sidecar_identities()?;
-        self.ensure_live_binding()?;
+        transaction.commit().map_err(|source| {
+            RegistryError::LocationStateCommittedUnconfirmed {
+                id,
+                expected_revision: command.expected_revision(),
+                desired_state: command.state(),
+                source: Box::new(source.into()),
+            }
+        })?;
+        after_commit(self);
+        self.confirm_location_state_commit(id, command.expected_revision(), command.state())?;
         Ok(location)
+    }
+
+    fn confirm_location_state_commit(
+        &mut self,
+        id: LocationId,
+        expected_revision: LocationRevision,
+        desired_state: LocationState,
+    ) -> Result<(), RegistryError> {
+        self.ensure_live_binding()
+            .and_then(|()| self.capture_sidecar_identities())
+            .and_then(|()| self.ensure_live_binding())
+            .map_err(|source| RegistryError::LocationStateCommittedUnconfirmed {
+                id,
+                expected_revision,
+                desired_state,
+                source: Box::new(source),
+            })
     }
 }
 
@@ -850,6 +932,17 @@ fn map_repository_error(operation: &'static str, error: RegistryError) -> Locati
         RegistryError::RevisionOverflow { id, current } => {
             LocationRepositoryError::RevisionOverflow { id, current }
         }
+        RegistryError::LocationStateCommittedUnconfirmed {
+            id,
+            expected_revision,
+            desired_state,
+            source,
+        } => LocationRepositoryError::CommittedUnconfirmed {
+            id,
+            expected_revision,
+            desired_state,
+            source: Box::new(*source),
+        },
         error => LocationRepositoryError::Backend {
             operation,
             source: Box::new(error),
@@ -869,16 +962,15 @@ fn configure_connection(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DatabaseOwnership {
-    Fresh,
-    OwnedV1,
-    OwnedV2,
+enum RegistryOpenMode {
+    CreateIfMissing,
+    ExistingOnly,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SchemaVersion {
-    V1,
-    V2,
+enum DatabaseOwnership {
+    Fresh,
+    Current,
 }
 
 fn inspect_database(connection: &Connection) -> Result<DatabaseOwnership, RegistryError> {
@@ -890,10 +982,10 @@ fn inspect_database(connection: &Connection) -> Result<DatabaseOwnership, Regist
             expected: APPLICATION_ID,
         });
     }
-    if app_id == APPLICATION_ID && version > CURRENT_SCHEMA_VERSION {
+    if app_id == APPLICATION_ID && version != CURRENT_SCHEMA_VERSION {
         return Err(RegistryError::UnsupportedSchemaVersion {
             actual: version,
-            maximum_supported: CURRENT_SCHEMA_VERSION,
+            supported: CURRENT_SCHEMA_VERSION,
         });
     }
 
@@ -913,23 +1005,15 @@ fn inspect_database(connection: &Connection) -> Result<DatabaseOwnership, Regist
             detail: "owned database has an empty schema".to_owned(),
         });
     }
-    match version {
-        V1_SCHEMA_VERSION => Ok(DatabaseOwnership::OwnedV1),
-        CURRENT_SCHEMA_VERSION => Ok(DatabaseOwnership::OwnedV2),
-        actual => Err(RegistryError::DamagedSchema {
-            detail: format!("owned database has unsupported schema version {actual}"),
-        }),
-    }
+    Ok(DatabaseOwnership::Current)
 }
 
 fn validate_owned_database(connection: &Connection) -> Result<(), RegistryError> {
     match inspect_database(connection)? {
-        DatabaseOwnership::OwnedV2 => validate_schema_shape(connection, SchemaVersion::V2),
-        DatabaseOwnership::Fresh | DatabaseOwnership::OwnedV1 => {
-            Err(RegistryError::DamagedSchema {
-                detail: "registry schema is not at the current version".to_owned(),
-            })
-        }
+        DatabaseOwnership::Current => validate_schema_shape(connection),
+        DatabaseOwnership::Fresh => Err(RegistryError::DamagedSchema {
+            detail: "registry schema is not initialized".to_owned(),
+        }),
     }
 }
 
@@ -946,21 +1030,14 @@ fn database_is_empty(connection: &Connection) -> Result<bool, RegistryError> {
     Ok(has_user_objects == 0)
 }
 
-fn validate_schema_shape(
-    connection: &Connection,
-    version: SchemaVersion,
-) -> Result<(), RegistryError> {
+fn validate_schema_shape(connection: &Connection) -> Result<(), RegistryError> {
     let table_sql = bounded_schema_sql(connection, "table", "locations", "locations table")?;
     let Some(table_sql) = table_sql else {
         return Err(RegistryError::DamagedSchema {
             detail: "required locations table is missing".to_owned(),
         });
     };
-    let expected_table_sql = match version {
-        SchemaVersion::V1 => EXPECTED_LOCATIONS_TABLE_V1_SQL,
-        SchemaVersion::V2 => EXPECTED_LOCATIONS_TABLE_V2_SQL,
-    };
-    if !schema_sql_matches(&table_sql, expected_table_sql) {
+    if !schema_sql_matches(&table_sql, EXPECTED_LOCATIONS_TABLE_V2_SQL) {
         return Err(RegistryError::DamagedSchema {
             detail: "locations table SQL definition does not match the expected policy".to_owned(),
         });
@@ -976,10 +1053,7 @@ fn validate_schema_shape(
             row.get::<_, i64>(5)?,
         ))
     })?;
-    let expected_columns = match version {
-        SchemaVersion::V1 => EXPECTED_LOCATION_COLUMNS_V1.as_slice(),
-        SchemaVersion::V2 => EXPECTED_LOCATION_COLUMNS_V2.as_slice(),
-    };
+    let expected_columns = EXPECTED_LOCATION_COLUMNS_V2.as_slice();
     let columns_match = columns.len() == expected_columns.len()
         && columns.iter().zip(expected_columns).all(
             |(
@@ -1058,7 +1132,7 @@ fn bounded_schema_sql(
     let Some(length) = length else {
         return Ok(None);
     };
-    let actual = usize::try_from(length).map_or(usize::MAX, |value| value);
+    let actual = usize::try_from(length).unwrap_or(usize::MAX);
     if actual > MAX_SCHEMA_SQL_BYTES {
         return Err(RegistryError::SchemaSqlTooLarge {
             object,
@@ -1180,18 +1254,6 @@ fn migrate_fresh(connection: &mut Connection) -> Result<(), RegistryError> {
          );
          CREATE INDEX locations_state_name_idx
              ON locations(state, display_name COLLATE NOCASE);",
-    )?;
-    transaction.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)?;
-    transaction.commit()?;
-    Ok(())
-}
-
-fn migrate_v1_to_v2(connection: &mut Connection) -> Result<(), RegistryError> {
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    transaction.execute(
-        "ALTER TABLE locations
-         ADD COLUMN revision INTEGER NOT NULL DEFAULT 1 CHECK(revision >= 1)",
-        [],
     )?;
     transaction.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)?;
     transaction.commit()?;
@@ -1340,7 +1402,7 @@ fn validate_location_id_length(length: i64) -> Result<(), RegistryError> {
     if length == LOCATION_ID_BYTES_I64 {
         Ok(())
     } else {
-        let actual = usize::try_from(length).map_or(usize::MAX, |value| value);
+        let actual = usize::try_from(length).unwrap_or(usize::MAX);
         Err(RegistryError::PersistedFieldLengthInvalid {
             field: "location_id",
             actual,
@@ -1354,7 +1416,7 @@ fn validate_persisted_length(
     length: i64,
     maximum: usize,
 ) -> Result<(), RegistryError> {
-    let actual = usize::try_from(length).map_or(usize::MAX, |value| value);
+    let actual = usize::try_from(length).unwrap_or(usize::MAX);
     if actual > maximum {
         Err(RegistryError::PersistedFieldTooLarge {
             field,
@@ -1462,8 +1524,8 @@ pub enum RegistryError {
         actual: String,
         expected: &'static str,
     },
-    #[error("registry schema version {actual} is newer than supported version {maximum_supported}")]
-    UnsupportedSchemaVersion { actual: i64, maximum_supported: i64 },
+    #[error("registry schema version {actual} is unsupported; supported version is {supported}")]
+    UnsupportedSchemaVersion { actual: i64, supported: i64 },
     #[error("Location root is already registered as {existing_id}")]
     LocationAlreadyRegistered { existing_id: LocationId },
     #[error("Location identity already exists: {0}")]
@@ -1480,6 +1542,32 @@ pub enum RegistryError {
     RevisionOverflow {
         id: LocationId,
         current: LocationRevision,
+    },
+    #[error("Location update time for {id} regressed: minimum {minimum:?}, observed {observed:?}")]
+    LocationTimestampRegression {
+        id: LocationId,
+        minimum: TimestampMillis,
+        observed: TimestampMillis,
+    },
+    #[error("Location root changed for {id}; expected root is stale")]
+    LocationRootConflict { id: LocationId },
+    #[error("Location root is unchanged for {id}")]
+    LocationRootUnchanged { id: LocationId },
+    #[error("Location state commit for {id} requires durable readback")]
+    LocationStateCommittedUnconfirmed {
+        id: LocationId,
+        expected_revision: LocationRevision,
+        desired_state: LocationState,
+        #[source]
+        source: Box<RegistryError>,
+    },
+    #[error("Location root commit for {id} requires durable readback")]
+    LocationRootCommittedUnconfirmed {
+        id: LocationId,
+        expected_revision: LocationRevision,
+        new_root: LocationRoot,
+        #[source]
+        source: Box<RegistryError>,
     },
     #[error("corrupt registry field {field}: {detail}")]
     CorruptRecord { field: &'static str, detail: String },
@@ -1868,6 +1956,52 @@ mod tests {
     }
 
     #[test]
+    fn open_existing_never_creates_missing_or_fresh_registry_and_opens_owned_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = unique_test_root("open-existing")?;
+        let missing_parent_database = root.join("missing-parent").join("registry.sqlite3");
+        assert!(matches!(
+            GlobalRegistry::open_existing(&missing_parent_database),
+            Err(RegistryError::DatabaseParentMetadata { .. })
+        ));
+        assert!(!root.exists());
+
+        fs::create_dir_all(&root)?;
+        let missing_database = root.join("missing.sqlite3");
+        assert!(matches!(
+            GlobalRegistry::open_existing(&missing_database),
+            Err(RegistryError::DatabasePathInvariant { detail, .. })
+                if detail == "existing Registry database is missing"
+        ));
+        assert!(!missing_database.exists());
+
+        let fresh_database = root.join("fresh.sqlite3");
+        fs::write(&fresh_database, [])?;
+        assert!(matches!(
+            GlobalRegistry::open_existing(&fresh_database),
+            Err(RegistryError::UnownedDatabase)
+        ));
+        assert_eq!(fs::metadata(&fresh_database)?.len(), 0);
+
+        let owned_database = root.join("owned.sqlite3");
+        let workspace = root.join("owned-workspace");
+        fs::create_dir_all(&workspace)?;
+        let mut created = GlobalRegistry::open(&owned_database)?;
+        created.register_location(&command(location_id(901), "owned", workspace, 1)?)?;
+        drop(created);
+
+        let reopened = GlobalRegistry::open_existing(&owned_database)?;
+        assert_eq!(
+            reopened.list_locations(LocationListLimit::DEFAULT)?.len(),
+            1
+        );
+        assert_eq!(reopened.health()?.schema_version(), CURRENT_SCHEMA_VERSION);
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
     fn mismatched_application_id_fails_without_mutating_database()
     -> Result<(), Box<dyn std::error::Error>> {
         let root = unique_test_root("wrong-app")?;
@@ -1906,7 +2040,7 @@ mod tests {
             GlobalRegistry::open(&database),
             Err(RegistryError::UnsupportedSchemaVersion {
                 actual: 99,
-                maximum_supported: 2
+                supported: 2
             })
         ));
         fs::remove_dir_all(root)?;
@@ -2235,55 +2369,31 @@ mod tests {
     }
 
     #[test]
-    fn exact_v1_fixture_migrates_once_and_preserves_location_data()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let root = unique_test_root("v1-migration")?;
+    fn outdated_schema_is_rejected_without_mutation() -> Result<(), Box<dyn std::error::Error>> {
+        let root = unique_test_root("v1-rejected")?;
         fs::create_dir_all(&root)?;
         let database = root.join("registry.sqlite3");
-        let native_root = root.join(std::ffi::OsString::from_vec(b"native-\xFF".to_vec()));
-        let id = location_id(80);
         create_owned_schema_v1(&database)?;
+        let before = fs::read(&database)?;
+
+        assert!(matches!(
+            GlobalRegistry::open(&database),
+            Err(RegistryError::UnsupportedSchemaVersion {
+                actual: 1,
+                supported: 2
+            })
+        ));
+        assert!(matches!(
+            GlobalRegistry::inspect_existing_read_only(&database),
+            Err(RegistryError::UnsupportedSchemaVersion {
+                actual: 1,
+                supported: 2
+            })
+        ));
+        assert_eq!(fs::read(&database)?, before);
         let connection = Connection::open(&database)?;
-        let id_bytes = id.into_uuid().into_bytes();
-        connection.execute(
-            "INSERT INTO locations
-                (location_id, display_name, root_path, state, created_at_ms, updated_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                id_bytes.as_slice(),
-                "Migrated",
-                native_root.as_os_str().as_bytes(),
-                0_i64,
-                10_i64,
-                11_i64,
-            ],
-        )?;
-        drop(connection);
-
-        let registry = GlobalRegistry::open(&database)?;
-        let locations = registry.list_locations(LocationListLimit::DEFAULT)?;
-        let location = &locations[0];
-        assert_eq!(location.id(), id);
-        assert_eq!(location.name().as_str(), "Migrated");
-        assert_eq!(
-            location.root().as_path().as_os_str().as_bytes(),
-            native_root.as_os_str().as_bytes()
-        );
-        assert_eq!(location.state(), LocationState::Disabled);
-        assert_eq!(location.created_at().get(), 10);
-        assert_eq!(location.updated_at().get(), 11);
-        assert_eq!(location.revision(), LocationRevision::INITIAL);
-        let version: i64 = registry
-            .connection
-            .pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 2);
-        drop(registry);
-
-        let reopened = GlobalRegistry::open(&database)?;
-        assert_eq!(
-            reopened.list_locations(LocationListLimit::DEFAULT)?[0].revision(),
-            LocationRevision::INITIAL
-        );
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        assert_eq!(version, 1);
         fs::remove_dir_all(root)?;
         Ok(())
     }
@@ -2309,6 +2419,231 @@ mod tests {
         );
         let missing_id = location_id(83);
         assert!(registry.get_location(missing_id)?.is_none());
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn relocate_location_root_preserves_location_identity_and_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = unique_test_root("location-relocation")?;
+        let old_root = root.join("old-root");
+        let new_root_path = root.join("new-root");
+        fs::create_dir_all(&old_root)?;
+        fs::create_dir_all(&new_root_path)?;
+        let database = root.join("registry.sqlite3");
+        let id = location_id(84);
+        let mut registry = GlobalRegistry::open(&database)?;
+        let registered = registry.register_location(&command(id, "Relocate", old_root, 10)?)?;
+        let disabled = registry.set_location_state(&SetLocationState::new(
+            id,
+            registered.revision(),
+            LocationState::Disabled,
+            TimestampMillis::new(20)?,
+        ))?;
+
+        let new_root = LocationRoot::from_canonical(new_root_path.clone())?;
+        let relocated = registry.relocate_location_root(
+            id,
+            disabled.revision(),
+            disabled.root(),
+            &new_root,
+            TimestampMillis::new(30)?,
+        )?;
+
+        assert_eq!(relocated.id(), disabled.id());
+        assert_eq!(relocated.name(), disabled.name());
+        assert_eq!(relocated.root(), &new_root);
+        assert_eq!(relocated.state(), LocationState::Disabled);
+        assert_eq!(relocated.created_at().get(), 10);
+        assert_eq!(relocated.updated_at().get(), 30);
+        assert_eq!(relocated.revision().get(), disabled.revision().get() + 1);
+        assert_eq!(registry.get_location(id)?, Some(relocated));
+
+        drop(registry);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn relocate_location_root_rejects_timestamp_regression_without_mutation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = unique_test_root("location-relocation-time-regression")?;
+        let old_root = root.join("old-root");
+        let new_root_path = root.join("new-root");
+        fs::create_dir_all(&old_root)?;
+        fs::create_dir_all(&new_root_path)?;
+        let database = root.join("registry.sqlite3");
+        let id = location_id(89);
+        let mut registry = GlobalRegistry::open(&database)?;
+        let registered = registry.register_location(&command(id, "Time", old_root, 10)?)?;
+        let current = registry.set_location_state(&SetLocationState::new(
+            id,
+            registered.revision(),
+            LocationState::Disabled,
+            TimestampMillis::new(20)?,
+        ))?;
+        let new_root = LocationRoot::from_canonical(new_root_path)?;
+
+        assert!(matches!(
+            registry.relocate_location_root(
+                id,
+                current.revision(),
+                current.root(),
+                &new_root,
+                TimestampMillis::new(19)?,
+            ),
+            Err(RegistryError::LocationTimestampRegression {
+                id: conflict_id,
+                minimum,
+                observed,
+            }) if conflict_id == id && minimum.get() == 20 && observed.get() == 19
+        ));
+        assert_eq!(registry.get_location(id)?, Some(current));
+
+        drop(registry);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn relocate_location_root_rejects_stale_revision_without_mutation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = unique_test_root("location-relocation-stale")?;
+        let old_root_path = root.join("old-root");
+        let first_new_root_path = root.join("first-new-root");
+        let stale_new_root_path = root.join("stale-new-root");
+        fs::create_dir_all(&old_root_path)?;
+        fs::create_dir_all(&first_new_root_path)?;
+        fs::create_dir_all(&stale_new_root_path)?;
+        let database = root.join("registry.sqlite3");
+        let id = location_id(85);
+        let mut first = GlobalRegistry::open(&database)?;
+        let original = first.register_location(&command(id, "Stale", old_root_path, 1)?)?;
+        let mut second = GlobalRegistry::open(&database)?;
+        let second_snapshot = second
+            .get_location(id)?
+            .ok_or("registered Location was not returned")?;
+        let first_new_root = LocationRoot::from_canonical(first_new_root_path.clone())?;
+        let relocated = first.relocate_location_root(
+            id,
+            original.revision(),
+            original.root(),
+            &first_new_root,
+            TimestampMillis::new(2)?,
+        )?;
+        let stale_new_root = LocationRoot::from_canonical(stale_new_root_path)?;
+
+        assert!(matches!(
+            second.relocate_location_root(
+                id,
+                second_snapshot.revision(),
+                second_snapshot.root(),
+                &stale_new_root,
+                TimestampMillis::new(3)?,
+            ),
+            Err(RegistryError::RevisionConflict {
+                id: conflict_id,
+                expected,
+                actual,
+            }) if conflict_id == id
+                && expected == LocationRevision::INITIAL
+                && actual == relocated.revision()
+        ));
+        assert_eq!(second.get_location(id)?, Some(relocated));
+
+        drop(first);
+        drop(second);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn relocate_location_root_rejects_wrong_old_root_without_mutation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = unique_test_root("location-relocation-wrong-old")?;
+        let old_root_path = root.join("old-root");
+        let wrong_old_root_path = root.join("wrong-old-root");
+        let new_root_path = root.join("new-root");
+        fs::create_dir_all(&old_root_path)?;
+        fs::create_dir_all(&wrong_old_root_path)?;
+        fs::create_dir_all(&new_root_path)?;
+        let database = root.join("registry.sqlite3");
+        let id = location_id(86);
+        let mut registry = GlobalRegistry::open(&database)?;
+        let original = registry.register_location(&command(id, "Wrong old", old_root_path, 1)?)?;
+        let wrong_old_root = LocationRoot::from_canonical(wrong_old_root_path)?;
+        let new_root = LocationRoot::from_canonical(new_root_path)?;
+
+        assert!(matches!(
+            registry.relocate_location_root(
+                id,
+                original.revision(),
+                &wrong_old_root,
+                &new_root,
+                TimestampMillis::new(2)?,
+            ),
+            Err(RegistryError::LocationRootConflict { id: conflict_id })
+                if conflict_id == id
+        ));
+        assert_eq!(registry.get_location(id)?, Some(original));
+
+        drop(registry);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn relocate_location_root_rejects_duplicate_and_unchanged_roots()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = unique_test_root("location-relocation-root-conflicts")?;
+        let first_root_path = root.join("first-root");
+        let second_root_path = root.join("second-root");
+        fs::create_dir_all(&first_root_path)?;
+        fs::create_dir_all(&second_root_path)?;
+        let database = root.join("registry.sqlite3");
+        let first_id = location_id(87);
+        let second_id = location_id(88);
+        let mut registry = GlobalRegistry::open(&database)?;
+        let first = registry.register_location(&command(
+            first_id,
+            "First root",
+            first_root_path.clone(),
+            1,
+        )?)?;
+        let second = registry.register_location(&command(
+            second_id,
+            "Second root",
+            second_root_path.clone(),
+            1,
+        )?)?;
+        let second_root = LocationRoot::from_canonical(second_root_path)?;
+
+        assert!(matches!(
+            registry.relocate_location_root(
+                first_id,
+                first.revision(),
+                first.root(),
+                &second_root,
+                TimestampMillis::new(2)?,
+            ),
+            Err(RegistryError::LocationAlreadyRegistered { existing_id })
+                if existing_id == second_id
+        ));
+        assert!(matches!(
+            registry.relocate_location_root(
+                first_id,
+                first.revision(),
+                first.root(),
+                first.root(),
+                TimestampMillis::new(2)?,
+            ),
+            Err(RegistryError::LocationRootUnchanged { id }) if id == first_id
+        ));
+        assert_eq!(registry.get_location(first_id)?, Some(first));
+        assert_eq!(registry.get_location(second_id)?, Some(second));
+
+        drop(registry);
         fs::remove_dir_all(root)?;
         Ok(())
     }
@@ -2368,6 +2703,94 @@ mod tests {
         assert_eq!(same_state.state(), LocationState::Disabled);
         assert_eq!(same_state.updated_at().get(), 2);
         assert_eq!(same_state.revision().get(), 3);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn location_state_sqlite_commit_failure_preserves_unknown_outcome()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = unique_test_root("location-state-commit-unknown")?;
+        let mut registry = create_registry_with_location(&root, "commit-unknown")?;
+        registry.connection.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             CREATE TEMP TABLE location_commit_guard_parent (
+                 id INTEGER PRIMARY KEY
+             );
+             CREATE TEMP TABLE location_commit_guard_child (
+                 parent_id INTEGER REFERENCES location_commit_guard_parent(id)
+                     DEFERRABLE INITIALLY DEFERRED
+             );
+             CREATE TEMP TRIGGER location_commit_guard
+             AFTER UPDATE ON locations
+             BEGIN
+                 INSERT INTO location_commit_guard_child(parent_id) VALUES (99);
+             END;",
+        )?;
+        let location = registry.list_locations(LocationListLimit::DEFAULT)?[0].clone();
+        let outcome = registry.set_location_state(&SetLocationState::new(
+            location.id(),
+            location.revision(),
+            LocationState::Disabled,
+            TimestampMillis::new(2)?,
+        ));
+        match outcome {
+            Err(RegistryError::LocationStateCommittedUnconfirmed {
+                id,
+                expected_revision,
+                desired_state,
+                source,
+            }) => {
+                assert_eq!(id, location.id());
+                assert_eq!(expected_revision, location.revision());
+                assert_eq!(desired_state, LocationState::Disabled);
+                assert!(matches!(source.as_ref(), RegistryError::Sqlite(_)));
+            }
+            other => return Err(format!("unexpected Location state outcome: {other:?}").into()),
+        }
+        let unchanged = registry.list_locations(LocationListLimit::DEFAULT)?[0].clone();
+        assert_eq!(unchanged.state(), LocationState::Enabled);
+        assert_eq!(unchanged.revision(), location.revision());
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn location_state_post_commit_binding_failure_requires_reopen_readback()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = unique_test_root("location-state-post-commit-binding")?;
+        let mut registry = create_registry_with_location(&root, "post-commit-binding")?;
+        let location = registry.list_locations(LocationListLimit::DEFAULT)?[0].clone();
+        let marker = location.root().as_path().join("preserved");
+        fs::write(&marker, b"preserved")?;
+        let original_identity = registry.database_identity;
+        let outcome = registry.set_location_state_with_hook(
+            &SetLocationState::new(
+                location.id(),
+                location.revision(),
+                LocationState::Disabled,
+                TimestampMillis::new(2)?,
+            ),
+            |registry| registry.database_identity.inode ^= 1,
+        );
+        assert!(matches!(
+            outcome,
+            Err(RegistryError::LocationStateCommittedUnconfirmed {
+                id,
+                expected_revision,
+                desired_state: LocationState::Disabled,
+                source,
+            }) if id == location.id()
+                && expected_revision == location.revision()
+                && matches!(source.as_ref(), RegistryError::DatabasePathChanged(_))
+        ));
+        registry.database_identity = original_identity;
+        let readback = registry.list_locations(LocationListLimit::DEFAULT)?[0].clone();
+        assert_eq!(readback.id(), location.id());
+        assert_eq!(readback.state(), LocationState::Disabled);
+        assert_eq!(readback.revision().get(), location.revision().get() + 1);
+        assert_eq!(readback.updated_at().get(), 2);
+        assert_eq!(fs::read(&marker)?, b"preserved");
         fs::remove_dir_all(root)?;
         Ok(())
     }
@@ -2655,7 +3078,7 @@ mod tests {
              ON locations(state, display_name COLLATE NOCASE)",
             [],
         )?;
-        connection.pragma_update(None, "user_version", 1_i64)?;
+        connection.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)?;
         Ok(())
     }
 
@@ -2670,7 +3093,10 @@ mod tests {
                 created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0),
                 updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= 0)
              );",
-        )
+        )?;
+        let connection = Connection::open(database)?;
+        connection.pragma_update(None, "user_version", 1_i64)?;
+        Ok(())
     }
 
     fn location_id(value: u128) -> LocationId {

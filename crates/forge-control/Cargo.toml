@@ -12,10 +12,15 @@ forge-domain = { path = "../forge-domain" }
 forge-execution = { path = "../forge-execution" }
 forge-persistence = { path = "../forge-persistence" }
 forge-workspace = { path = "../forge-workspace" }
+heterarchy-orchestration-policy.workspace = true
 getrandom.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+rusqlite.workspace = true
 
 [lints]
 workspace = true

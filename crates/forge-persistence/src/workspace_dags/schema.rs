@@ -1,6 +1,6 @@
-//! Canonical `SQLite` schema, migration, and exact-shape validation for Goal DAG persistence.
+//! Canonical `SQLite` schema creation and exact-shape validation for Goal DAG persistence.
 
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use super::DagStoreError;
 
@@ -48,17 +48,6 @@ pub(super) fn create_schema(connection: &Connection) -> Result<(), DagStoreError
     for (_, _, sql) in OBJECTS {
         connection.execute_batch(sql)?;
     }
-    Ok(())
-}
-
-pub(super) fn migrate_v9_to_v10(
-    connection: &mut Connection,
-    next_schema_version: i64,
-) -> Result<(), DagStoreError> {
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    create_schema(&transaction)?;
-    transaction.pragma_update(None, "user_version", next_schema_version)?;
-    transaction.commit()?;
     Ok(())
 }
 

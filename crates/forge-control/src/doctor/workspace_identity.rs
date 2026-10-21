@@ -343,7 +343,10 @@ mod tests {
     fn bounded_worker_round_trips_workspace_identity_doctor()
     -> Result<(), Box<dyn std::error::Error>> {
         let fixture = fixture("worker-round-trip")?;
-        let control = ForgeControl::from_location_service(fixture.locations);
+        let control = ForgeControl::from_location_service(
+            fixture.locations,
+            fixture.root.join("agent-sessions.sqlite3"),
+        );
         let (client, mut worker) = control.start_worker()?;
 
         let report = client.workspace_identity_doctor()?;
@@ -376,7 +379,10 @@ mod tests {
             second.id(),
             WorkspaceId::from_uuid(Uuid::from_u128(0xA201)),
         )?;
-        let control = ForgeControl::from_location_service(fixture.locations);
+        let control = ForgeControl::from_location_service(
+            fixture.locations,
+            fixture.root.join("agent-sessions.sqlite3"),
+        );
 
         let report = control.workspace_identity_doctor()?;
         assert_eq!(report.outcome(), WorkspaceIdentityDoctorOutcome::Healthy);
@@ -401,7 +407,10 @@ mod tests {
         let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(0xB200));
         let store = establish_workspace(&workspace_root, parent.id(), workspace_id)?;
         let nested = register_location(&mut fixture, 0xB101, &workspace_root)?;
-        let control = ForgeControl::from_location_service(fixture.locations);
+        let control = ForgeControl::from_location_service(
+            fixture.locations,
+            fixture.root.join("agent-sessions.sqlite3"),
+        );
 
         let report = control.workspace_identity_doctor()?;
         assert_eq!(report.outcome(), WorkspaceIdentityDoctorOutcome::Damaged);
@@ -433,7 +442,10 @@ mod tests {
         let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(0xB400));
         let first_store = establish_workspace(&root.join("first"), location.id(), workspace_id)?;
         let second_store = establish_workspace(&root.join("second"), location.id(), workspace_id)?;
-        let control = ForgeControl::from_location_service(fixture.locations);
+        let control = ForgeControl::from_location_service(
+            fixture.locations,
+            fixture.root.join("agent-sessions.sqlite3"),
+        );
 
         let report = control.workspace_identity_doctor()?;
         assert_eq!(report.outcome(), WorkspaceIdentityDoctorOutcome::Damaged);
@@ -465,7 +477,10 @@ mod tests {
                 timestamp(2)?,
             ))?;
         assert_eq!(disabled.state(), LocationState::Disabled);
-        let control = ForgeControl::from_location_service(fixture.locations);
+        let control = ForgeControl::from_location_service(
+            fixture.locations,
+            fixture.root.join("agent-sessions.sqlite3"),
+        );
 
         let report = control.workspace_identity_doctor()?;
         assert_eq!(report.outcome(), WorkspaceIdentityDoctorOutcome::Incomplete);
@@ -486,7 +501,10 @@ mod tests {
             let root = fixture.root.join(format!("location-{offset}"));
             let _ = register_location(&mut fixture, 0xD100 + seed, &root)?;
         }
-        let control = ForgeControl::from_location_service(fixture.locations);
+        let control = ForgeControl::from_location_service(
+            fixture.locations,
+            fixture.root.join("agent-sessions.sqlite3"),
+        );
 
         let report = control.workspace_identity_doctor()?;
         assert_eq!(report.outcome(), WorkspaceIdentityDoctorOutcome::Incomplete);

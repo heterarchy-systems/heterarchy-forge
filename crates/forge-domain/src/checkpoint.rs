@@ -143,7 +143,7 @@ impl FromStr for GitObjectId {
             return Err(GitObjectIdParseError::UnsupportedFormat);
         };
         let mut decoded = [0_u8; SHA1_BYTES];
-        for (index, pair) in hex.as_bytes().chunks_exact(2).enumerate() {
+        for (index, pair) in hex.as_bytes().as_chunks::<2>().0.iter().enumerate() {
             decoded[index] = (decode_lower_hex(pair[0])? << 4) | decode_lower_hex(pair[1])?;
         }
         Ok(Self(decoded))

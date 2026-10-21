@@ -4,20 +4,21 @@ use std::path::{Path, PathBuf};
 
 use forge_domain::{
     AbandonDiffEvidence, ActivityId, BeginDiffEvidence, BeginDiffPurge, BeginFileMutation,
-    ChangeSetId, ChangeSetState, CompleteDiffEvidence, CompleteDiffPurge,
-    DiffArtifactInventoryName, DiffArtifactRelativePath, DiffAttribution, DiffByteCount,
-    DiffChangeKind, DiffContractVersions, DiffEvidenceState, DiffEvidenceTimestamps,
-    DiffFileSummary, DiffId, DiffLineCount, DiffListLimit, DiffPayloadHash, DiffPayloadProjection,
+    ChangeSetId, CompleteDiffEvidence, CompleteDiffPurge, DiffArtifactInventoryName,
+    DiffArtifactRelativePath, DiffAttribution, DiffByteCount, DiffChangeKind, DiffContractVersions,
+    DiffEntrySubject, DiffEntrySummary, DiffEvidenceState, DiffEvidenceTimestamps, DiffId,
+    DiffLineCount, DiffListLimit, DiffOrigin, DiffPayloadHash, DiffPayloadProjection,
     DiffPurgeRecord, DiffPurgeStatus, DiffRedactionPolicyVersion, DiffRenderKind,
     DiffRendererVersion, DiffRetentionKeepCount, DiffRetentionPlanLimit, DiffRevision,
-    FileMutationId, RegisteredDiffEvidence, TimestampMillis, WorkspaceId, WorkspaceRelativePath,
+    FileMutationId, RegisteredDiffEvidence, TimestampMillis, TreeChangeSetIntent, WorkspaceId,
+    WorkspaceRelativePath,
 };
-use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub(crate) const EXPECTED_DIFF_EVIDENCE_TABLE_SQL: &str = "CREATE TABLE diff_evidence (diff_id BLOB PRIMARY KEY NOT NULL CHECK(length(diff_id) = 16), changeset_id BLOB NOT NULL UNIQUE REFERENCES change_sets(changeset_id), workspace_id BLOB NOT NULL REFERENCES workspace(workspace_id), activity_id BLOB NOT NULL REFERENCES activities(activity_id), mutation_id BLOB NOT NULL UNIQUE REFERENCES file_mutations(mutation_id), state INTEGER NOT NULL CHECK(state IN (0, 1, 2, 3, 4, 5)), render_kind INTEGER NOT NULL CHECK(render_kind IN (0, 1, 2)), pending_relative_path BLOB CHECK(pending_relative_path IS NULL OR length(pending_relative_path) BETWEEN 1 AND 4096), artifact_relative_path BLOB CHECK(artifact_relative_path IS NULL OR length(artifact_relative_path) BETWEEN 1 AND 4096), compressed_hash BLOB CHECK(compressed_hash IS NULL OR length(compressed_hash) = 32), uncompressed_hash BLOB CHECK(uncompressed_hash IS NULL OR length(uncompressed_hash) = 32), compressed_size INTEGER CHECK(compressed_size IS NULL OR compressed_size >= 0), uncompressed_size INTEGER CHECK(uncompressed_size IS NULL OR uncompressed_size >= 0), renderer_version INTEGER NOT NULL CHECK(renderer_version >= 1), redaction_policy_version INTEGER NOT NULL CHECK(redaction_policy_version >= 1), created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0), updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= 0), revision INTEGER NOT NULL CHECK(revision >= 1), CHECK((state = 0 AND render_kind = 0 AND pending_relative_path IS NOT NULL AND artifact_relative_path IS NOT NULL AND compressed_hash IS NOT NULL AND uncompressed_hash IS NOT NULL AND compressed_size IS NOT NULL AND uncompressed_size IS NOT NULL) OR (state = 0 AND render_kind IN (1, 2) AND pending_relative_path IS NULL AND artifact_relative_path IS NULL AND compressed_hash IS NULL AND uncompressed_hash IS NULL AND compressed_size IS NULL AND uncompressed_size IS NULL) OR (state IN (1, 4) AND render_kind = 0 AND pending_relative_path IS NULL AND artifact_relative_path IS NOT NULL AND compressed_hash IS NOT NULL AND uncompressed_hash IS NOT NULL AND compressed_size IS NOT NULL AND uncompressed_size IS NOT NULL) OR (state = 2 AND render_kind IN (1, 2) AND pending_relative_path IS NULL AND artifact_relative_path IS NULL AND compressed_hash IS NULL AND uncompressed_hash IS NULL AND compressed_size IS NULL AND uncompressed_size IS NULL) OR (state IN (3, 5) AND pending_relative_path IS NULL AND artifact_relative_path IS NULL AND compressed_hash IS NULL AND uncompressed_hash IS NULL AND compressed_size IS NULL AND uncompressed_size IS NULL)))";
-pub(crate) const EXPECTED_DIFF_FILES_TABLE_SQL: &str = "CREATE TABLE diff_files (diff_id BLOB PRIMARY KEY NOT NULL REFERENCES diff_evidence(diff_id), ordinal INTEGER NOT NULL CHECK(ordinal = 0), relative_path BLOB NOT NULL CHECK(length(relative_path) BETWEEN 1 AND 4096), kind INTEGER NOT NULL CHECK(kind IN (0, 1, 2)), additions INTEGER NOT NULL CHECK(additions >= 0), deletions INTEGER NOT NULL CHECK(deletions >= 0))";
+pub(crate) const EXPECTED_DIFF_EVIDENCE_TABLE_SQL: &str = "CREATE TABLE diff_evidence (diff_id BLOB PRIMARY KEY NOT NULL CHECK(length(diff_id) = 16), changeset_id BLOB NOT NULL UNIQUE REFERENCES change_sets(changeset_id), workspace_id BLOB NOT NULL REFERENCES workspace(workspace_id), activity_id BLOB NOT NULL REFERENCES activities(activity_id), origin_kind INTEGER NOT NULL CHECK(origin_kind IN (0, 1)), mutation_id BLOB UNIQUE REFERENCES file_mutations(mutation_id) CHECK(mutation_id IS NULL OR length(mutation_id) = 16), state INTEGER NOT NULL CHECK(state IN (0, 1, 2, 3, 4, 5)), render_kind INTEGER NOT NULL CHECK(render_kind IN (0, 1, 2, 3)), pending_relative_path BLOB CHECK(pending_relative_path IS NULL OR length(pending_relative_path) BETWEEN 1 AND 4096), artifact_relative_path BLOB CHECK(artifact_relative_path IS NULL OR length(artifact_relative_path) BETWEEN 1 AND 4096), compressed_hash BLOB CHECK(compressed_hash IS NULL OR length(compressed_hash) = 32), uncompressed_hash BLOB CHECK(uncompressed_hash IS NULL OR length(uncompressed_hash) = 32), compressed_size INTEGER CHECK(compressed_size IS NULL OR compressed_size >= 0), uncompressed_size INTEGER CHECK(uncompressed_size IS NULL OR uncompressed_size >= 0), renderer_version INTEGER NOT NULL CHECK(renderer_version >= 1), redaction_policy_version INTEGER NOT NULL CHECK(redaction_policy_version >= 1), created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0), updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= 0), revision INTEGER NOT NULL CHECK(revision >= 1), CHECK((origin_kind = 0 AND mutation_id IS NOT NULL) OR (origin_kind = 1 AND mutation_id IS NULL)), CHECK((state = 0 AND render_kind = 0 AND pending_relative_path IS NOT NULL AND artifact_relative_path IS NOT NULL AND compressed_hash IS NOT NULL AND uncompressed_hash IS NOT NULL AND compressed_size IS NOT NULL AND uncompressed_size IS NOT NULL) OR (state = 0 AND render_kind IN (1, 2, 3) AND pending_relative_path IS NULL AND artifact_relative_path IS NULL AND compressed_hash IS NULL AND uncompressed_hash IS NULL AND compressed_size IS NULL AND uncompressed_size IS NULL) OR (state IN (1, 4) AND render_kind = 0 AND pending_relative_path IS NULL AND artifact_relative_path IS NOT NULL AND compressed_hash IS NOT NULL AND uncompressed_hash IS NOT NULL AND compressed_size IS NOT NULL AND uncompressed_size IS NOT NULL) OR (state = 2 AND render_kind IN (1, 2, 3) AND pending_relative_path IS NULL AND artifact_relative_path IS NULL AND compressed_hash IS NULL AND uncompressed_hash IS NULL AND compressed_size IS NULL AND uncompressed_size IS NULL) OR (state IN (3, 5) AND pending_relative_path IS NULL AND artifact_relative_path IS NULL AND compressed_hash IS NULL AND uncompressed_hash IS NULL AND compressed_size IS NULL AND uncompressed_size IS NULL)))";
+pub(crate) const EXPECTED_DIFF_ENTRIES_TABLE_SQL: &str = "CREATE TABLE diff_entries (diff_id BLOB NOT NULL REFERENCES diff_evidence(diff_id), ordinal INTEGER NOT NULL CHECK(ordinal BETWEEN 0 AND 255), subject_kind INTEGER NOT NULL CHECK(subject_kind IN (0, 1)), primary_path BLOB NOT NULL CHECK(length(primary_path) BETWEEN 1 AND 4096), secondary_path BLOB CHECK(secondary_path IS NULL OR length(secondary_path) BETWEEN 1 AND 4096), kind INTEGER NOT NULL CHECK(kind IN (0, 1, 2, 3)), additions INTEGER NOT NULL CHECK(additions >= 0), deletions INTEGER NOT NULL CHECK(deletions >= 0), PRIMARY KEY(diff_id, ordinal), CHECK((kind = 3 AND secondary_path IS NOT NULL) OR (kind IN (0, 1, 2) AND secondary_path IS NULL)))";
 pub(crate) const EXPECTED_DIFF_ACTIVITY_INDEX_SQL: &str = "CREATE INDEX diff_evidence_activity_created_idx ON diff_evidence(activity_id, created_at_ms DESC, diff_id DESC)";
 pub(crate) const EXPECTED_DIFF_STATE_INDEX_SQL: &str =
     "CREATE INDEX diff_evidence_state_updated_idx ON diff_evidence(state, updated_at_ms, diff_id)";
@@ -52,7 +53,7 @@ impl DiffDoctorReport {
         }
     }
 
-    /// Durable Diff/legacy references in deterministic `DiffId` order.
+    /// Durable Diff references in deterministic `DiffId` order.
     pub fn references(&self) -> &[DiffDoctorReference] {
         &self.references
     }
@@ -64,12 +65,13 @@ impl DiffDoctorReport {
     }
 }
 
-/// One current durable Diff row or one migrated legacy `ChangeSet` identity.
+/// One current durable Diff row.
 #[must_use]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiffDoctorReference {
     diff_id: DiffId,
-    lifecycle: DiffDoctorLifecycle,
+    state: DiffEvidenceState,
+    render_kind: DiffRenderKind,
     pending_artifact: Option<DiffDoctorArtifactReference>,
     final_artifact: Option<DiffDoctorArtifactReference>,
 }
@@ -79,8 +81,12 @@ impl DiffDoctorReference {
         self.diff_id
     }
 
-    pub const fn lifecycle(&self) -> &DiffDoctorLifecycle {
-        &self.lifecycle
+    pub const fn state(&self) -> DiffEvidenceState {
+        self.state
+    }
+
+    pub const fn render_kind(&self) -> DiffRenderKind {
+        self.render_kind
     }
 
     /// Pending artifact expectation, present only for text Diff intents.
@@ -92,45 +98,6 @@ impl DiffDoctorReference {
     /// retention-pending rows.
     pub const fn final_artifact(&self) -> Option<&DiffDoctorArtifactReference> {
         self.final_artifact.as_ref()
-    }
-
-    pub const fn is_legacy(&self) -> bool {
-        matches!(self.lifecycle, DiffDoctorLifecycle::Legacy { .. })
-    }
-}
-
-/// Durable state carried by a Diff Doctor reference.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DiffDoctorLifecycle {
-    Evidence {
-        state: DiffEvidenceState,
-        render_kind: DiffRenderKind,
-    },
-    Legacy {
-        change_set_state: ChangeSetState,
-    },
-}
-
-impl DiffDoctorLifecycle {
-    pub const fn evidence_state(self) -> Option<DiffEvidenceState> {
-        match self {
-            Self::Evidence { state, .. } => Some(state),
-            Self::Legacy { .. } => None,
-        }
-    }
-
-    pub const fn render_kind(self) -> Option<DiffRenderKind> {
-        match self {
-            Self::Evidence { render_kind, .. } => Some(render_kind),
-            Self::Legacy { .. } => None,
-        }
-    }
-
-    pub const fn legacy_change_set_state(self) -> Option<ChangeSetState> {
-        match self {
-            Self::Evidence { .. } => None,
-            Self::Legacy { change_set_state } => Some(change_set_state),
-        }
     }
 }
 
@@ -173,110 +140,39 @@ impl DiffDoctorArtifactReference {
     }
 }
 
-const RECORD_QUERY: &str = "SELECT
+const HEADER_QUERY: &str = "SELECT
         length(CAST(e.diff_id AS BLOB)), length(CAST(e.workspace_id AS BLOB)),
         length(CAST(e.activity_id AS BLOB)), length(CAST(e.changeset_id AS BLOB)),
-        length(CAST(e.mutation_id AS BLOB)), length(CAST(f.relative_path AS BLOB)),
+        length(CAST(e.mutation_id AS BLOB)),
         length(CAST(e.pending_relative_path AS BLOB)),
         length(CAST(e.artifact_relative_path AS BLOB)),
         length(CAST(e.compressed_hash AS BLOB)), length(CAST(e.uncompressed_hash AS BLOB)),
-        e.diff_id, e.workspace_id, e.activity_id, e.changeset_id, e.mutation_id,
+        e.diff_id, e.workspace_id, e.activity_id, e.changeset_id, e.origin_kind, e.mutation_id,
         e.state, e.render_kind, e.pending_relative_path, e.artifact_relative_path,
         e.compressed_hash, e.uncompressed_hash, e.compressed_size, e.uncompressed_size,
         e.renderer_version, e.redaction_policy_version, e.created_at_ms, e.updated_at_ms,
-        e.revision, f.relative_path, f.kind, f.additions, f.deletions,
-        e.workspace_id = c.workspace_id, e.activity_id = c.activity_id,
-        e.changeset_id = m.changeset_id, c.state
+        e.revision, e.workspace_id = c.workspace_id, e.activity_id = c.activity_id,
+        CASE WHEN e.origin_kind = 0 THEN m.mutation_id IS NOT NULL AND e.changeset_id = m.changeset_id
+             ELSE e.mutation_id IS NULL END,
+        c.state
     FROM diff_evidence AS e
-    JOIN diff_files AS f ON f.diff_id = e.diff_id
     JOIN change_sets AS c ON c.changeset_id = e.changeset_id
-    JOIN file_mutations AS m ON m.mutation_id = e.mutation_id";
-
-const LEGACY_DOCTOR_QUERY: &str = "SELECT
-        length(CAST(c.changeset_id AS BLOB)),
-        length(CAST(c.workspace_id AS BLOB)),
-        length(CAST(c.activity_id AS BLOB)),
-        length(CAST(f.mutation_id AS BLOB)),
-        length(CAST(f.relative_path AS BLOB)),
-        c.changeset_id, c.workspace_id, c.activity_id, c.state,
-        c.created_at_ms, c.updated_at_ms, c.revision,
-        f.mutation_id, f.relative_path
-    FROM change_sets AS c
-    LEFT JOIN diff_evidence AS e ON e.changeset_id = c.changeset_id
-    LEFT JOIN file_mutations AS f ON f.changeset_id = c.changeset_id
-    WHERE e.diff_id IS NULL
-    ORDER BY c.changeset_id ASC
-    LIMIT 257";
+    LEFT JOIN file_mutations AS m ON m.mutation_id = e.mutation_id";
 
 pub(crate) fn create_schema(connection: &Connection) -> Result<(), DiffStoreError> {
-    create_schema_v4(connection)?;
+    create_diff_core_schema(connection)?;
     create_retention_index(connection)
 }
 
-fn create_schema_v4(connection: &Connection) -> Result<(), DiffStoreError> {
-    connection.execute_batch(
-        "CREATE TABLE diff_evidence (
-            diff_id BLOB PRIMARY KEY NOT NULL CHECK(length(diff_id) = 16),
-            changeset_id BLOB NOT NULL UNIQUE REFERENCES change_sets(changeset_id),
-            workspace_id BLOB NOT NULL REFERENCES workspace(workspace_id),
-            activity_id BLOB NOT NULL REFERENCES activities(activity_id),
-            mutation_id BLOB NOT NULL UNIQUE REFERENCES file_mutations(mutation_id),
-            state INTEGER NOT NULL CHECK(state IN (0, 1, 2, 3, 4, 5)),
-            render_kind INTEGER NOT NULL CHECK(render_kind IN (0, 1, 2)),
-            pending_relative_path BLOB CHECK(pending_relative_path IS NULL OR length(pending_relative_path) BETWEEN 1 AND 4096),
-            artifact_relative_path BLOB CHECK(artifact_relative_path IS NULL OR length(artifact_relative_path) BETWEEN 1 AND 4096),
-            compressed_hash BLOB CHECK(compressed_hash IS NULL OR length(compressed_hash) = 32),
-            uncompressed_hash BLOB CHECK(uncompressed_hash IS NULL OR length(uncompressed_hash) = 32),
-            compressed_size INTEGER CHECK(compressed_size IS NULL OR compressed_size >= 0),
-            uncompressed_size INTEGER CHECK(uncompressed_size IS NULL OR uncompressed_size >= 0),
-            renderer_version INTEGER NOT NULL CHECK(renderer_version >= 1),
-            redaction_policy_version INTEGER NOT NULL CHECK(redaction_policy_version >= 1),
-            created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0),
-            updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= 0),
-            revision INTEGER NOT NULL CHECK(revision >= 1),
-            CHECK(
-                (state = 0 AND render_kind = 0 AND pending_relative_path IS NOT NULL AND artifact_relative_path IS NOT NULL AND compressed_hash IS NOT NULL AND uncompressed_hash IS NOT NULL AND compressed_size IS NOT NULL AND uncompressed_size IS NOT NULL)
-                OR (state = 0 AND render_kind IN (1, 2) AND pending_relative_path IS NULL AND artifact_relative_path IS NULL AND compressed_hash IS NULL AND uncompressed_hash IS NULL AND compressed_size IS NULL AND uncompressed_size IS NULL)
-                OR (state IN (1, 4) AND render_kind = 0 AND pending_relative_path IS NULL AND artifact_relative_path IS NOT NULL AND compressed_hash IS NOT NULL AND uncompressed_hash IS NOT NULL AND compressed_size IS NOT NULL AND uncompressed_size IS NOT NULL)
-                OR (state = 2 AND render_kind IN (1, 2) AND pending_relative_path IS NULL AND artifact_relative_path IS NULL AND compressed_hash IS NULL AND uncompressed_hash IS NULL AND compressed_size IS NULL AND uncompressed_size IS NULL)
-                OR (state IN (3, 5) AND pending_relative_path IS NULL AND artifact_relative_path IS NULL AND compressed_hash IS NULL AND uncompressed_hash IS NULL AND compressed_size IS NULL AND uncompressed_size IS NULL)
-            )
-         );
-         CREATE TABLE diff_files (
-            diff_id BLOB PRIMARY KEY NOT NULL REFERENCES diff_evidence(diff_id),
-            ordinal INTEGER NOT NULL CHECK(ordinal = 0),
-            relative_path BLOB NOT NULL CHECK(length(relative_path) BETWEEN 1 AND 4096),
-            kind INTEGER NOT NULL CHECK(kind IN (0, 1, 2)),
-            additions INTEGER NOT NULL CHECK(additions >= 0),
-            deletions INTEGER NOT NULL CHECK(deletions >= 0)
-         );
-         CREATE INDEX diff_evidence_activity_created_idx
-            ON diff_evidence(activity_id, created_at_ms DESC, diff_id DESC);
-         CREATE INDEX diff_evidence_state_updated_idx
-            ON diff_evidence(state, updated_at_ms, diff_id);",
-    )?;
-    Ok(())
-}
-
-pub(crate) fn migrate_v3_to_v4(
-    connection: &mut Connection,
-    next_schema_version: i64,
-) -> Result<(), DiffStoreError> {
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    create_schema_v4(&transaction)?;
-    transaction.pragma_update(None, "user_version", next_schema_version)?;
-    transaction.commit()?;
-    Ok(())
-}
-
-pub(crate) fn migrate_v4_to_v5(
-    connection: &mut Connection,
-    next_schema_version: i64,
-) -> Result<(), DiffStoreError> {
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    create_retention_index(&transaction)?;
-    transaction.pragma_update(None, "user_version", next_schema_version)?;
-    transaction.commit()?;
+fn create_diff_core_schema(connection: &Connection) -> Result<(), DiffStoreError> {
+    for sql in [
+        EXPECTED_DIFF_EVIDENCE_TABLE_SQL,
+        EXPECTED_DIFF_ENTRIES_TABLE_SQL,
+        EXPECTED_DIFF_ACTIVITY_INDEX_SQL,
+        EXPECTED_DIFF_STATE_INDEX_SQL,
+    ] {
+        connection.execute_batch(sql)?;
+    }
     Ok(())
 }
 
@@ -291,24 +187,15 @@ fn create_retention_index(connection: &Connection) -> Result<(), DiffStoreError>
 pub(crate) fn schema_objects() -> [(&'static str, &'static str); 5] {
     [
         ("table", "diff_evidence"),
-        ("table", "diff_files"),
+        ("table", "diff_entries"),
         ("index", "diff_evidence_activity_created_idx"),
         ("index", "diff_evidence_state_updated_idx"),
         ("index", "diff_evidence_retention_idx"),
     ]
 }
 
-pub(crate) fn schema_objects_v4() -> [(&'static str, &'static str); 4] {
-    [
-        ("table", "diff_evidence"),
-        ("table", "diff_files"),
-        ("index", "diff_evidence_activity_created_idx"),
-        ("index", "diff_evidence_state_updated_idx"),
-    ]
-}
-
 pub(crate) fn validate_schema(connection: &Connection) -> Result<(), DiffStoreError> {
-    validate_schema_v4(connection)?;
+    validate_diff_core_schema(connection)?;
     validate_schema_sql(
         connection,
         "index",
@@ -322,7 +209,7 @@ pub(crate) fn validate_schema(connection: &Connection) -> Result<(), DiffStoreEr
     )
 }
 
-pub(crate) fn validate_schema_v4(connection: &Connection) -> Result<(), DiffStoreError> {
+pub(crate) fn validate_diff_core_schema(connection: &Connection) -> Result<(), DiffStoreError> {
     validate_schema_sql(
         connection,
         "table",
@@ -332,8 +219,8 @@ pub(crate) fn validate_schema_v4(connection: &Connection) -> Result<(), DiffStor
     validate_schema_sql(
         connection,
         "table",
-        "diff_files",
-        EXPECTED_DIFF_FILES_TABLE_SQL,
+        "diff_entries",
+        EXPECTED_DIFF_ENTRIES_TABLE_SQL,
     )?;
     validate_schema_sql(
         connection,
@@ -355,7 +242,8 @@ pub(crate) fn validate_schema_v4(connection: &Connection) -> Result<(), DiffStor
             ("changeset_id", "BLOB", 1, 0),
             ("workspace_id", "BLOB", 1, 0),
             ("activity_id", "BLOB", 1, 0),
-            ("mutation_id", "BLOB", 1, 0),
+            ("origin_kind", "INTEGER", 1, 0),
+            ("mutation_id", "BLOB", 0, 0),
             ("state", "INTEGER", 1, 0),
             ("render_kind", "INTEGER", 1, 0),
             ("pending_relative_path", "BLOB", 0, 0),
@@ -373,11 +261,13 @@ pub(crate) fn validate_schema_v4(connection: &Connection) -> Result<(), DiffStor
     )?;
     validate_table_columns(
         connection,
-        "diff_files",
+        "diff_entries",
         &[
             ("diff_id", "BLOB", 1, 1),
-            ("ordinal", "INTEGER", 1, 0),
-            ("relative_path", "BLOB", 1, 0),
+            ("ordinal", "INTEGER", 1, 2),
+            ("subject_kind", "INTEGER", 1, 0),
+            ("primary_path", "BLOB", 1, 0),
+            ("secondary_path", "BLOB", 0, 0),
             ("kind", "INTEGER", 1, 0),
             ("additions", "INTEGER", 1, 0),
             ("deletions", "INTEGER", 1, 0),
@@ -394,7 +284,7 @@ pub(crate) fn validate_schema_v4(connection: &Connection) -> Result<(), DiffStor
         &["state", "updated_at_ms", "diff_id"],
     )?;
     validate_foreign_keys(connection, "diff_evidence", 4)?;
-    validate_foreign_keys(connection, "diff_files", 1)
+    validate_foreign_keys(connection, "diff_entries", 1)
 }
 
 pub(crate) fn begin(
@@ -402,38 +292,78 @@ pub(crate) fn begin(
     file_command: &BeginFileMutation,
     command: &BeginDiffEvidence,
 ) -> Result<RegisteredDiffEvidence, DiffStoreError> {
-    validate_begin_linkage(file_command, command)?;
-    if let Some(existing) = get_by_change_set(transaction, file_command.change_set_id())? {
+    validate_file_begin_linkage(file_command, command)?;
+    insert_begin(transaction, command)
+}
+
+pub(crate) fn begin_tree(
+    transaction: &Transaction<'_>,
+    tree_intent: &TreeChangeSetIntent,
+    command: &BeginDiffEvidence,
+) -> Result<RegisteredDiffEvidence, DiffStoreError> {
+    validate_tree_begin_linkage(tree_intent, command)?;
+    insert_begin(transaction, command)
+}
+
+pub(crate) fn inspect_tree(
+    connection: &Connection,
+    tree_intent: &TreeChangeSetIntent,
+    command: &BeginDiffEvidence,
+) -> Result<Option<RegisteredDiffEvidence>, DiffStoreError> {
+    validate_tree_begin_linkage(tree_intent, command)?;
+    let existing = get_by_change_set(connection, tree_intent.attribution().id())?;
+    match existing {
+        Some(record) if record_matches_begin(&record, command) => Ok(Some(record)),
+        Some(_) => Err(DiffStoreError::IdentityConflict),
+        None => Ok(None),
+    }
+}
+
+fn insert_begin(
+    transaction: &Transaction<'_>,
+    command: &BeginDiffEvidence,
+) -> Result<RegisteredDiffEvidence, DiffStoreError> {
+    let attribution = command.attribution();
+    if crate::workspace_goal_deletion::artifact_identity_is_pending(
+        transaction,
+        crate::workspace_goal_deletion::GoalDeletionArtifactIdentity::Diff(attribution.id()),
+    )? {
+        return Err(DiffStoreError::IdentityConflict);
+    }
+    if let Some(existing) = get_by_change_set(transaction, attribution.change_set_id())? {
         return if record_matches_begin(&existing, command) {
             Ok(existing)
         } else {
             Err(DiffStoreError::IdentityConflict)
         };
     }
-    if get_by_id(transaction, command.attribution().id())?.is_some() {
+    if get_by_id(transaction, attribution.id())?.is_some() {
         return Err(DiffStoreError::IdentityConflict);
     }
 
-    let attribution = command.attribution();
     let encoded = encode_payload(command.payload())?;
     let diff_id = attribution.id().into_uuid().into_bytes();
     let change_set_id = attribution.change_set_id().into_uuid().into_bytes();
     let workspace_id = attribution.workspace_id().into_uuid().into_bytes();
     let activity_id = attribution.activity_id().into_uuid().into_bytes();
-    let mutation_id = attribution.mutation_id().into_uuid().into_bytes();
+    let (origin_kind, mutation_id) = match attribution.origin() {
+        DiffOrigin::FileMutation(id) => (0_i64, Some(id.into_uuid().into_bytes())),
+        DiffOrigin::TreeChangeSet => (1_i64, None),
+    };
     transaction.execute(
         "INSERT INTO diff_evidence (
-            diff_id, changeset_id, workspace_id, activity_id, mutation_id,
+            diff_id, changeset_id, workspace_id, activity_id, origin_kind, mutation_id,
             state, render_kind, pending_relative_path, artifact_relative_path,
             compressed_hash, uncompressed_hash, compressed_size, uncompressed_size,
             renderer_version, redaction_policy_version, created_at_ms, updated_at_ms, revision
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?16, ?17)",
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?17, ?18)",
         params![
             diff_id.as_slice(),
             change_set_id.as_slice(),
             workspace_id.as_slice(),
             activity_id.as_slice(),
-            mutation_id.as_slice(),
+            origin_kind,
+            mutation_id.as_ref().map(<[u8; 16]>::as_slice),
             encoded.state,
             encoded.render_kind,
             encoded.pending_path.as_deref(),
@@ -448,17 +378,24 @@ pub(crate) fn begin(
             DiffRevision::INITIAL.get(),
         ],
     )?;
-    transaction.execute(
-        "INSERT INTO diff_files (diff_id, ordinal, relative_path, kind, additions, deletions)
-         VALUES (?1, 0, ?2, ?3, ?4, ?5)",
-        params![
-            diff_id.as_slice(),
-            command.file().path().as_path().as_os_str().as_bytes(),
-            encode_change_kind(command.file().kind()),
-            i64::from(command.file().additions().get()),
-            i64::from(command.file().deletions().get()),
-        ],
-    )?;
+    for (ordinal, entry) in command.entries().iter().enumerate() {
+        let ordinal = i64::try_from(ordinal).map_err(|_| DiffStoreError::SizeOverflow)?;
+        transaction.execute(
+            "INSERT INTO diff_entries (
+                diff_id, ordinal, subject_kind, primary_path, secondary_path, kind, additions, deletions
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                diff_id.as_slice(),
+                ordinal,
+                encode_entry_subject(entry.subject()),
+                entry.primary_path().as_path().as_os_str().as_bytes(),
+                entry.secondary_path().map(|path| path.as_path().as_os_str().as_bytes()),
+                encode_change_kind(entry.kind()),
+                i64::from(entry.additions().get()),
+                i64::from(entry.deletions().get()),
+            ],
+        )?;
+    }
     get_by_id(transaction, attribution.id())?.ok_or(DiffStoreError::RecordMissing)
 }
 
@@ -572,49 +509,47 @@ pub(crate) fn list_by_activity(
     activity_id: ActivityId,
     limit: DiffListLimit,
 ) -> Result<Vec<RegisteredDiffEvidence>, DiffStoreError> {
-    let query = format!(
-        "{RECORD_QUERY} WHERE e.activity_id = ?1
-         ORDER BY e.created_at_ms DESC, e.diff_id DESC LIMIT ?2"
-    );
     let activity_id = activity_id.into_uuid().into_bytes();
-    let mut statement = connection.prepare(&query)?;
-    let mut rows = statement.query(params![activity_id.as_slice(), i64::from(limit.get())])?;
-    let mut records = Vec::new();
-    while let Some(row) = rows.next()? {
-        records.push(decode_record(row)?);
-    }
-    Ok(records)
+    let mut statement = connection.prepare(
+        "SELECT diff_id FROM diff_evidence
+         WHERE activity_id = ?1
+         ORDER BY created_at_ms DESC, diff_id DESC LIMIT ?2",
+    )?;
+    let ids = statement
+        .query_map(
+            params![activity_id.as_slice(), i64::from(limit.get())],
+            |row| row.get::<_, Vec<u8>>(0),
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    ids.into_iter()
+        .map(|raw| {
+            let id = decode_uuid("diff.id", &raw).map(DiffId::from_uuid)?;
+            get_by_id(connection, id)?.ok_or(DiffStoreError::RecordMissing)
+        })
+        .collect()
 }
 
 /// Read a bounded, metadata-only inventory of current Diff expectations.
 ///
-/// The current Diff query and the migrated legacy-without-Diff query are fixed
-/// bounded scans. They are intentionally separate from the Activity list
-/// query because a legacy `ChangeSet` has no `diff_evidence` row to decode. The
-/// two result sets are merged and sorted by the stable Diff identity, then
-/// capped at 256 rows. No artifact body or per-row follow-up query is issued.
+/// The query is a fixed bounded scan ordered by stable Diff identity. No
+/// artifact body or per-row follow-up query is issued.
 pub(crate) fn doctor_references(
     connection: &Connection,
 ) -> Result<DiffDoctorReport, DiffStoreError> {
     validate_doctor_relationships(connection)?;
-    let mut references = Vec::with_capacity(DIFF_DOCTOR_PROBE_REFERENCES.saturating_mul(2));
-
-    let current_query =
-        format!("{RECORD_QUERY}\nORDER BY e.diff_id ASC\nLIMIT {DIFF_DOCTOR_PROBE_REFERENCES}");
-    let mut current_statement = connection.prepare(&current_query)?;
-    let mut current_rows = current_statement.query([])?;
-    while let Some(row) = current_rows.next()? {
-        let evidence = decode_record_inner(row)?;
+    let mut references = Vec::with_capacity(DIFF_DOCTOR_PROBE_REFERENCES);
+    let query = format!(
+        "SELECT diff_id FROM diff_evidence ORDER BY diff_id ASC LIMIT {DIFF_DOCTOR_PROBE_REFERENCES}"
+    );
+    let mut statement = connection.prepare(&query)?;
+    let ids = statement
+        .query_map([], |row| row.get::<_, Vec<u8>>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    for raw in ids {
+        let id = decode_uuid("diff.id", &raw).map(DiffId::from_uuid)?;
+        let evidence = get_by_id(connection, id)?.ok_or(DiffStoreError::RecordMissing)?;
         references.push(doctor_reference_from_evidence(&evidence)?);
     }
-
-    let mut legacy_statement = connection.prepare(LEGACY_DOCTOR_QUERY)?;
-    let mut legacy_rows = legacy_statement.query([])?;
-    while let Some(row) = legacy_rows.next()? {
-        references.push(decode_legacy_doctor_reference(row)?);
-    }
-
-    references.sort_by_key(DiffDoctorReference::diff_id);
     let truncated = references.len() > DIFF_DOCTOR_MAX_REFERENCES;
     references.truncate(DIFF_DOCTOR_MAX_REFERENCES);
     Ok(DiffDoctorReport::new(references, truncated))
@@ -627,15 +562,14 @@ fn validate_doctor_relationships(connection: &Connection) -> Result<(), DiffStor
         "SELECT EXISTS(
             SELECT 1
             FROM diff_evidence AS e
-            LEFT JOIN diff_files AS f ON f.diff_id = e.diff_id
             LEFT JOIN change_sets AS c ON c.changeset_id = e.changeset_id
             LEFT JOIN file_mutations AS m ON m.mutation_id = e.mutation_id
-            WHERE f.diff_id IS NULL
-               OR c.changeset_id IS NULL
-               OR m.mutation_id IS NULL
+            WHERE c.changeset_id IS NULL
+               OR NOT EXISTS (SELECT 1 FROM diff_entries AS d WHERE d.diff_id = e.diff_id)
                OR e.workspace_id != c.workspace_id
                OR e.activity_id != c.activity_id
-               OR e.changeset_id != m.changeset_id
+               OR (e.origin_kind = 0 AND (m.mutation_id IS NULL OR e.changeset_id != m.changeset_id))
+               OR (e.origin_kind = 1 AND e.mutation_id IS NOT NULL)
         )",
         [],
         |row| row.get(0),
@@ -644,33 +578,18 @@ fn validate_doctor_relationships(connection: &Connection) -> Result<(), DiffStor
         return Err(DiffStoreError::CorruptRecord("diff.relationship"));
     }
 
-    let orphaned_diff_files: i64 = connection.query_row(
+    let orphaned_entries: i64 = connection.query_row(
         "SELECT EXISTS(
             SELECT 1
-            FROM diff_files AS f
-            LEFT JOIN diff_evidence AS e ON e.diff_id = f.diff_id
+            FROM diff_entries AS d
+            LEFT JOIN diff_evidence AS e ON e.diff_id = d.diff_id
             WHERE e.diff_id IS NULL
         )",
         [],
         |row| row.get(0),
     )?;
-    if orphaned_diff_files != 0 {
+    if orphaned_entries != 0 {
         return Err(DiffStoreError::CorruptRecord("diff.relationship"));
-    }
-
-    let malformed_legacy: i64 = connection.query_row(
-        "SELECT EXISTS(
-            SELECT 1
-            FROM change_sets AS c
-            LEFT JOIN diff_evidence AS e ON e.changeset_id = c.changeset_id
-            LEFT JOIN file_mutations AS f ON f.changeset_id = c.changeset_id
-            WHERE e.diff_id IS NULL AND f.mutation_id IS NULL
-        )",
-        [],
-        |row| row.get(0),
-    )?;
-    if malformed_legacy != 0 {
-        return Err(DiffStoreError::CorruptRecord("legacy.relationship"));
     }
     Ok(())
 }
@@ -679,10 +598,8 @@ fn doctor_reference_from_evidence(
     evidence: &RegisteredDiffEvidence,
 ) -> Result<DiffDoctorReference, DiffStoreError> {
     let diff_id = evidence.id();
-    let lifecycle = DiffDoctorLifecycle::Evidence {
-        state: evidence.state(),
-        render_kind: evidence.payload().render_kind(),
-    };
+    let state = evidence.state();
+    let render_kind = evidence.payload().render_kind();
     let (pending_artifact, final_artifact) = match evidence.payload() {
         DiffPayloadProjection::IntentText {
             pending_relative_path,
@@ -743,7 +660,8 @@ fn doctor_reference_from_evidence(
     };
     Ok(DiffDoctorReference {
         diff_id,
-        lifecycle,
+        state,
+        render_kind,
         pending_artifact,
         final_artifact,
     })
@@ -783,81 +701,32 @@ fn doctor_artifact_reference(
     })
 }
 
-fn decode_legacy_doctor_reference(row: &Row<'_>) -> Result<DiffDoctorReference, DiffStoreError> {
-    validate_exact_length("legacy.change_set.id", row.get(0)?, 16)?;
-    validate_exact_length("legacy.workspace_id", row.get(1)?, 16)?;
-    validate_exact_length("legacy.activity_id", row.get(2)?, 16)?;
-    let mutation_length = row
-        .get::<_, Option<i64>>(3)?
-        .ok_or(DiffStoreError::CorruptRecord("legacy.file_mutation"))?;
-    validate_exact_length("legacy.file_mutation.id", mutation_length, 16)?;
-    let path_length = row
-        .get::<_, Option<i64>>(4)?
-        .ok_or(DiffStoreError::CorruptRecord("legacy.file_mutation.path"))?;
-    validate_bounded_length("legacy.file_mutation.path", path_length, MAX_PATH_BYTES)?;
-
-    let change_set_id = decode_uuid("legacy.change_set.id", &row.get::<_, Vec<u8>>(5)?)
-        .map(ChangeSetId::from_uuid)?;
-    // Validate the other durable identity columns even though they are not
-    // retained in the metadata-only legacy projection.
-    decode_uuid("legacy.workspace_id", &row.get::<_, Vec<u8>>(6)?)?;
-    decode_uuid("legacy.activity_id", &row.get::<_, Vec<u8>>(7)?)?;
-    let change_set_state = decode_legacy_change_set_state(row.get(8)?)?;
-    let created_at = TimestampMillis::new(row.get(9)?)
-        .map_err(|_| DiffStoreError::CorruptRecord("legacy.created_at_ms"))?;
-    let updated_at = TimestampMillis::new(row.get(10)?)
-        .map_err(|_| DiffStoreError::CorruptRecord("legacy.updated_at_ms"))?;
-    if updated_at.get() < created_at.get() {
-        return Err(DiffStoreError::CorruptRecord("legacy.updated_at_ms"));
-    }
-    if row.get::<_, i64>(11)? < 1 {
-        return Err(DiffStoreError::CorruptRecord("legacy.revision"));
-    }
-    decode_uuid("legacy.file_mutation.id", &row.get::<_, Vec<u8>>(12)?)?;
-    let path = row.get::<_, Vec<u8>>(13)?;
-    WorkspaceRelativePath::new(PathBuf::from(OsString::from_vec(path)))
-        .map_err(|_| DiffStoreError::CorruptRecord("legacy.file_mutation.path"))?;
-
-    Ok(DiffDoctorReference {
-        diff_id: DiffId::for_change_set(change_set_id),
-        lifecycle: DiffDoctorLifecycle::Legacy { change_set_state },
-        pending_artifact: None,
-        final_artifact: None,
-    })
-}
-
-const fn decode_legacy_change_set_state(value: i64) -> Result<ChangeSetState, DiffStoreError> {
-    match value {
-        0 => Ok(ChangeSetState::Starting),
-        1 => Ok(ChangeSetState::Applied),
-        2 => Ok(ChangeSetState::Failed),
-        _ => Err(DiffStoreError::CorruptRecord("legacy.change_set.state")),
-    }
-}
-
 pub(crate) fn list_retention_candidates(
     connection: &Connection,
     keep_recent: DiffRetentionKeepCount,
     limit: DiffRetentionPlanLimit,
 ) -> Result<Vec<RegisteredDiffEvidence>, DiffStoreError> {
-    let query = format!(
-        "{RECORD_QUERY} WHERE e.state = 1 AND e.render_kind = 0
+    let mut statement = connection.prepare(
+        "SELECT e.diff_id FROM diff_evidence AS e
+         WHERE e.state = 1 AND e.render_kind = 0
          AND NOT EXISTS (
              SELECT 1 FROM goal_evidence_refs AS g
              WHERE g.evidence_kind = 0 AND g.evidence_id = e.changeset_id
          )
-         ORDER BY e.created_at_ms DESC, e.diff_id DESC LIMIT ?1 OFFSET ?2"
-    );
-    let mut statement = connection.prepare(&query)?;
-    let mut rows = statement.query(params![
-        i64::from(limit.get()),
-        i64::from(keep_recent.get())
-    ])?;
-    let mut records = Vec::new();
-    while let Some(row) = rows.next()? {
-        records.push(decode_record(row)?);
-    }
-    Ok(records)
+         ORDER BY e.created_at_ms DESC, e.diff_id DESC LIMIT ?1 OFFSET ?2",
+    )?;
+    let ids = statement
+        .query_map(
+            params![i64::from(limit.get()), i64::from(keep_recent.get())],
+            |row| row.get::<_, Vec<u8>>(0),
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    ids.into_iter()
+        .map(|raw| {
+            let id = decode_uuid("diff.id", &raw).map(DiffId::from_uuid)?;
+            get_by_id(connection, id)?.ok_or(DiffStoreError::RecordMissing)
+        })
+        .collect()
 }
 
 pub(crate) fn begin_purge(
@@ -1048,14 +917,189 @@ fn query_one(
     clause: &str,
     id: &[u8],
 ) -> Result<Option<RegisteredDiffEvidence>, DiffStoreError> {
-    let query = format!("{RECORD_QUERY} {clause}");
-    connection
-        .query_row(&query, params![id], decode_record)
-        .optional()
-        .map_err(DiffStoreError::from)
+    let query = format!("{HEADER_QUERY} {clause}");
+    let header = connection
+        .query_row(&query, params![id], decode_header)
+        .optional()?;
+    let Some(header) = header else {
+        return Ok(None);
+    };
+    let entries = query_entries(connection, header.attribution.id())?;
+    if entries.is_empty() || entries.len() > forge_domain::MAX_TREE_CHANGESET_MUTATIONS {
+        return Err(DiffStoreError::CorruptRecord("diff.entries"));
+    }
+    Ok(Some(RegisteredDiffEvidence::from_parts(
+        header.attribution,
+        entries,
+        header.payload,
+        header.timestamps,
+        header.versions,
+        header.revision,
+    )))
 }
 
-fn validate_begin_linkage(
+#[derive(Debug)]
+struct DecodedDiffHeader {
+    attribution: DiffAttribution,
+    payload: DiffPayloadProjection,
+    timestamps: DiffEvidenceTimestamps,
+    versions: DiffContractVersions,
+    revision: DiffRevision,
+}
+
+fn decode_header(row: &Row<'_>) -> rusqlite::Result<DecodedDiffHeader> {
+    decode_header_inner(row).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(9, rusqlite::types::Type::Blob, Box::new(error))
+    })
+}
+
+fn decode_header_inner(row: &Row<'_>) -> Result<DecodedDiffHeader, DiffStoreError> {
+    for (field, index) in [
+        ("diff.id", 0),
+        ("diff.workspace_id", 1),
+        ("diff.activity_id", 2),
+        ("diff.changeset_id", 3),
+    ] {
+        validate_exact_length(field, row.get(index)?, 16)?;
+    }
+    validate_optional_exact_length("diff.mutation_id", row.get(4)?, 16)?;
+    validate_optional_bounded_length("diff.pending_relative_path", row.get(5)?, MAX_PATH_BYTES)?;
+    validate_optional_bounded_length("diff.artifact_relative_path", row.get(6)?, MAX_PATH_BYTES)?;
+    validate_optional_exact_length("diff.compressed_hash", row.get(7)?, HASH_BYTES)?;
+    validate_optional_exact_length("diff.uncompressed_hash", row.get(8)?, HASH_BYTES)?;
+
+    let id = decode_uuid("diff.id", &row.get::<_, Vec<u8>>(9)?).map(DiffId::from_uuid)?;
+    let workspace_id = decode_uuid("diff.workspace_id", &row.get::<_, Vec<u8>>(10)?)
+        .map(WorkspaceId::from_uuid)?;
+    let activity_id =
+        decode_uuid("diff.activity_id", &row.get::<_, Vec<u8>>(11)?).map(ActivityId::from_uuid)?;
+    let change_set_id = decode_uuid("diff.changeset_id", &row.get::<_, Vec<u8>>(12)?)
+        .map(ChangeSetId::from_uuid)?;
+    if id != DiffId::for_change_set(change_set_id)
+        || row.get::<_, i64>(28)? != 1
+        || row.get::<_, i64>(29)? != 1
+        || row.get::<_, i64>(30)? != 1
+    {
+        return Err(DiffStoreError::CorruptRecord("diff.attribution"));
+    }
+    let origin = match (row.get::<_, i64>(13)?, row.get::<_, Option<Vec<u8>>>(14)?) {
+        (0, Some(raw)) => DiffOrigin::FileMutation(
+            decode_uuid("diff.mutation_id", &raw).map(FileMutationId::from_uuid)?,
+        ),
+        (1, None) => DiffOrigin::TreeChangeSet,
+        _ => return Err(DiffStoreError::CorruptRecord("diff.origin")),
+    };
+    let attribution = match origin {
+        DiffOrigin::FileMutation(mutation_id) => DiffAttribution::for_file_mutation(
+            id,
+            workspace_id,
+            activity_id,
+            change_set_id,
+            mutation_id,
+        ),
+        DiffOrigin::TreeChangeSet => {
+            DiffAttribution::for_tree_change_set(id, workspace_id, activity_id, change_set_id)
+        }
+    };
+    let state = decode_state(row.get(15)?)?;
+    let render_kind = decode_render_kind(row.get(16)?)?;
+    let payload = decode_payload(
+        state,
+        render_kind,
+        RawPayloadFields {
+            pending_path: row.get(17)?,
+            artifact_path: row.get(18)?,
+            compressed_hash: row.get(19)?,
+            uncompressed_hash: row.get(20)?,
+            compressed_size: row.get(21)?,
+            uncompressed_size: row.get(22)?,
+        },
+    )?;
+    validate_change_set_state(state, row.get(31)?)?;
+    let renderer_version = decode_u32("diff.renderer_version", row.get(23)?).and_then(|value| {
+        DiffRendererVersion::new(value)
+            .map_err(|_| DiffStoreError::CorruptRecord("diff.renderer_version"))
+    })?;
+    let redaction_policy_version = decode_u32("diff.redaction_policy_version", row.get(24)?)
+        .and_then(|value| {
+            DiffRedactionPolicyVersion::new(value)
+                .map_err(|_| DiffStoreError::CorruptRecord("diff.redaction_policy_version"))
+        })?;
+    let created_at = TimestampMillis::new(row.get(25)?)
+        .map_err(|_| DiffStoreError::CorruptRecord("diff.created_at_ms"))?;
+    let updated_at = TimestampMillis::new(row.get(26)?)
+        .map_err(|_| DiffStoreError::CorruptRecord("diff.updated_at_ms"))?;
+    if updated_at.get() < created_at.get() {
+        return Err(DiffStoreError::CorruptRecord("diff.updated_at_ms"));
+    }
+    let revision = DiffRevision::new(row.get(27)?)
+        .map_err(|_| DiffStoreError::CorruptRecord("diff.revision"))?;
+    Ok(DecodedDiffHeader {
+        attribution,
+        payload,
+        timestamps: DiffEvidenceTimestamps::new(created_at, updated_at),
+        versions: DiffContractVersions::new(renderer_version, redaction_policy_version),
+        revision,
+    })
+}
+
+fn query_entries(
+    connection: &Connection,
+    id: DiffId,
+) -> Result<Vec<DiffEntrySummary>, DiffStoreError> {
+    let raw_id = id.into_uuid().into_bytes();
+    let mut statement = connection.prepare(
+        "SELECT ordinal, subject_kind, primary_path, secondary_path, kind, additions, deletions
+         FROM diff_entries WHERE diff_id = ?1 ORDER BY ordinal ASC",
+    )?;
+    let mut rows = statement.query(params![raw_id.as_slice()])?;
+    let mut entries = Vec::new();
+    while let Some(row) = rows.next()? {
+        let expected_ordinal =
+            i64::try_from(entries.len()).map_err(|_| DiffStoreError::SizeOverflow)?;
+        if row.get::<_, i64>(0)? != expected_ordinal {
+            return Err(DiffStoreError::CorruptRecord("diff.entry.ordinal"));
+        }
+        let subject = match row.get::<_, i64>(1)? {
+            0 => DiffEntrySubject::File,
+            1 => DiffEntrySubject::Directory,
+            _ => return Err(DiffStoreError::CorruptRecord("diff.entry.subject_kind")),
+        };
+        let primary_raw: Vec<u8> = row.get(2)?;
+        validate_bounded_length(
+            "diff.entry.primary_path",
+            i64::try_from(primary_raw.len()).unwrap_or(i64::MAX),
+            MAX_PATH_BYTES,
+        )?;
+        let primary = WorkspaceRelativePath::new(PathBuf::from(OsString::from_vec(primary_raw)))
+            .map_err(|_| DiffStoreError::CorruptRecord("diff.entry.primary_path"))?;
+        let secondary_raw: Option<Vec<u8>> = row.get(3)?;
+        if let Some(raw) = secondary_raw.as_ref() {
+            validate_bounded_length(
+                "diff.entry.secondary_path",
+                i64::try_from(raw.len()).unwrap_or(i64::MAX),
+                MAX_PATH_BYTES,
+            )?;
+        }
+        let secondary = secondary_raw
+            .map(|raw| WorkspaceRelativePath::new(PathBuf::from(OsString::from_vec(raw))))
+            .transpose()
+            .map_err(|_| DiffStoreError::CorruptRecord("diff.entry.secondary_path"))?;
+        let kind = decode_change_kind(row.get(4)?)?;
+        let additions = DiffLineCount::new(decode_u32("diff.entry.additions", row.get(5)?)?);
+        let deletions = DiffLineCount::new(decode_u32("diff.entry.deletions", row.get(6)?)?);
+        entries.push(
+            DiffEntrySummary::new(subject, primary, secondary, kind, additions, deletions)
+                .map_err(|_| DiffStoreError::CorruptRecord("diff.entry.shape"))?,
+        );
+        if entries.len() > forge_domain::MAX_TREE_CHANGESET_MUTATIONS {
+            return Err(DiffStoreError::CorruptRecord("diff.entries"));
+        }
+    }
+    Ok(entries)
+}
+
+fn validate_file_begin_linkage(
     file_command: &BeginFileMutation,
     command: &BeginDiffEvidence,
 ) -> Result<(), DiffStoreError> {
@@ -1065,13 +1109,19 @@ fn validate_begin_linkage(
         forge_domain::FileMutationKind::Replace => DiffChangeKind::Modified,
         forge_domain::FileMutationKind::Delete => DiffChangeKind::Deleted,
     };
+    let expected_origin = DiffOrigin::FileMutation(file_command.mutation_id());
+    let [entry] = command.entries() else {
+        return Err(DiffStoreError::AttributionMismatch);
+    };
     if attribution.id() != DiffId::for_change_set(file_command.change_set_id())
         || attribution.change_set_id() != file_command.change_set_id()
-        || attribution.mutation_id() != file_command.mutation_id()
+        || attribution.origin() != expected_origin
         || attribution.workspace_id() != file_command.workspace_id()
         || attribution.activity_id() != file_command.activity_id()
-        || command.file().path() != file_command.path()
-        || command.file().kind() != expected_kind
+        || entry.subject() != DiffEntrySubject::File
+        || entry.primary_path() != file_command.path()
+        || entry.secondary_path().is_some()
+        || entry.kind() != expected_kind
         || command.observed_at() != file_command.observed_at()
     {
         return Err(DiffStoreError::AttributionMismatch);
@@ -1079,14 +1129,67 @@ fn validate_begin_linkage(
     Ok(())
 }
 
+fn validate_tree_begin_linkage(
+    tree_intent: &TreeChangeSetIntent,
+    command: &BeginDiffEvidence,
+) -> Result<(), DiffStoreError> {
+    let attribution = command.attribution();
+    let change_set = tree_intent.attribution();
+    if attribution.id() != DiffId::for_change_set(change_set.id())
+        || attribution.change_set_id() != change_set.id()
+        || attribution.origin() != DiffOrigin::TreeChangeSet
+        || attribution.workspace_id() != change_set.workspace_id()
+        || attribution.activity_id() != change_set.activity_id()
+        || command.observed_at() != tree_intent.observed_at()
+        || command.entries() != tree_intent.diff_entries()
+        || !valid_tree_begin_payload(command.versions(), command.payload(), command.entries())
+    {
+        return Err(DiffStoreError::AttributionMismatch);
+    }
+    Ok(())
+}
+
+/// Tree Diff text is truthful only when every entry is a file modification,
+/// because one aggregate text artifact cannot describe directory, move, or
+/// delete effects. V1 keeps the historical structured summary contract for
+/// arbitrary validated tree plans. V2 adds text and its explicit oversized
+/// fallback for patch-only plans.
+fn valid_tree_begin_payload(
+    versions: DiffContractVersions,
+    payload: &DiffPayloadProjection,
+    entries: &[DiffEntrySummary],
+) -> bool {
+    match (versions, payload) {
+        (
+            DiffContractVersions::V1,
+            DiffPayloadProjection::IntentSummary {
+                render_kind: DiffRenderKind::Structured,
+            },
+        ) => true,
+        (
+            DiffContractVersions::V2,
+            DiffPayloadProjection::IntentText { .. }
+            | DiffPayloadProjection::IntentSummary {
+                render_kind: DiffRenderKind::Oversized,
+            },
+        ) => entries.iter().all(is_patch_only_file_modified_entry),
+        _ => false,
+    }
+}
+
+const fn is_patch_only_file_modified_entry(entry: &DiffEntrySummary) -> bool {
+    matches!(entry.subject(), DiffEntrySubject::File)
+        && entry.secondary_path().is_none()
+        && matches!(entry.kind(), DiffChangeKind::Modified)
+}
+
 fn record_matches_begin(record: &RegisteredDiffEvidence, command: &BeginDiffEvidence) -> bool {
     record.id() == command.attribution().id()
         && record.workspace_id() == command.attribution().workspace_id()
         && record.activity_id() == command.attribution().activity_id()
         && record.change_set_id() == command.attribution().change_set_id()
-        && record.mutation_id() == command.attribution().mutation_id()
-        && record.file() == command.file()
-        && record.created_at() == command.observed_at()
+        && record.origin() == command.attribution().origin()
+        && record.entries() == command.entries()
         && record.renderer_version() == command.versions().renderer()
         && record.redaction_policy_version() == command.versions().redaction_policy()
         && payload_matches_begin(record.payload(), command.payload())
@@ -1261,95 +1364,6 @@ fn size_to_i64(value: DiffByteCount) -> Result<i64, DiffStoreError> {
     i64::try_from(value.get()).map_err(|_| DiffStoreError::SizeOverflow)
 }
 
-fn decode_record(row: &Row<'_>) -> rusqlite::Result<RegisteredDiffEvidence> {
-    decode_record_inner(row).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(10, rusqlite::types::Type::Blob, Box::new(error))
-    })
-}
-
-fn decode_record_inner(row: &Row<'_>) -> Result<RegisteredDiffEvidence, DiffStoreError> {
-    for (field, index) in [
-        ("diff.id", 0),
-        ("diff.workspace_id", 1),
-        ("diff.activity_id", 2),
-        ("diff.changeset_id", 3),
-        ("diff.mutation_id", 4),
-    ] {
-        validate_exact_length(field, row.get(index)?, 16)?;
-    }
-    validate_bounded_length("diff.file.relative_path", row.get(5)?, MAX_PATH_BYTES)?;
-    validate_optional_bounded_length("diff.pending_relative_path", row.get(6)?, MAX_PATH_BYTES)?;
-    validate_optional_bounded_length("diff.artifact_relative_path", row.get(7)?, MAX_PATH_BYTES)?;
-    validate_optional_exact_length("diff.compressed_hash", row.get(8)?, HASH_BYTES)?;
-    validate_optional_exact_length("diff.uncompressed_hash", row.get(9)?, HASH_BYTES)?;
-
-    let id = decode_uuid("diff.id", &row.get::<_, Vec<u8>>(10)?).map(DiffId::from_uuid)?;
-    let workspace_id = decode_uuid("diff.workspace_id", &row.get::<_, Vec<u8>>(11)?)
-        .map(WorkspaceId::from_uuid)?;
-    let activity_id =
-        decode_uuid("diff.activity_id", &row.get::<_, Vec<u8>>(12)?).map(ActivityId::from_uuid)?;
-    let change_set_id = decode_uuid("diff.changeset_id", &row.get::<_, Vec<u8>>(13)?)
-        .map(ChangeSetId::from_uuid)?;
-    let mutation_id = decode_uuid("diff.mutation_id", &row.get::<_, Vec<u8>>(14)?)
-        .map(FileMutationId::from_uuid)?;
-    if id != DiffId::for_change_set(change_set_id)
-        || row.get::<_, i64>(32)? != 1
-        || row.get::<_, i64>(33)? != 1
-        || row.get::<_, i64>(34)? != 1
-    {
-        return Err(DiffStoreError::CorruptRecord("diff.attribution"));
-    }
-
-    let state = decode_state(row.get(15)?)?;
-    let render_kind = decode_render_kind(row.get(16)?)?;
-    let payload = decode_payload(
-        state,
-        render_kind,
-        RawPayloadFields {
-            pending_path: row.get(17)?,
-            artifact_path: row.get(18)?,
-            compressed_hash: row.get(19)?,
-            uncompressed_hash: row.get(20)?,
-            compressed_size: row.get(21)?,
-            uncompressed_size: row.get(22)?,
-        },
-    )?;
-    validate_change_set_state(state, row.get(35)?)?;
-
-    let renderer_version = decode_u32("diff.renderer_version", row.get(23)?).and_then(|value| {
-        DiffRendererVersion::new(value)
-            .map_err(|_| DiffStoreError::CorruptRecord("diff.renderer_version"))
-    })?;
-    let redaction_policy_version = decode_u32("diff.redaction_policy_version", row.get(24)?)
-        .and_then(|value| {
-            DiffRedactionPolicyVersion::new(value)
-                .map_err(|_| DiffStoreError::CorruptRecord("diff.redaction_policy_version"))
-        })?;
-    let created_at = TimestampMillis::new(row.get(25)?)
-        .map_err(|_| DiffStoreError::CorruptRecord("diff.created_at_ms"))?;
-    let updated_at = TimestampMillis::new(row.get(26)?)
-        .map_err(|_| DiffStoreError::CorruptRecord("diff.updated_at_ms"))?;
-    if updated_at.get() < created_at.get() {
-        return Err(DiffStoreError::CorruptRecord("diff.updated_at_ms"));
-    }
-    let revision = DiffRevision::new(row.get(27)?)
-        .map_err(|_| DiffStoreError::CorruptRecord("diff.revision"))?;
-    let path = WorkspaceRelativePath::new(PathBuf::from(OsString::from_vec(row.get(28)?)))
-        .map_err(|_| DiffStoreError::CorruptRecord("diff.file.relative_path"))?;
-    let kind = decode_change_kind(row.get(29)?)?;
-    let additions = DiffLineCount::new(decode_u32("diff.file.additions", row.get(30)?)?);
-    let deletions = DiffLineCount::new(decode_u32("diff.file.deletions", row.get(31)?)?);
-
-    Ok(RegisteredDiffEvidence::from_parts(
-        DiffAttribution::new(id, workspace_id, activity_id, change_set_id, mutation_id),
-        DiffFileSummary::new(path, kind, additions, deletions),
-        payload,
-        DiffEvidenceTimestamps::new(created_at, updated_at),
-        DiffContractVersions::new(renderer_version, redaction_policy_version),
-        revision,
-    ))
-}
-
 #[derive(Debug)]
 struct RawPayloadFields {
     pending_path: Option<Vec<u8>>,
@@ -1451,12 +1465,18 @@ fn decode_payload(
     let fields = DecodedPayloadFields::decode(raw)?;
     match (state, render_kind) {
         (DiffEvidenceState::Intent, DiffRenderKind::Text) => decode_intent_text(fields),
-        (DiffEvidenceState::Intent, DiffRenderKind::Binary | DiffRenderKind::Oversized) => {
+        (
+            DiffEvidenceState::Intent,
+            DiffRenderKind::Binary | DiffRenderKind::Oversized | DiffRenderKind::Structured,
+        ) => {
             fields.require_empty()?;
             Ok(DiffPayloadProjection::IntentSummary { render_kind })
         }
         (DiffEvidenceState::Ready, DiffRenderKind::Text) => decode_ready(fields),
-        (DiffEvidenceState::SummaryOnly, DiffRenderKind::Binary | DiffRenderKind::Oversized) => {
+        (
+            DiffEvidenceState::SummaryOnly,
+            DiffRenderKind::Binary | DiffRenderKind::Oversized | DiffRenderKind::Structured,
+        ) => {
             fields.require_empty()?;
             Ok(DiffPayloadProjection::SummaryOnly { render_kind })
         }
@@ -1622,6 +1642,7 @@ const fn encode_render_kind(value: DiffRenderKind) -> i64 {
         DiffRenderKind::Text => 0,
         DiffRenderKind::Binary => 1,
         DiffRenderKind::Oversized => 2,
+        DiffRenderKind::Structured => 3,
     }
 }
 
@@ -1630,7 +1651,15 @@ const fn decode_render_kind(value: i64) -> Result<DiffRenderKind, DiffStoreError
         0 => Ok(DiffRenderKind::Text),
         1 => Ok(DiffRenderKind::Binary),
         2 => Ok(DiffRenderKind::Oversized),
+        3 => Ok(DiffRenderKind::Structured),
         _ => Err(DiffStoreError::CorruptRecord("diff.render_kind")),
+    }
+}
+
+const fn encode_entry_subject(value: DiffEntrySubject) -> i64 {
+    match value {
+        DiffEntrySubject::File => 0,
+        DiffEntrySubject::Directory => 1,
     }
 }
 
@@ -1639,6 +1668,7 @@ const fn encode_change_kind(value: DiffChangeKind) -> i64 {
         DiffChangeKind::Created => 0,
         DiffChangeKind::Modified => 1,
         DiffChangeKind::Deleted => 2,
+        DiffChangeKind::Moved => 3,
     }
 }
 
@@ -1647,7 +1677,8 @@ const fn decode_change_kind(value: i64) -> Result<DiffChangeKind, DiffStoreError
         0 => Ok(DiffChangeKind::Created),
         1 => Ok(DiffChangeKind::Modified),
         2 => Ok(DiffChangeKind::Deleted),
-        _ => Err(DiffStoreError::CorruptRecord("diff.file.kind")),
+        3 => Ok(DiffChangeKind::Moved),
+        _ => Err(DiffStoreError::CorruptRecord("diff.entry.kind")),
     }
 }
 
@@ -1810,8 +1841,11 @@ mod tests {
     use std::path::PathBuf;
 
     use forge_domain::{
-        ChangeSetState, DiffArtifactRelativePath, DiffByteCount, DiffEvidenceState,
-        DiffPayloadHash, DiffRenderKind,
+        ActivityLeaseRevision, ChangeSetAttribution, ChangeSetState, DiffArtifactRelativePath,
+        DiffAttribution, DiffByteCount, DiffChangeKind, DiffEntrySubject, DiffEvidenceState,
+        DiffPayloadHash, DiffRenderKind, FileContentHash, RuntimeInstanceId, TimestampMillis,
+        TreeChangeSetIntent, TreeChangeSetPlan, TreeMutationId, TreeMutationPlan,
+        WorkspaceRelativePath, WorkspaceRevision,
     };
     use rusqlite::params;
     use uuid::Uuid;
@@ -1820,6 +1854,442 @@ mod tests {
 
     fn artifact(value: &str) -> Result<DiffArtifactRelativePath, Box<dyn std::error::Error>> {
         Ok(DiffArtifactRelativePath::new(PathBuf::from(value))?)
+    }
+
+    fn tree_attribution(seed: u128) -> ChangeSetAttribution {
+        ChangeSetAttribution::new(
+            ChangeSetId::from_uuid(Uuid::from_u128(seed)),
+            WorkspaceId::from_uuid(Uuid::from_u128(0x100)),
+            WorkspaceRevision::INITIAL,
+            ActivityId::from_uuid(Uuid::from_u128(0x200)),
+            RuntimeInstanceId::from_uuid(Uuid::from_u128(seed + 1)),
+            ActivityLeaseRevision::INITIAL,
+        )
+    }
+
+    fn tree_plan(paths: &[&str]) -> Result<TreeChangeSetPlan, Box<dyn std::error::Error>> {
+        let mutations = paths
+            .iter()
+            .map(|value| {
+                Ok(TreeMutationPlan::update_file(
+                    WorkspaceRelativePath::new(PathBuf::from(value))?,
+                    FileContentHash::from_bytes([1; FileContentHash::BYTE_LEN]),
+                    FileContentHash::from_bytes([2; FileContentHash::BYTE_LEN]),
+                ))
+            })
+            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+        Ok(TreeChangeSetPlan::new(mutations)?)
+    }
+
+    fn tree_intent(
+        seed: u128,
+        paths: &[&str],
+    ) -> Result<TreeChangeSetIntent, Box<dyn std::error::Error>> {
+        let plan = tree_plan(paths)?;
+        let mutation_ids = (0..plan.mutations().len())
+            .map(|offset| TreeMutationId::from_uuid(Uuid::from_u128(seed + offset as u128 + 10)))
+            .collect();
+        Ok(TreeChangeSetIntent::from_plan(
+            tree_attribution(seed),
+            mutation_ids,
+            &plan,
+            TimestampMillis::new(1)?,
+        )?)
+    }
+
+    fn patch_intent_with_counts(
+        seed: u128,
+        additions: u32,
+        deletions: u32,
+    ) -> Result<TreeChangeSetIntent, Box<dyn std::error::Error>> {
+        let plan = tree_plan(&["src/lib.rs"])?;
+        let mutation_id = TreeMutationId::from_uuid(Uuid::from_u128(seed + 10));
+        let entry = DiffEntrySummary::new(
+            DiffEntrySubject::File,
+            WorkspaceRelativePath::new(PathBuf::from("src/lib.rs"))?,
+            None,
+            DiffChangeKind::Modified,
+            DiffLineCount::new(additions),
+            DiffLineCount::new(deletions),
+        )?;
+        Ok(TreeChangeSetIntent::from_plan_with_diff_entries(
+            tree_attribution(seed),
+            vec![mutation_id],
+            &plan,
+            TimestampMillis::new(1)?,
+            vec![entry],
+        )?)
+    }
+
+    fn tree_connection(
+        attribution: ChangeSetAttribution,
+    ) -> Result<Connection, Box<dyn std::error::Error>> {
+        let connection = doctor_connection()?;
+        connection.execute(
+            "INSERT INTO change_sets(
+                changeset_id, workspace_id, activity_id, state,
+                created_at_ms, updated_at_ms, revision
+             ) VALUES (?1, ?2, ?3, 0, 1, 1, 1)",
+            params![
+                attribution.id().into_uuid().as_bytes(),
+                attribution.workspace_id().into_uuid().as_bytes(),
+                attribution.activity_id().into_uuid().as_bytes(),
+            ],
+        )?;
+        Ok(connection)
+    }
+
+    fn mark_change_set_applied(
+        connection: &Connection,
+        id: ChangeSetId,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let changed = connection.execute(
+            "UPDATE change_sets SET state = 1, updated_at_ms = 2, revision = 2
+             WHERE changeset_id = ?1",
+            params![id.into_uuid().as_bytes()],
+        )?;
+        if changed != 1 {
+            return Err("tree ChangeSet fixture did not transition to Applied".into());
+        }
+        Ok(())
+    }
+
+    fn tree_command(
+        intent: &TreeChangeSetIntent,
+        versions: DiffContractVersions,
+        payload: DiffPayloadProjection,
+        entries: Vec<DiffEntrySummary>,
+    ) -> Result<BeginDiffEvidence, Box<dyn std::error::Error>> {
+        let attribution = intent.attribution();
+        let diff_attribution = DiffAttribution::for_tree_change_set(
+            DiffId::for_change_set(attribution.id()),
+            attribution.workspace_id(),
+            attribution.activity_id(),
+            attribution.id(),
+        );
+        tree_command_with_attribution(
+            diff_attribution,
+            intent.observed_at(),
+            versions,
+            payload,
+            entries,
+        )
+    }
+
+    fn tree_command_with_attribution(
+        attribution: DiffAttribution,
+        observed_at: TimestampMillis,
+        versions: DiffContractVersions,
+        payload: DiffPayloadProjection,
+        entries: Vec<DiffEntrySummary>,
+    ) -> Result<BeginDiffEvidence, Box<dyn std::error::Error>> {
+        Ok(BeginDiffEvidence::new(
+            attribution,
+            entries,
+            payload,
+            observed_at,
+            versions,
+        )?)
+    }
+
+    fn assert_tree_begin_rejected(
+        connection: &mut Connection,
+        intent: &TreeChangeSetIntent,
+        command: &BeginDiffEvidence,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let transaction = connection.transaction()?;
+        assert!(matches!(
+            begin_tree(&transaction, intent, command),
+            Err(DiffStoreError::AttributionMismatch)
+        ));
+        transaction.rollback()?;
+        Ok(())
+    }
+
+    fn text_payload(diff_id: DiffId) -> Result<DiffPayloadProjection, Box<dyn std::error::Error>> {
+        Ok(DiffPayloadProjection::IntentText {
+            pending_relative_path: artifact(&format!("diffs/.diff-{diff_id}.pending"))?,
+            final_relative_path: artifact(&format!("diffs/diff_{diff_id}.diff.zst"))?,
+            compressed_hash: DiffPayloadHash::from_bytes([3; HASH_BYTES]),
+            uncompressed_hash: DiffPayloadHash::from_bytes([4; HASH_BYTES]),
+            compressed_size: DiffByteCount::new(3),
+            uncompressed_size: DiffByteCount::new(4),
+        })
+    }
+
+    fn ready_payload(diff_id: DiffId) -> Result<DiffPayloadProjection, Box<dyn std::error::Error>> {
+        Ok(DiffPayloadProjection::Ready {
+            relative_path: artifact(&format!("diffs/diff_{diff_id}.diff.zst"))?,
+            compressed_hash: DiffPayloadHash::from_bytes([3; HASH_BYTES]),
+            uncompressed_hash: DiffPayloadHash::from_bytes([4; HASH_BYTES]),
+            compressed_size: DiffByteCount::new(3),
+            uncompressed_size: DiffByteCount::new(4),
+        })
+    }
+
+    #[test]
+    fn tree_v2_text_begin_complete_and_reopen_preserves_counted_entries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let intent = patch_intent_with_counts(0x700, 8, 3)?;
+        let attribution = intent.attribution();
+        let mut connection = tree_connection(attribution)?;
+        let diff_id = DiffId::for_change_set(attribution.id());
+        let begin_command = tree_command(
+            &intent,
+            DiffContractVersions::V2,
+            text_payload(diff_id)?,
+            intent.diff_entries().to_vec(),
+        )?;
+
+        let transaction = connection.transaction()?;
+        let started = begin_tree(&transaction, &intent, &begin_command)?;
+        assert_eq!(started.state(), DiffEvidenceState::Intent);
+        assert_eq!(started.entries(), intent.diff_entries());
+        transaction.commit()?;
+
+        let reopened_intent = get_by_change_set(&connection, attribution.id())?
+            .ok_or("tree Diff intent was not durable")?;
+        assert_eq!(reopened_intent.entries(), intent.diff_entries());
+        assert_eq!(reopened_intent.renderer_version(), DiffRendererVersion::V2);
+        assert_eq!(
+            reopened_intent.redaction_policy_version(),
+            DiffRedactionPolicyVersion::V2
+        );
+        assert!(matches!(
+            reopened_intent.payload(),
+            DiffPayloadProjection::IntentText { .. }
+        ));
+
+        let completion = CompleteDiffEvidence::new(
+            diff_id,
+            DiffRevision::INITIAL,
+            ready_payload(diff_id)?,
+            TimestampMillis::new(2)?,
+        )?;
+        let transaction = connection.transaction()?;
+        complete(&transaction, &completion)?;
+        transaction.commit()?;
+        mark_change_set_applied(&connection, attribution.id())?;
+
+        let reopened_ready = get_by_change_set(&connection, attribution.id())?
+            .ok_or("completed tree Diff was not readable after reopen")?;
+        assert_eq!(reopened_ready.state(), DiffEvidenceState::Ready);
+        assert_eq!(reopened_ready.entries(), intent.diff_entries());
+        assert!(matches!(
+            reopened_ready.payload(),
+            DiffPayloadProjection::Ready { .. }
+        ));
+        assert!(inspect_tree(&connection, &intent, &begin_command)?.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn tree_v1_structured_and_v2_oversized_summaries_keep_truthful_contract()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let structured_intent = tree_intent(0x710, &["created.txt", "src/lib.rs"])?;
+        let structured_attribution = structured_intent.attribution();
+        let mut structured_connection = tree_connection(structured_attribution)?;
+        let structured_begin = tree_command(
+            &structured_intent,
+            DiffContractVersions::V1,
+            DiffPayloadProjection::IntentSummary {
+                render_kind: DiffRenderKind::Structured,
+            },
+            structured_intent.diff_entries().to_vec(),
+        )?;
+        let transaction = structured_connection.transaction()?;
+        let structured_started = begin_tree(&transaction, &structured_intent, &structured_begin)?;
+        assert_eq!(structured_started.state(), DiffEvidenceState::Intent);
+        assert_eq!(
+            structured_started.entries(),
+            structured_intent.diff_entries()
+        );
+        transaction.commit()?;
+        let structured_completion = CompleteDiffEvidence::new(
+            DiffId::for_change_set(structured_attribution.id()),
+            DiffRevision::INITIAL,
+            DiffPayloadProjection::SummaryOnly {
+                render_kind: DiffRenderKind::Structured,
+            },
+            TimestampMillis::new(2)?,
+        )?;
+        let transaction = structured_connection.transaction()?;
+        complete(&transaction, &structured_completion)?;
+        transaction.commit()?;
+        mark_change_set_applied(&structured_connection, structured_attribution.id())?;
+        let structured = get_by_change_set(&structured_connection, structured_attribution.id())?
+            .ok_or("V1 structured tree Diff was not readable")?;
+        assert_eq!(structured.state(), DiffEvidenceState::SummaryOnly);
+        assert_eq!(
+            structured.payload().render_kind(),
+            DiffRenderKind::Structured
+        );
+
+        let oversized_intent = patch_intent_with_counts(0x720, 0, 0)?;
+        let oversized_attribution = oversized_intent.attribution();
+        let mut oversized_connection = tree_connection(oversized_attribution)?;
+        let oversized_begin = tree_command(
+            &oversized_intent,
+            DiffContractVersions::V2,
+            DiffPayloadProjection::IntentSummary {
+                render_kind: DiffRenderKind::Oversized,
+            },
+            oversized_intent.diff_entries().to_vec(),
+        )?;
+        let transaction = oversized_connection.transaction()?;
+        let oversized_started = begin_tree(&transaction, &oversized_intent, &oversized_begin)?;
+        assert_eq!(oversized_started.state(), DiffEvidenceState::Intent);
+        assert_eq!(oversized_started.entries(), oversized_intent.diff_entries());
+        transaction.commit()?;
+        let oversized_completion = CompleteDiffEvidence::new(
+            DiffId::for_change_set(oversized_attribution.id()),
+            DiffRevision::INITIAL,
+            DiffPayloadProjection::SummaryOnly {
+                render_kind: DiffRenderKind::Oversized,
+            },
+            TimestampMillis::new(2)?,
+        )?;
+        let transaction = oversized_connection.transaction()?;
+        complete(&transaction, &oversized_completion)?;
+        transaction.commit()?;
+        mark_change_set_applied(&oversized_connection, oversized_attribution.id())?;
+        let oversized = get_by_change_set(&oversized_connection, oversized_attribution.id())?
+            .ok_or("V2 oversized tree Diff was not readable")?;
+        assert_eq!(oversized.state(), DiffEvidenceState::SummaryOnly);
+        assert_eq!(oversized.payload().render_kind(), DiffRenderKind::Oversized);
+        Ok(())
+    }
+
+    #[test]
+    fn tree_begin_rejects_count_order_and_path_mismatch() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let intent = tree_intent(0x730, &["src/a.rs", "src/b.rs"])?;
+        let attribution = intent.attribution();
+
+        let mut wrong_count = intent.diff_entries().to_vec();
+        wrong_count[0] = DiffEntrySummary::new(
+            DiffEntrySubject::File,
+            WorkspaceRelativePath::new(PathBuf::from("src/a.rs"))?,
+            None,
+            DiffChangeKind::Modified,
+            DiffLineCount::new(1),
+            DiffLineCount::new(0),
+        )?;
+        let wrong_count_command = tree_command(
+            &intent,
+            DiffContractVersions::V1,
+            DiffPayloadProjection::IntentSummary {
+                render_kind: DiffRenderKind::Structured,
+            },
+            wrong_count,
+        )?;
+        let mut connection = tree_connection(attribution)?;
+        assert_tree_begin_rejected(&mut connection, &intent, &wrong_count_command)?;
+
+        let mut reversed = intent.diff_entries().to_vec();
+        reversed.reverse();
+        let reversed_command = tree_command(
+            &intent,
+            DiffContractVersions::V1,
+            DiffPayloadProjection::IntentSummary {
+                render_kind: DiffRenderKind::Structured,
+            },
+            reversed,
+        )?;
+        assert_tree_begin_rejected(&mut connection, &intent, &reversed_command)?;
+
+        let mut wrong_path = intent.diff_entries().to_vec();
+        wrong_path[0] = DiffEntrySummary::new(
+            DiffEntrySubject::File,
+            WorkspaceRelativePath::new(PathBuf::from("src/other.rs"))?,
+            None,
+            DiffChangeKind::Modified,
+            DiffLineCount::new(0),
+            DiffLineCount::new(0),
+        )?;
+        let wrong_path_command = tree_command(
+            &intent,
+            DiffContractVersions::V1,
+            DiffPayloadProjection::IntentSummary {
+                render_kind: DiffRenderKind::Structured,
+            },
+            wrong_path,
+        )?;
+        assert_tree_begin_rejected(&mut connection, &intent, &wrong_path_command)?;
+        Ok(())
+    }
+
+    #[test]
+    fn tree_begin_rejects_unsafe_payloads_and_mixed_text() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let intent = tree_intent(0x735, &["src/a.rs", "src/b.rs"])?;
+        let attribution = intent.attribution();
+        let mut connection = tree_connection(attribution)?;
+        let unsafe_payloads = [
+            (
+                DiffContractVersions::V1,
+                DiffPayloadProjection::IntentText {
+                    pending_relative_path: artifact("diffs/.diff-unsafe.pending")?,
+                    final_relative_path: artifact("diffs/diff_unsafe.diff.zst")?,
+                    compressed_hash: DiffPayloadHash::from_bytes([3; HASH_BYTES]),
+                    uncompressed_hash: DiffPayloadHash::from_bytes([4; HASH_BYTES]),
+                    compressed_size: DiffByteCount::new(3),
+                    uncompressed_size: DiffByteCount::new(4),
+                },
+            ),
+            (
+                DiffContractVersions::V1,
+                DiffPayloadProjection::IntentSummary {
+                    render_kind: DiffRenderKind::Oversized,
+                },
+            ),
+            (
+                DiffContractVersions::V2,
+                DiffPayloadProjection::IntentSummary {
+                    render_kind: DiffRenderKind::Structured,
+                },
+            ),
+            (
+                DiffContractVersions::V2,
+                DiffPayloadProjection::IntentSummary {
+                    render_kind: DiffRenderKind::Binary,
+                },
+            ),
+        ];
+        for (versions, payload) in unsafe_payloads {
+            let command = tree_command(&intent, versions, payload, intent.diff_entries().to_vec())?;
+            assert_tree_begin_rejected(&mut connection, &intent, &command)?;
+        }
+
+        let mixed_plan = TreeChangeSetPlan::new(vec![
+            TreeMutationPlan::create_directory(WorkspaceRelativePath::new(PathBuf::from(
+                "generated",
+            ))?),
+            TreeMutationPlan::update_file(
+                WorkspaceRelativePath::new(PathBuf::from("src/lib.rs"))?,
+                FileContentHash::from_bytes([1; FileContentHash::BYTE_LEN]),
+                FileContentHash::from_bytes([2; FileContentHash::BYTE_LEN]),
+            ),
+        ])?;
+        let mixed_intent = TreeChangeSetIntent::from_plan(
+            tree_attribution(0x740),
+            vec![
+                TreeMutationId::from_uuid(Uuid::from_u128(0x750)),
+                TreeMutationId::from_uuid(Uuid::from_u128(0x751)),
+            ],
+            &mixed_plan,
+            TimestampMillis::new(1)?,
+        )?;
+        let mixed_attribution = mixed_intent.attribution();
+        let mut mixed_connection = tree_connection(mixed_attribution)?;
+        let mixed_command = tree_command(
+            &mixed_intent,
+            DiffContractVersions::V2,
+            text_payload(DiffId::for_change_set(mixed_attribution.id()))?,
+            mixed_intent.diff_entries().to_vec(),
+        )?;
+        assert_tree_begin_rejected(&mut mixed_connection, &mixed_intent, &mixed_command)?;
+        Ok(())
     }
 
     #[test]
@@ -1833,9 +2303,10 @@ mod tests {
              CREATE TABLE file_mutations(mutation_id BLOB PRIMARY KEY);",
         )?;
         create_schema(&connection)?;
+        crate::workspace_goal_deletion::create_schema(&connection)?;
         for (kind, name, expected) in [
             ("table", "diff_evidence", EXPECTED_DIFF_EVIDENCE_TABLE_SQL),
-            ("table", "diff_files", EXPECTED_DIFF_FILES_TABLE_SQL),
+            ("table", "diff_entries", EXPECTED_DIFF_ENTRIES_TABLE_SQL),
             (
                 "index",
                 "diff_evidence_activity_created_idx",
@@ -1949,6 +2420,7 @@ mod tests {
              );",
         )?;
         create_schema(&connection)?;
+        crate::workspace_goal_deletion::create_schema(&connection)?;
         connection.execute(
             "INSERT INTO workspace(workspace_id) VALUES (?1)",
             params![Uuid::from_u128(0x100).as_bytes()],
@@ -2037,12 +2509,12 @@ mod tests {
         let encoded_render_kind = encode_render_kind(render_kind);
         connection.execute(
             "INSERT INTO diff_evidence(
-                diff_id, changeset_id, workspace_id, activity_id, mutation_id,
+                diff_id, changeset_id, workspace_id, activity_id, origin_kind, mutation_id,
                 state, render_kind, pending_relative_path, artifact_relative_path,
                 compressed_hash, uncompressed_hash, compressed_size, uncompressed_size,
                 renderer_version, redaction_policy_version, created_at_ms,
                 updated_at_ms, revision
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+             ) VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
                        1, 1, ?14, ?14, 1)",
             params![
                 diff_id.into_uuid().as_bytes(),
@@ -2062,25 +2534,15 @@ mod tests {
             ],
         )?;
         connection.execute(
-            "INSERT INTO diff_files(diff_id, ordinal, relative_path, kind, additions, deletions)
-             VALUES (?1, 0, ?2, 0, 1, 0)",
+            "INSERT INTO diff_entries(
+                diff_id, ordinal, subject_kind, primary_path, secondary_path, kind, additions, deletions
+             ) VALUES (?1, 0, 0, ?2, NULL, 0, 1, 0)",
             params![
                 diff_id.into_uuid().as_bytes(),
                 format!("src/file-{seed}.rs").as_bytes()
             ],
         )?;
         Ok(diff_id)
-    }
-
-    fn insert_legacy(
-        connection: &Connection,
-        seed: u128,
-        state: ChangeSetState,
-    ) -> Result<DiffId, Box<dyn std::error::Error>> {
-        let (change_set_id, _) = insert_change_set(connection, seed, state)?;
-        Ok(DiffId::for_change_set(ChangeSetId::from_uuid(
-            change_set_id,
-        )))
     }
 
     #[test]
@@ -2121,20 +2583,15 @@ mod tests {
             DiffEvidenceState::PurgePending,
             DiffRenderKind::Text,
         )?;
-        let legacy = insert_legacy(&connection, 0x305, ChangeSetState::Applied)?;
-
         let report = doctor_references(&connection)?;
-        assert_eq!(report.references().len(), 5);
+        assert_eq!(report.references().len(), 4);
         assert!(!report.truncated());
         let pending_reference = report
             .references()
             .iter()
             .find(|reference| reference.diff_id() == pending)
             .ok_or("pending reference missing")?;
-        assert_eq!(
-            pending_reference.lifecycle().evidence_state(),
-            Some(DiffEvidenceState::Intent)
-        );
+        assert_eq!(pending_reference.state(), DiffEvidenceState::Intent);
         assert_eq!(
             pending_reference
                 .pending_artifact()
@@ -2163,30 +2620,14 @@ mod tests {
             .iter()
             .find(|reference| reference.diff_id() == summary)
             .ok_or("summary reference missing")?;
-        assert_eq!(
-            summary_reference.lifecycle().evidence_state(),
-            Some(DiffEvidenceState::SummaryOnly)
-        );
+        assert_eq!(summary_reference.state(), DiffEvidenceState::SummaryOnly);
         assert!(summary_reference.final_artifact().is_none());
         let purge_reference = report
             .references()
             .iter()
             .find(|reference| reference.diff_id() == purge_pending)
             .ok_or("purge reference missing")?;
-        assert_eq!(
-            purge_reference.lifecycle().evidence_state(),
-            Some(DiffEvidenceState::PurgePending)
-        );
-        let legacy_reference = report
-            .references()
-            .iter()
-            .find(|reference| reference.diff_id() == legacy)
-            .ok_or("legacy reference missing")?;
-        assert!(legacy_reference.is_legacy());
-        assert_eq!(
-            legacy_reference.lifecycle().legacy_change_set_state(),
-            Some(ChangeSetState::Applied)
-        );
+        assert_eq!(purge_reference.state(), DiffEvidenceState::PurgePending);
         Ok(())
     }
 

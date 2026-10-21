@@ -12,7 +12,7 @@ use forge_domain::{
     DiffArtifactInvalidReason, DiffArtifactInventoryEntry, DiffArtifactInventoryKind,
     DiffArtifactInventoryLimit, DiffArtifactInventoryName, DiffArtifactRelativePath,
     DiffArtifactRelativePathError, DiffByteCount, DiffChangeKind, DiffId, DiffLineCount,
-    DiffPayloadHash, DiffRenderKind, WorkspaceRelativePath,
+    DiffPayloadHash, DiffRenderKind, FileEntryKind, WorkspaceRelativePath,
 };
 use rustix::fs::{
     AtFlags, Mode, OFlags, RenameFlags, fchmod, fstat, fsync, openat, renameat_with, unlinkat,
@@ -21,15 +21,21 @@ use rustix::io::Errno;
 use similar::{Algorithm, ChangeTag, TextDiff};
 use thiserror::Error;
 
+#[cfg(target_os = "macos")]
+use crate::confinement::reopen_workspace_root;
+#[cfg(not(target_os = "macos"))]
+use crate::confinement::walk_directories;
 use crate::confinement::{
     DirectoryIdentity, ensure_directory_identity, require_regular_single_link, sync_file,
-    walk_directories,
 };
 use crate::{CapturedDiffSource, ConfinedFilesystemError};
 
-/// Stable renderer contract recorded beside every durable Diff Evidence row.
+mod patch;
+pub use patch::render_patch_diff_evidence;
+
+/// Legacy whole-source renderer contract; patch windows use domain V2 versions.
 pub const DIFF_RENDERER_VERSION: u32 = 1;
-/// Stable deterministic redaction contract recorded beside every Diff row.
+/// Legacy whole-source redaction contract; V2 preserves patch-window line counts.
 pub const DIFF_REDACTION_POLICY_VERSION: u32 = 1;
 /// Maximum redacted unified-diff bytes retained before compression.
 pub const MAX_DIFF_RENDERED_BYTES: usize = 128 * 1024;
@@ -110,6 +116,31 @@ impl std::fmt::Debug for RenderedTextDiff {
 }
 
 impl RenderedTextDiff {
+    /// Combine already-redacted file diffs under the same artifact byte bound.
+    pub fn combine(parts: Vec<Self>) -> RenderedDiffEvidence {
+        let total = parts
+            .iter()
+            .try_fold(0_usize, |total, part| total.checked_add(part.bytes.len()));
+        let Some(total) = total.filter(|total| *total <= MAX_DIFF_RENDERED_BYTES) else {
+            return RenderedDiffEvidence::SummaryOnly {
+                render_kind: DiffRenderKind::Oversized,
+            };
+        };
+        let mut bytes = Vec::with_capacity(total);
+        let mut additions = 0_u32;
+        let mut deletions = 0_u32;
+        for part in parts {
+            bytes.extend_from_slice(&part.bytes);
+            additions = additions.saturating_add(part.additions.get());
+            deletions = deletions.saturating_add(part.deletions.get());
+        }
+        RenderedDiffEvidence::Text(Self {
+            bytes,
+            additions: DiffLineCount::new(additions),
+            deletions: DiffLineCount::new(deletions),
+        })
+    }
+
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
@@ -125,7 +156,11 @@ impl RenderedTextDiff {
 
 /// Descriptor-rooted owner for durable Diff Evidence artifacts.
 pub struct DiffArtifactStore {
+    #[cfg(target_os = "macos")]
+    workspace_root: PathBuf,
+    #[cfg(not(target_os = "macos"))]
     filesystem_root: OwnedFd,
+    #[cfg(not(target_os = "macos"))]
     root_components: Vec<OsString>,
     root: OwnedFd,
     root_identity: DirectoryIdentity,
@@ -179,7 +214,11 @@ impl DiffArtifactInventory {
 impl DiffArtifactStore {
     pub(crate) fn from_parts(parts: DiffArtifactStoreParts) -> Self {
         Self {
+            #[cfg(target_os = "macos")]
+            workspace_root: parts.workspace_root,
+            #[cfg(not(target_os = "macos"))]
             filesystem_root: parts.filesystem_root,
+            #[cfg(not(target_os = "macos"))]
             root_components: parts.root_components,
             root: parts.root,
             root_identity: parts.root_identity,
@@ -267,6 +306,7 @@ impl DiffArtifactStore {
     ) -> Result<PublishedDiffArtifact, DiffArtifactStoreError> {
         self.ensure_scope(true)?;
         let final_name = final_name(staged.metadata.id);
+        self.verify_named_metadata(&staged.pending_name, &staged.metadata)?;
         match renameat_with(
             &self.diffs,
             &staged.pending_name,
@@ -288,7 +328,7 @@ impl DiffArtifactStore {
                     }
                 }
             }
-            Err(Errno::NOTSUP | Errno::OPNOTSUPP | Errno::NOSYS) => {
+            Err(source) if [Errno::NOTSUP, Errno::OPNOTSUPP, Errno::NOSYS].contains(&source) => {
                 return Err(DiffArtifactStoreError::AtomicPublishUnsupported);
             }
             Err(source) => {
@@ -302,6 +342,7 @@ impl DiffArtifactStore {
             operation: DiffArtifactOperation::SyncDiffDirectory,
             source,
         })?;
+        self.verify_named_metadata(&final_name, &staged.metadata)?;
         self.ensure_scope(true)?;
         Ok(PublishedDiffArtifact {
             metadata: staged.metadata,
@@ -408,6 +449,24 @@ impl DiffArtifactStore {
                         kind,
                         diff_id,
                         DiffArtifactInvalidReason::NonRegular,
+                    ));
+                    continue;
+                }
+                Err(DiffArtifactStoreError::Scope(ConfinedFilesystemError::InvalidPathKind {
+                    actual,
+                    ..
+                })) => {
+                    let reason = match actual {
+                        FileEntryKind::SymbolicLink => DiffArtifactInvalidReason::Symlink,
+                        FileEntryKind::Directory
+                        | FileEntryKind::RegularFile
+                        | FileEntryKind::Other => DiffArtifactInvalidReason::NonRegular,
+                    };
+                    invalid_entries.push(DiffArtifactInvalidInventoryEntry::new(
+                        inventory_name,
+                        kind,
+                        diff_id,
+                        reason,
                     ));
                     continue;
                 }
@@ -542,7 +601,8 @@ impl DiffArtifactStore {
                 | DiffArtifactStoreError::Scope(
                     ConfinedFilesystemError::SymlinkRejected
                     | ConfinedFilesystemError::NonRegularLeaf
-                    | ConfinedFilesystemError::HardlinkRejected,
+                    | ConfinedFilesystemError::HardlinkRejected
+                    | ConfinedFilesystemError::InvalidPathKind { .. },
                 ),
             ) => Ok(DiffArtifactHealth::Corrupt),
             Err(error) => Err(error),
@@ -552,6 +612,10 @@ impl DiffArtifactStore {
     fn ensure_scope(&self, committed: bool) -> Result<(), DiffArtifactStoreError> {
         ensure_directory_identity(&self.root, self.root_identity, committed)
             .map_err(DiffArtifactStoreError::Scope)?;
+        #[cfg(target_os = "macos")]
+        let reopened_root = reopen_workspace_root(&self.workspace_root, committed)
+            .map_err(DiffArtifactStoreError::Scope)?;
+        #[cfg(not(target_os = "macos"))]
         let reopened_root =
             walk_directories(&self.filesystem_root, &self.root_components, committed)
                 .map_err(DiffArtifactStoreError::Scope)?;
@@ -651,7 +715,11 @@ impl DiffArtifactStore {
 
 #[derive(Debug)]
 pub(crate) struct DiffArtifactStoreParts {
+    #[cfg(target_os = "macos")]
+    pub(crate) workspace_root: PathBuf,
+    #[cfg(not(target_os = "macos"))]
     pub(crate) filesystem_root: OwnedFd,
+    #[cfg(not(target_os = "macos"))]
     pub(crate) root_components: Vec<OsString>,
     pub(crate) root: OwnedFd,
     pub(crate) root_identity: DirectoryIdentity,
@@ -923,7 +991,7 @@ fn verify_bytes(
 }
 
 fn payload_hash(bytes: &[u8]) -> DiffPayloadHash {
-    DiffPayloadHash::from_bytes(*blake3::hash(bytes).as_bytes())
+    DiffPayloadHash::for_content(bytes)
 }
 
 fn byte_count(length: usize) -> Result<DiffByteCount, DiffArtifactStoreError> {
@@ -1084,7 +1152,7 @@ pub fn render_diff_evidence(
         }
     }
 
-    let (old_header, new_header) = diff_headers(path, kind);
+    let (old_header, new_header) = diff_headers(path, kind)?;
     let initial_capacity = redacted_old
         .len()
         .saturating_add(redacted_new.len())
@@ -1193,12 +1261,16 @@ const fn is_key_character(character: char) -> bool {
     character.is_ascii_alphanumeric() || character == '_'
 }
 
-fn diff_headers(path: &WorkspaceRelativePath, kind: DiffChangeKind) -> (String, String) {
+fn diff_headers(
+    path: &WorkspaceRelativePath,
+    kind: DiffChangeKind,
+) -> Result<(String, String), DiffRenderError> {
     let encoded = diff_path_label(path);
     match kind {
-        DiffChangeKind::Created => ("/dev/null".to_owned(), format!("b/{encoded}")),
-        DiffChangeKind::Modified => (format!("a/{encoded}"), format!("b/{encoded}")),
-        DiffChangeKind::Deleted => (format!("a/{encoded}"), "/dev/null".to_owned()),
+        DiffChangeKind::Created => Ok(("/dev/null".to_owned(), format!("b/{encoded}"))),
+        DiffChangeKind::Modified => Ok((format!("a/{encoded}"), format!("b/{encoded}"))),
+        DiffChangeKind::Deleted => Ok((format!("a/{encoded}"), "/dev/null".to_owned())),
+        DiffChangeKind::Moved => Err(DiffRenderError::StructuredChange),
     }
 }
 
@@ -1264,6 +1336,8 @@ impl Write for BoundedWriter {
 pub enum DiffRenderError {
     #[error("Diff source pair does not describe a file change")]
     InvalidSourcePair,
+    #[error("structured source-tree changes are not rendered as one-file unified Diff text")]
+    StructuredChange,
     #[error("unified Diff rendering failed")]
     Render(#[source] io::Error),
 }
@@ -1311,6 +1385,41 @@ mod tests {
     fn artifact_store(root: &PathBuf) -> Result<DiffArtifactStore, Box<dyn std::error::Error>> {
         let layout = WorkspaceStateLayout::inspect_existing(root)?.ok_or("missing layout")?;
         Ok(ConfinedWorkspace::open(&layout)?.diff_artifact_store()?)
+    }
+
+    #[test]
+    fn publish_rejects_pending_symlink_and_content_substitution()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for substitute_link in [true, false] {
+            let root = workspace_root("publish-substitution")?;
+            let store = artifact_store(&root)?;
+            let rendered = rendered_text(render_diff_evidence(
+                &path("file.txt")?,
+                DiffChangeKind::Modified,
+                &CapturedDiffSource::Text("old\n".into()),
+                &CapturedDiffSource::Text("new\n".into()),
+            )?)?;
+            let staged = store.stage(DiffId::from_uuid(Uuid::from_u128(0xFA)), &rendered)?;
+            let pending = root
+                .join(".heterarchy-forge")
+                .join(staged.pending_relative_path()?.as_path());
+            let final_path = root
+                .join(".heterarchy-forge")
+                .join(staged.final_relative_path()?.as_path());
+            fs::remove_file(&pending)?;
+            let sentinel = root.join("sentinel");
+            fs::write(&sentinel, b"preserved")?;
+            if substitute_link {
+                symlink(&sentinel, &pending)?;
+            } else {
+                fs::write(&pending, b"corrupt substitute")?;
+            }
+            assert!(store.publish(staged).is_err());
+            assert!(!final_path.exists());
+            assert_eq!(fs::read(&sentinel)?, b"preserved");
+            fs::remove_dir_all(root)?;
+        }
+        Ok(())
     }
 
     #[test]

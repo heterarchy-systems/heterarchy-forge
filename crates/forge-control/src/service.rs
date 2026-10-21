@@ -1,14 +1,18 @@
+use std::fmt;
+
 use forge_domain::{
-    ActivityId, ActivityLeaseBatchLimit, ActivityLeaseProjection, ActivityLeaseRevision,
-    ActivityListLimit, ActivityProjection, BootstrapActivity as BootstrapActivityCommand,
-    BootstrapActivityDecision, CloseActivity, LocationId, LocationRevision,
-    ReconcileExpiredActivities, RegisteredActivity, ReleaseActivityLease, RenewActivityLease,
-    RuntimeInstanceId, TimestampMillis, WorkspaceId, WorkspaceRevision,
+    ActivityCoordinatorActor, ActivityId, ActivityLeaseBatchLimit, ActivityLeaseProjection,
+    ActivityLeaseRevision, ActivityListLimit, ActivityProjection,
+    BootstrapActivity as BootstrapActivityCommand, BootstrapActivityDecision, CloseActivity,
+    GoalId, LocationId, LocationListLimit, LocationRevision, ReconcileExpiredActivities,
+    RegisteredActivity, RegisteredLocation, ReleaseActivityLease, RenewActivityLease,
+    RuntimeInstanceId, SetLocationState, TimestampMillis, WorkspaceId, WorkspaceRevision,
 };
 use forge_persistence::{GlobalRegistry, WorkspaceStore, WorkspaceStoreError};
 use forge_workspace::{
     ExistingWorkspaceStateLayout, LocationRepositoryError, LocationService, LocationServiceError,
-    WorkspaceCandidate, WorkspaceCandidateKind, WorkspaceLocator, WorkspaceSignals,
+    WorkspaceCandidateKey, WorkspaceCandidateKind, WorkspaceDiscoveryDisposition,
+    WorkspaceDiscoveryObservation, WorkspaceDiscoveryReason, WorkspaceLocator, WorkspaceSignals,
     WorkspaceStateLayout,
 };
 
@@ -22,96 +26,101 @@ pub const MAX_ACTIVITY_PROJECTION_RESULTS: usize = 256;
 
 /// Maximum commands accepted by one atomic lease/lifecycle batch.
 pub const MAX_ACTIVITY_LEASE_BATCH: usize = 256;
+/// Maximum Activity identities accepted by one exact durable lease observation.
+pub const MAX_ACTIVITY_LEASE_OBSERVATION_IDS: usize = 128;
 
-/// Remote-safe state of a discovered Workspace candidate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum WorkspaceCatalogStatus {
-    /// An owned Forge state root was observed through strict immutable
-    /// inspection.  The durable identity is carried in this status.
-    Ready {
-        workspace_id: WorkspaceId,
-        workspace_revision: WorkspaceRevision,
-    },
-    /// The candidate has no Forge state root yet.  Listing never initializes
-    /// one and therefore cannot grant authority.
-    Uninitialized,
-    /// A valid older schema must be migrated through the explicit write/recovery
-    /// path before it can be shown as a read-only ready Workspace.
-    MigrationRequired,
-    /// The state root could not be inspected.  The code is stable and does
-    /// not contain a path or adapter error string.
-    Unavailable(ControlErrorCode),
-}
-
-impl WorkspaceCatalogStatus {
-    pub const fn is_ready(self) -> bool {
-        matches!(self, Self::Ready { .. })
-    }
-
-    pub const fn is_uninitialized(self) -> bool {
-        matches!(self, Self::Uninitialized)
-    }
-
-    pub const fn error_code(self) -> Option<ControlErrorCode> {
-        match self {
-            Self::Unavailable(code) => Some(code),
-            Self::MigrationRequired => Some(ControlErrorCode::WorkspaceMigrationRequired),
-            Self::Ready { .. } | Self::Uninitialized => None,
-        }
-    }
-
-    pub const fn is_migration_required(self) -> bool {
-        matches!(self, Self::MigrationRequired)
-    }
-
-    pub const fn workspace_id(self) -> Option<WorkspaceId> {
-        match self {
-            Self::Ready { workspace_id, .. } => Some(workspace_id),
-            Self::Uninitialized | Self::MigrationRequired | Self::Unavailable(_) => None,
-        }
-    }
-
-    pub const fn workspace_revision(self) -> Option<WorkspaceRevision> {
-        match self {
-            Self::Ready {
-                workspace_revision, ..
-            } => Some(workspace_revision),
-            Self::Uninitialized | Self::MigrationRequired | Self::Unavailable(_) => None,
-        }
-    }
-}
-
-/// Bounded remote-safe Workspace catalog entry.
+/// Typed request to register one exact root path as a Location identity.
 ///
-/// The entry intentionally carries a relative [`WorkspaceLocator`] and a
-/// display label only.  No absolute filesystem path is present in this
-/// projection.
+/// The selected path is validated and canonicalized by the Location service;
+/// only the canonical root is durably registered.
+#[must_use]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisterLocationRequest {
+    pub id: LocationId,
+    pub name: String,
+    pub selected_path: std::path::PathBuf,
+    pub observed_at: TimestampMillis,
+}
+
+/// Bounded remote-safe durable Workspace catalog entry.
+///
+/// `workspace_list` emits only registered durable Workspace identities. Filesystem
+/// discovery state is deliberately absent from this projection.
 #[must_use]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceCatalogEntry {
     locator: WorkspaceLocator,
-    kind: WorkspaceCandidateKind,
     display_name: String,
-    signals: WorkspaceSignals,
-    status: WorkspaceCatalogStatus,
+    workspace_id: WorkspaceId,
+    workspace_revision: WorkspaceRevision,
 }
 
 impl WorkspaceCatalogEntry {
-    fn from_candidate(
-        candidate: &WorkspaceCandidate,
+    fn from_registered(
+        location_id: LocationId,
         expected_revision: LocationRevision,
-        status: WorkspaceCatalogStatus,
+        display_name: String,
+        workspace_id: WorkspaceId,
+        workspace_revision: WorkspaceRevision,
     ) -> Result<Self, ControlError> {
-        let locator = candidate
+        let locator = WorkspaceCandidateKey::location_root(location_id)
+            .locator(expected_revision)
+            .map_err(|source| ControlError::with_source(ControlErrorCode::InvalidInput, source))?;
+        Ok(Self {
+            locator,
+            display_name,
+            workspace_id,
+            workspace_revision,
+        })
+    }
+
+    pub const fn locator(&self) -> &WorkspaceLocator {
+        &self.locator
+    }
+
+    pub fn display_name(&self) -> &str {
+        &self.display_name
+    }
+
+    pub const fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
+    }
+
+    pub const fn workspace_revision(&self) -> WorkspaceRevision {
+        self.workspace_revision
+    }
+}
+
+/// Bounded read-only filesystem observation returned by `workspace_discover`.
+/// This projection is correlation/evidence only and never grants registration
+/// or effect authority.
+#[must_use]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceDiscoveryEntry {
+    locator: WorkspaceLocator,
+    kind: WorkspaceCandidateKind,
+    display_name: String,
+    signals: WorkspaceSignals,
+    disposition: WorkspaceDiscoveryDisposition,
+    reason: WorkspaceDiscoveryReason,
+}
+
+impl WorkspaceDiscoveryEntry {
+    fn from_observation(
+        observation: &WorkspaceDiscoveryObservation,
+        expected_revision: LocationRevision,
+    ) -> Result<Self, ControlError> {
+        let locator = observation
             .key()
             .locator(expected_revision)
             .map_err(|source| ControlError::with_source(ControlErrorCode::InvalidInput, source))?;
         Ok(Self {
             locator,
-            kind: candidate.kind(),
-            display_name: candidate.display_label().into_owned(),
-            signals: candidate.signals(),
-            status,
+            kind: observation.kind(),
+            display_name: observation.display_label().into_owned(),
+            signals: observation.signals(),
+            disposition: observation.disposition(),
+            reason: observation.reason(),
         })
     }
 
@@ -131,8 +140,12 @@ impl WorkspaceCatalogEntry {
         self.signals
     }
 
-    pub const fn status(&self) -> WorkspaceCatalogStatus {
-        self.status
+    pub const fn disposition(&self) -> WorkspaceDiscoveryDisposition {
+        self.disposition
+    }
+
+    pub const fn reason(&self) -> WorkspaceDiscoveryReason {
+        self.reason
     }
 }
 
@@ -146,6 +159,18 @@ pub struct ResolvedWorkspaceScope {
     workspace_id: WorkspaceId,
     workspace_revision: WorkspaceRevision,
     locator: WorkspaceLocator,
+}
+
+/// Exact Goal and Coordinator preconditions for a host-supervised Activity
+/// lease renewal. Persistence rechecks all fields in the lease CAS transaction.
+#[must_use]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SupervisedActivityLeaseRenewRequest {
+    pub scope: ResolvedWorkspaceScope,
+    pub actor: ActivityCoordinatorActor,
+    pub goal_id: GoalId,
+    pub goal_created_at: TimestampMillis,
+    pub command: RenewActivityLease,
 }
 
 /// Bounded, transport/UI-neutral projection returned by the desktop refresh
@@ -223,6 +248,7 @@ impl ResolvedWorkspaceScope {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ActivityBootstrapStatus {
     Created,
+    Resumed,
     ExpiredRecoveryRequired,
     UnleasedRecoveryRequired,
     AlreadyOwned,
@@ -237,7 +263,7 @@ impl ActivityBootstrapStatus {
     pub const fn is_committed(self) -> bool {
         matches!(
             self,
-            Self::Created | Self::AlreadyOwned | Self::CommittedButUnconfirmed
+            Self::Created | Self::Resumed | Self::AlreadyOwned | Self::CommittedButUnconfirmed
         )
     }
 
@@ -289,19 +315,6 @@ pub struct ActivityOperation {
 }
 
 impl ActivityOperation {
-    fn single(
-        scope: ResolvedWorkspaceScope,
-        activity: RegisteredActivity,
-        status: ActivityOperationStatus,
-    ) -> Self {
-        Self {
-            scope,
-            activity: Some(activity),
-            activities: Vec::new(),
-            status,
-        }
-    }
-
     fn batch(
         scope: ResolvedWorkspaceScope,
         activities: Vec<RegisteredActivity>,
@@ -329,7 +342,14 @@ impl ActivityOperation {
     }
 
     fn into_single(mut self, status: ActivityOperationStatus) -> Result<Self, ControlError> {
-        if self.activities.len() != 1 || self.activity.is_some() {
+        if self.activities.len() > 1 || self.activity.is_some() {
+            return Err(ControlError::new(ControlErrorCode::Internal));
+        }
+        if self.is_committed_but_unconfirmed() {
+            self.activity = self.activities.pop();
+            return Ok(self);
+        }
+        if self.activities.len() != 1 {
             return Err(ControlError::new(ControlErrorCode::Internal));
         }
         self.activity = self.activities.pop();
@@ -479,74 +499,164 @@ impl ActivityBootstrap {
     }
 }
 
-/// Synchronous application service used by desktop and MCP adapters.
+/// Synchronous application service used by desktop-era and HTTP adapters.
 ///
 /// `LocationService<GlobalRegistry>` is the sole owner of the global
 /// repository handle.  Workspace stores are opened for one operation and are
 /// never retained as a process-global active Workspace.
-#[derive(Debug)]
 pub struct ForgeControl {
     pub(crate) locations: LocationService<GlobalRegistry>,
+    pub(crate) session_authority: Box<dyn crate::AgentSessionAuthority>,
+}
+
+impl fmt::Debug for ForgeControl {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ForgeControl")
+            .field("locations", &self.locations)
+            .field("session_authority", &"<injected>")
+            .finish()
+    }
 }
 
 impl ForgeControl {
-    pub const fn new(registry: GlobalRegistry) -> Self {
-        Self {
-            locations: LocationService::new(registry),
-        }
+    pub fn new(registry: GlobalRegistry) -> Self {
+        let session_catalog_path = registry
+            .database_path()
+            .with_file_name("agent-sessions.sqlite3");
+        Self::from_location_service(LocationService::new(registry), session_catalog_path)
     }
 
     /// Construct the control service around an already-owned Location
     /// application service without exposing its repository escape hatches.
-    pub const fn from_location_service(locations: LocationService<GlobalRegistry>) -> Self {
-        Self { locations }
+    pub fn from_location_service(
+        locations: LocationService<GlobalRegistry>,
+        session_catalog_path: std::path::PathBuf,
+    ) -> Self {
+        Self {
+            locations,
+            session_authority: crate::agent_session::local_session_authority(session_catalog_path),
+        }
     }
 
     /// Alias for adapters that name this boundary explicitly.
-    pub const fn with_location_service(locations: LocationService<GlobalRegistry>) -> Self {
-        Self::from_location_service(locations)
+    pub fn with_location_service(
+        locations: LocationService<GlobalRegistry>,
+        session_catalog_path: std::path::PathBuf,
+    ) -> Self {
+        Self::from_location_service(locations, session_catalog_path)
     }
 
-    /// List discovered candidates without initializing state or mutating Git,
-    /// `SQLite`, or the filesystem.  The candidate scanner itself is bounded;
-    /// this method applies a second explicit guard before allocation.
+    /// Compose control around an explicit logical Agent session authority.
+    ///
+    /// The injected authority is used directly. Its errors are returned to
+    /// callers and never fall back to the legacy Forge `SQLite` catalog.
+    pub fn with_session_authority(
+        locations: LocationService<GlobalRegistry>,
+        authority: Box<dyn crate::AgentSessionAuthority>,
+    ) -> Self {
+        Self {
+            locations,
+            session_authority: authority,
+        }
+    }
+
+    /// List the bounded registered Location identities needed to begin a
+    /// remote-safe Workspace discovery sequence. Native roots remain private.
+    pub fn location_list(&self) -> Result<Vec<RegisteredLocation>, ControlError> {
+        self.locations
+            .list_locations(LocationListLimit::DEFAULT)
+            .map_err(map_location_error)
+    }
+
+    /// Register one exact root path as a bounded Location identity.
+    ///
+    /// The path is inspected and canonicalized by the existing Location
+    /// service; the canonical root is the only registered form. Duplicate
+    /// roots and duplicate identities stay explicit, typed conflicts.
+    pub fn register_location(
+        &mut self,
+        request: RegisterLocationRequest,
+    ) -> Result<RegisteredLocation, ControlError> {
+        self.locations
+            .register_selected_path(
+                request.id,
+                request.name,
+                &request.selected_path,
+                request.observed_at,
+            )
+            .map_err(map_register_location_error)
+    }
+
+    /// Apply one explicit Location enable/disable transition through the
+    /// optimistic-concurrency repository contract. Disabled Locations stay
+    /// registered but reject discovery and resolution.
+    pub fn set_location_state(
+        &mut self,
+        command: &SetLocationState,
+    ) -> Result<RegisteredLocation, ControlError> {
+        self.locations
+            .set_location_state(command)
+            .map_err(map_location_error)
+    }
+
+    /// List durable Workspace identities registered at the exact Location root.
+    /// No filesystem candidate scan participates in this authority projection.
     pub fn workspace_list(
         &self,
         location_id: LocationId,
         expected_revision: LocationRevision,
     ) -> Result<Vec<WorkspaceCatalogEntry>, ControlError> {
+        let location = self
+            .locations
+            .get_current_location(location_id, expected_revision)
+            .map_err(map_location_error)?;
+        let Some(layout) = WorkspaceStateLayout::inspect_existing(location.root().as_path())
+            .map_err(map_state_layout_error)?
+        else {
+            return Ok(Vec::new());
+        };
+        let workspace = WorkspaceStore::inspect_existing_identity_live_read_only(&layout)
+            .map_err(map_store_error)?;
+        if workspace.location_id() != location_id {
+            return Err(ControlError::new(
+                ControlErrorCode::WorkspaceIdentityConflict,
+            ));
+        }
+        Ok(vec![WorkspaceCatalogEntry::from_registered(
+            location_id,
+            expected_revision,
+            location.name().as_str().to_owned(),
+            workspace.id(),
+            workspace.revision(),
+        )?])
+    }
+
+    /// Discover bounded filesystem observations without registering a Workspace
+    /// or granting effect authority.
+    pub fn workspace_discover(
+        &self,
+        location_id: LocationId,
+        expected_revision: LocationRevision,
+    ) -> Result<Vec<WorkspaceDiscoveryEntry>, ControlError> {
         let discovery = self
             .locations
             .discover_current(location_id, expected_revision)
             .map_err(map_location_error)?;
-        if discovery.candidates().len() > MAX_WORKSPACE_CATALOG_ENTRIES {
+        if discovery.observations().len() > MAX_WORKSPACE_CATALOG_ENTRIES {
             return Err(ControlError::new(ControlErrorCode::CapacityExceeded));
         }
-
-        let mut entries = Vec::with_capacity(discovery.candidates().len());
-        for candidate in discovery.candidates() {
-            let status = match WorkspaceStateLayout::inspect_existing(candidate.absolute_root()) {
-                Ok(Some(layout)) => match WorkspaceStore::inspect_existing_read_only(&layout) {
-                    Ok(workspace) => WorkspaceCatalogStatus::Ready {
-                        workspace_id: workspace.id(),
-                        workspace_revision: workspace.revision(),
-                    },
-                    Err(error) => map_read_only_inspection_status(&error),
-                },
-                Ok(None) => WorkspaceCatalogStatus::Uninitialized,
-                Err(source) => WorkspaceCatalogStatus::Unavailable(map_state_layout_code(&source)),
-            };
-            entries.push(WorkspaceCatalogEntry::from_candidate(
-                candidate,
-                expected_revision,
-                status,
-            )?);
-        }
-        Ok(entries)
+        discovery
+            .observations()
+            .iter()
+            .map(|observation| {
+                WorkspaceDiscoveryEntry::from_observation(observation, expected_revision)
+            })
+            .collect()
     }
 
-    /// Resolve a locator with a fresh Location revision, candidate scan, state
-    /// layout inspection, `SQLite` identity read, and root/fingerprint checks.
+    /// Resolve a durable Workspace locator with a fresh Location revision,
+    /// exact confined root, current `SQLite` identity, and fingerprint checks.
     ///
     /// The locator's embedded revision must exactly match the explicit input;
     /// no stale/default/active Workspace fallback exists.
@@ -556,7 +666,7 @@ impl ForgeControl {
         expected_revision: LocationRevision,
         locator: &WorkspaceLocator,
     ) -> Result<ResolvedWorkspaceScope, ControlError> {
-        let (scope, _layout, _workspace) =
+        let (scope, _, _) =
             self.inspect_resolved_workspace(location_id, expected_revision, locator)?;
         Ok(scope)
     }
@@ -622,6 +732,7 @@ impl ForgeControl {
             match forge_domain::decide_bootstrap_activity(existing.as_ref(), &command, observed_at)
             {
                 BootstrapActivityDecision::Create => ActivityBootstrapStatus::Created,
+                BootstrapActivityDecision::ResumeReleased => ActivityBootstrapStatus::Resumed,
                 BootstrapActivityDecision::ExpiredRecoveryRequired => {
                     ActivityBootstrapStatus::ExpiredRecoveryRequired
                 }
@@ -636,9 +747,6 @@ impl ForgeControl {
         let activity = match store.bootstrap_activity(&command) {
             Ok(activity) => activity,
             Err(source) => {
-                // If the store reports a post-commit binding loss, preserve a
-                // typed committed-but-unconfirmed outcome.  For ordinary
-                // pre-commit conflicts, retain the stable error category.
                 if is_post_commit_store_error(&source) {
                     return Ok(ActivityBootstrap::new(
                         scope.clone(),
@@ -650,10 +758,6 @@ impl ForgeControl {
             }
         };
 
-        // The durable operation has returned only after its transaction has
-        // committed.  The injected test hook makes the commit/revalidation
-        // window deterministic without adding a production clock, transport,
-        // or global mutable state dependency.
         after_commit();
 
         if self.committed_scope_matches_with_store(scope, &store) {
@@ -671,7 +775,7 @@ impl ForgeControl {
         }
     }
 
-    fn inspect_resolved_workspace(
+    pub(crate) fn inspect_resolved_workspace(
         &self,
         location_id: LocationId,
         expected_revision: LocationRevision,
@@ -697,12 +801,18 @@ impl ForgeControl {
         let layout = WorkspaceStateLayout::inspect_existing(candidate.absolute_root())
             .map_err(map_state_layout_error)?
             .ok_or_else(|| ControlError::new(ControlErrorCode::WorkspaceNotInitialized))?;
-        let workspace =
-            WorkspaceStore::inspect_existing_read_only(&layout).map_err(map_store_error)?;
+        let observed_fingerprint = layout.root_fingerprint().map_err(map_state_layout_error)?;
+        let workspace = WorkspaceStore::inspect_existing_identity_live_read_only(&layout)
+            .map_err(map_store_error)?;
         if workspace.location_id() != location_id {
             return Err(ControlError::new(
                 ControlErrorCode::WorkspaceIdentityConflict,
             ));
+        }
+        if workspace.root().as_path() != candidate.absolute_root()
+            || workspace.root_fingerprint() != observed_fingerprint
+        {
+            return Err(ControlError::new(ControlErrorCode::WorkspaceRootConflict));
         }
         Ok((
             ResolvedWorkspaceScope {
@@ -790,7 +900,7 @@ impl ForgeControl {
         };
         workspace.id() == scope.workspace_id()
             && workspace.revision() == scope.workspace_revision()
-            && workspace.location_id() == candidate.location_id()
+            && workspace.location_id() == scope.locator.location_id()
             && workspace.root().as_path() == candidate.absolute_root()
     }
     /// Renew caller-owned Activity leases in one atomic, deterministic batch.
@@ -854,6 +964,63 @@ impl ForgeControl {
         );
         let operation = self.renew_activity_lease_batch(scope, std::slice::from_ref(&command))?;
         operation.into_single(ActivityOperationStatus::Renewed)
+    }
+
+    /// Renew one host-supervised lease only while its pinned Goal identity and
+    /// current session-bound Coordinator remain valid at the Source mutation boundary.
+    pub fn renew_supervised_activity_lease(
+        &self,
+        request: &SupervisedActivityLeaseRenewRequest,
+    ) -> Result<ActivityLeaseOperation, ControlError> {
+        let actor = request.actor;
+        if actor.workspace_id() != request.scope.workspace_id()
+            || actor.activity_id() != request.command.id()
+        {
+            return Err(ControlError::new(ControlErrorCode::ActivityLeaseConflict));
+        }
+        let _session = self.agent_session_resolve(crate::AgentSessionResolveRequest {
+            session_id: actor.session_id(),
+            principal: actor.principal(),
+        })?;
+        let (fresh_scope, mut store) = self.open_resolved_workspace(
+            request.scope.locator.location_id(),
+            request.scope.locator.expected_revision(),
+            &request.scope.locator,
+        )?;
+        if fresh_scope != request.scope {
+            return Err(ControlError::new(
+                ControlErrorCode::WorkspaceRevisionConflict,
+            ));
+        }
+        let activity = match store.renew_activity_lease_with_supervision_guard(
+            &request.command,
+            actor,
+            request.goal_id,
+            request.goal_created_at,
+        ) {
+            Ok(activity) => activity,
+            Err(error) if is_post_commit_store_error(&error) => {
+                return Ok(ActivityOperation::uncertain(
+                    request.scope.clone(),
+                    None,
+                    Vec::new(),
+                ));
+            }
+            Err(error) => return Err(map_activity_store_error(error)),
+        };
+        if !self.committed_scope_matches_with_store(&request.scope, &store) {
+            return Ok(ActivityOperation::uncertain(
+                request.scope.clone(),
+                Some(activity.clone()),
+                Vec::new(),
+            ));
+        }
+        ActivityOperation::batch(
+            request.scope.clone(),
+            vec![activity],
+            ActivityOperationStatus::Renewed,
+        )
+        .into_single(ActivityOperationStatus::Renewed)
     }
 
     /// Close caller-owned Activities in one atomic, deterministic batch.
@@ -936,6 +1103,48 @@ impl ForgeControl {
         )
     }
 
+    /// Release caller-owned leases in one atomic, deterministic batch.
+    pub fn release_activity_lease_batch(
+        &self,
+        scope: &ResolvedWorkspaceScope,
+        commands: &[ReleaseActivityLease],
+    ) -> Result<ActivityLeaseOperation, ControlError> {
+        validate_lease_batch_len(commands.len())?;
+        let (fresh_scope, mut store) = self.open_resolved_workspace(
+            scope.locator.location_id(),
+            scope.locator.expected_revision(),
+            &scope.locator,
+        )?;
+        if fresh_scope != *scope {
+            return Err(ControlError::new(
+                ControlErrorCode::WorkspaceRevisionConflict,
+            ));
+        }
+        let activities = match store.release_activity_leases(commands) {
+            Ok(activities) => activities,
+            Err(error) if is_post_commit_store_error(&error) => {
+                return Ok(ActivityOperation::uncertain(
+                    scope.clone(),
+                    None,
+                    Vec::new(),
+                ));
+            }
+            Err(error) => return Err(map_activity_store_error(error)),
+        };
+        if !self.committed_scope_matches_with_store(scope, &store) {
+            return Ok(ActivityOperation::uncertain(
+                scope.clone(),
+                None,
+                activities,
+            ));
+        }
+        Ok(ActivityOperation::batch(
+            scope.clone(),
+            activities,
+            ActivityOperationStatus::Released,
+        ))
+    }
+
     /// Release one caller-owned lease while keeping the Activity Open.
     pub fn release_activity_lease(
         &self,
@@ -951,12 +1160,43 @@ impl ForgeControl {
             expected_lease_revision,
             observed_at,
         );
-        self.mutate_single_activity(
-            scope,
-            ActivityOperationStatus::Released,
-            |store| store.release_activity_lease(&command),
-            || {},
-        )
+        let operation = self.release_activity_lease_batch(scope, std::slice::from_ref(&command))?;
+        operation.into_single(ActivityOperationStatus::Released)
+    }
+
+    /// Read exact Activity rows for tracker reconciliation without mutating
+    /// lifecycle or lease state. The scope is revalidated before and after
+    /// every bounded observation batch; callers must treat the returned rows
+    /// as an observational snapshot and fence any subsequent CAS separately.
+    pub fn observe_activity_leases(
+        &self,
+        scope: &ResolvedWorkspaceScope,
+        activity_ids: &[ActivityId],
+    ) -> Result<Vec<RegisteredActivity>, ControlError> {
+        validate_activity_observation_ids(activity_ids)?;
+        let (fresh_scope, store) = self.open_resolved_workspace(
+            scope.locator.location_id(),
+            scope.locator.expected_revision(),
+            &scope.locator,
+        )?;
+        if fresh_scope != *scope {
+            return Err(ControlError::new(
+                ControlErrorCode::WorkspaceRevisionConflict,
+            ));
+        }
+        let mut activities = Vec::with_capacity(activity_ids.len());
+        for activity_id in activity_ids {
+            if let Some(activity) = store
+                .get_activity(*activity_id)
+                .map_err(map_activity_store_error)?
+            {
+                activities.push(activity);
+            }
+        }
+        if !self.committed_scope_matches_with_store(scope, &store) {
+            return Err(ControlError::new(ControlErrorCode::WorkspaceRootConflict));
+        }
+        Ok(activities)
     }
 
     /// Reconcile expired leases into Interrupted Activities using the
@@ -1063,60 +1303,6 @@ impl ForgeControl {
         Ok(WorkspaceActivityProjection::new(scope, activities))
     }
 
-    fn mutate_single_activity<F, H>(
-        &self,
-        scope: &ResolvedWorkspaceScope,
-        status: ActivityOperationStatus,
-        mutate: F,
-        after_commit: H,
-    ) -> Result<ActivityLeaseOperation, ControlError>
-    where
-        F: FnOnce(&mut WorkspaceStore) -> Result<RegisteredActivity, WorkspaceStoreError>,
-        H: FnOnce(),
-    {
-        let (fresh_scope, mut store) = self.open_resolved_workspace(
-            scope.locator.location_id(),
-            scope.locator.expected_revision(),
-            &scope.locator,
-        )?;
-        if fresh_scope != *scope {
-            return Err(ControlError::new(
-                ControlErrorCode::WorkspaceRevisionConflict,
-            ));
-        }
-        let activity = match mutate(&mut store) {
-            Ok(activity) => activity,
-            Err(error) if is_post_commit_store_error(&error) => {
-                return Ok(ActivityOperation::uncertain(
-                    scope.clone(),
-                    None,
-                    Vec::new(),
-                ));
-            }
-            Err(error) => return Err(map_activity_store_error(error)),
-        };
-        Ok(self.finish_single_activity(scope, &store, activity, status, after_commit))
-    }
-
-    fn finish_single_activity<H>(
-        &self,
-        scope: &ResolvedWorkspaceScope,
-        store: &WorkspaceStore,
-        activity: RegisteredActivity,
-        status: ActivityOperationStatus,
-        after_commit: H,
-    ) -> ActivityLeaseOperation
-    where
-        H: FnOnce(),
-    {
-        after_commit();
-        if self.committed_scope_matches_with_store(scope, store) {
-            ActivityOperation::single(scope.clone(), activity, status)
-        } else {
-            ActivityOperation::uncertain(scope.clone(), Some(activity), Vec::new())
-        }
-    }
-
     fn mutate_activity_batch<F, H>(
         &self,
         scope: &ResolvedWorkspaceScope,
@@ -1166,6 +1352,12 @@ impl ForgeControl {
 }
 
 pub(crate) fn map_location_error(error: LocationServiceError) -> ControlError {
+    if matches!(
+        &error,
+        LocationServiceError::Repository(LocationRepositoryError::CommittedUnconfirmed { .. })
+    ) {
+        return ControlError::committed();
+    }
     let code = match &error {
         LocationServiceError::Repository(LocationRepositoryError::NotFound(_)) => {
             ControlErrorCode::LocationNotFound
@@ -1187,29 +1379,19 @@ pub(crate) fn map_location_error(error: LocationServiceError) -> ControlError {
     ControlError::with_source(code, error)
 }
 
-fn map_read_only_inspection_status(error: &WorkspaceStoreError) -> WorkspaceCatalogStatus {
-    match error {
-        WorkspaceStoreError::MigrationRequired { .. }
-        | WorkspaceStoreError::UnsupportedForReadOnly { .. } => {
-            WorkspaceCatalogStatus::MigrationRequired
+/// Registration-specific projection: duplicate roots/identities are durable
+/// identity conflicts, not generic invalid input.
+fn map_register_location_error(error: LocationServiceError) -> ControlError {
+    let code = match &error {
+        LocationServiceError::Repository(LocationRepositoryError::AlreadyRegistered { .. }) => {
+            ControlErrorCode::WorkspaceRootConflict
         }
-        WorkspaceStoreError::WorkspaceRootBindingConflict { .. }
-        | WorkspaceStoreError::ExistingWorkspaceBindingMismatch { .. }
-        | WorkspaceStoreError::WorkspaceRootFingerprintChanged { .. }
-        | WorkspaceStoreError::WorkspaceRootCanonicalPathChanged { .. }
-        | WorkspaceStoreError::WorkspaceRootSymlink(_)
-        | WorkspaceStoreError::WorkspaceRootNotDirectory(_) => {
-            WorkspaceCatalogStatus::Unavailable(ControlErrorCode::WorkspaceRootConflict)
+        LocationServiceError::Repository(LocationRepositoryError::IdentityConflict(_)) => {
+            ControlErrorCode::WorkspaceIdentityConflict
         }
-        WorkspaceStoreError::ReadOnlyWalActive { .. }
-        | WorkspaceStoreError::DatabaseSidecarPairMismatch { .. }
-        | WorkspaceStoreError::MissingDatabase(_)
-        | WorkspaceStoreError::FreshDatabase
-        | WorkspaceStoreError::UnownedDatabase => {
-            WorkspaceCatalogStatus::Unavailable(ControlErrorCode::WorkspaceStateUnavailable)
-        }
-        _ => WorkspaceCatalogStatus::Unavailable(ControlErrorCode::WorkspaceStateUnavailable),
-    }
+        _ => return map_location_error(error),
+    };
+    ControlError::with_source(code, error)
 }
 
 fn map_state_layout_code(error: &forge_workspace::StateLayoutError) -> ControlErrorCode {
@@ -1234,10 +1416,26 @@ pub(crate) fn map_state_layout_error(error: forge_workspace::StateLayoutError) -
 }
 
 pub(crate) fn map_store_error(error: WorkspaceStoreError) -> ControlError {
+    if matches!(
+        &error,
+        WorkspaceStoreError::ExecutionJournalCommittedUnconfirmed { .. }
+            | WorkspaceStoreError::ExecutionStopCommittedUnconfirmed { .. }
+            | WorkspaceStoreError::ExecutionStopRollbackUnconfirmed { .. }
+            | WorkspaceStoreError::ApprovalCleanupCommittedUnconfirmed { .. }
+            | WorkspaceStoreError::Approval(
+                forge_persistence::ApprovalStoreError::CleanupCommittedUnconfirmed { .. }
+                    | forge_persistence::ApprovalStoreError::CleanupRollbackUnconfirmed { .. }
+            )
+            | WorkspaceStoreError::Execution(
+                forge_persistence::ExecutionStoreError::CommittedUnconfirmed { .. }
+            )
+    ) {
+        return ControlError::committed();
+    }
     let code = match &error {
-        WorkspaceStoreError::MigrationRequired { .. }
+        WorkspaceStoreError::OutdatedSchema { .. }
         | WorkspaceStoreError::UnsupportedForReadOnly { .. } => {
-            ControlErrorCode::WorkspaceMigrationRequired
+            ControlErrorCode::WorkspaceSchemaOutdated
         }
         WorkspaceStoreError::ReadOnlyWalActive { .. }
         | WorkspaceStoreError::DatabaseSidecarPairMismatch { .. }
@@ -1264,6 +1462,9 @@ pub(crate) fn map_store_error(error: WorkspaceStoreError) -> ControlError {
         WorkspaceStoreError::LocationBindingConflict { .. } => {
             ControlErrorCode::WorkspaceIdentityConflict
         }
+        WorkspaceStoreError::ExecutionStop(
+            forge_persistence::ExecutionStopStoreError::Conflict,
+        ) => ControlErrorCode::ExecutionConflict,
         WorkspaceStoreError::ActivityNotFound(_) => ControlErrorCode::ActivityNotFound,
         WorkspaceStoreError::ActivityIdConflict(_) => ControlErrorCode::ActivityConflict,
         WorkspaceStoreError::ActivityWorkspaceMismatch { .. }
@@ -1295,17 +1496,57 @@ fn validate_lease_batch_len(len: usize) -> Result<(), ControlError> {
         .map_err(|_| ControlError::new(ControlErrorCode::CapacityExceeded))
 }
 
+fn validate_activity_observation_ids(ids: &[ActivityId]) -> Result<(), ControlError> {
+    if ids.len() <= MAX_ACTIVITY_LEASE_OBSERVATION_IDS {
+        Ok(())
+    } else {
+        Err(ControlError::new(ControlErrorCode::CapacityExceeded))
+    }
+}
+
 pub(crate) fn map_activity_store_error(error: WorkspaceStoreError) -> ControlError {
-    let error = match error {
+    match error {
+        WorkspaceStoreError::GoalDeletionCommittedUnconfirmed { .. }
+        | WorkspaceStoreError::ExecutionStopCommittedUnconfirmed { .. }
+        | WorkspaceStoreError::ExecutionStopRollbackUnconfirmed { .. }
+        | WorkspaceStoreError::ApprovalCleanupCommittedUnconfirmed { .. }
+        | WorkspaceStoreError::Approval(
+            forge_persistence::ApprovalStoreError::CleanupCommittedUnconfirmed { .. }
+            | forge_persistence::ApprovalStoreError::CleanupRollbackUnconfirmed { .. },
+        )
+        | WorkspaceStoreError::ExecutionJournalCommittedUnconfirmed { .. }
+        | WorkspaceStoreError::Execution(
+            forge_persistence::ExecutionStoreError::CommittedUnconfirmed { .. },
+        )
+        | WorkspaceStoreError::ExpiredActivityRecovery(
+            forge_persistence::ExpiredActivityRecoveryStoreError::CommitUnconfirmed(_)
+            | forge_persistence::ExpiredActivityRecoveryStoreError::RollbackUnconfirmed { .. },
+        )
+        | WorkspaceStoreError::UnstartedActivityContinuationCommittedUnconfirmed { .. } => {
+            ControlError::committed()
+        }
+        WorkspaceStoreError::GoalDeletion(source) => {
+            crate::goal_deletion::map_goal_deletion_store_error(source)
+        }
+        WorkspaceStoreError::Dag(source)
+        | WorkspaceStoreError::Approval(forge_persistence::ApprovalStoreError::Dag(source)) => {
+            crate::dag::map_dag_store_error(WorkspaceStoreError::Dag(source))
+        }
         WorkspaceStoreError::Approval(forge_persistence::ApprovalStoreError::Goal(source)) => {
-            return crate::goal::map_goal_store_error(WorkspaceStoreError::Goal(source));
+            crate::goal::map_goal_store_error(WorkspaceStoreError::Goal(source))
         }
-        WorkspaceStoreError::Approval(forge_persistence::ApprovalStoreError::Dag(source)) => {
-            return crate::dag::map_dag_store_error(WorkspaceStoreError::Dag(source));
+        WorkspaceStoreError::Approval(forge_persistence::ApprovalStoreError::Execution(source)) => {
+            map_activity_store_error(WorkspaceStoreError::Execution(source))
         }
-        error => error,
-    };
+        error => map_activity_store_code(error),
+    }
+}
+
+fn map_activity_store_code(error: WorkspaceStoreError) -> ControlError {
     let code = match &error {
+        WorkspaceStoreError::UnstartedActivityContinuation(
+            forge_persistence::UnstartedActivityContinuationStoreError::Conflict(_),
+        ) => ControlErrorCode::ActivityLeaseConflict,
         WorkspaceStoreError::Approval(
             forge_persistence::ApprovalStoreError::ApprovalMissing
             | forge_persistence::ApprovalStoreError::GrantMissing
@@ -1321,17 +1562,49 @@ pub(crate) fn map_activity_store_error(error: WorkspaceStoreError) -> ControlErr
             | forge_persistence::ApprovalStoreError::RevisionConflict
             | forge_persistence::ApprovalStoreError::InvalidTransition
             | forge_persistence::ApprovalStoreError::GrantMismatch
-            | forge_persistence::ApprovalStoreError::GrantReplay,
+            | forge_persistence::ApprovalStoreError::GrantReplay
+            | forge_persistence::ApprovalStoreError::CleanupPlanMismatch,
         ) => ControlErrorCode::ApprovalConflict,
-        WorkspaceStoreError::Execution(forge_persistence::ExecutionStoreError::RecordMissing) => {
-            ControlErrorCode::ExecutionNotFound
-        }
-        WorkspaceStoreError::Execution(
+        WorkspaceStoreError::UnstartedActivityContinuation(
+            forge_persistence::UnstartedActivityContinuationStoreError::Invalid(_),
+        )
+        | WorkspaceStoreError::Approval(
+            forge_persistence::ApprovalStoreError::CleanupLimitExceeded,
+        ) => ControlErrorCode::InvalidInput,
+        WorkspaceStoreError::Approval(
+            forge_persistence::ApprovalStoreError::AdmissionEnvelope(source),
+        ) => match source {
+            forge_persistence::AdmissionEnvelopeError::Invalid(
+                forge_domain::ExecutionAdmissionError::Expired,
+            ) => ControlErrorCode::ApprovalExpired,
+            forge_persistence::AdmissionEnvelopeError::Sqlite(_)
+            | forge_persistence::AdmissionEnvelopeError::DamagedSchema(_)
+            | forge_persistence::AdmissionEnvelopeError::CorruptRecord => {
+                ControlErrorCode::PersistenceFailure
+            }
+            forge_persistence::AdmissionEnvelopeError::Invalid(_)
+            | forge_persistence::AdmissionEnvelopeError::IdentityConflict
+            | forge_persistence::AdmissionEnvelopeError::ReplayedForDifferentExecution => {
+                ControlErrorCode::ExecutionConflict
+            }
+        },
+        WorkspaceStoreError::Approval(
+            forge_persistence::ApprovalStoreError::AdmissionEnvelopeMismatch,
+        )
+        | WorkspaceStoreError::Execution(
             forge_persistence::ExecutionStoreError::IdentityConflict
-            | forge_persistence::ExecutionStoreError::AttributionMismatch
+            | forge_persistence::ExecutionStoreError::AgentAuthorityConflict
+            | forge_persistence::ExecutionStoreError::GeneratedArtifactConflict
+            | forge_persistence::ExecutionStoreError::NativeClosureAlreadyExists
+            | forge_persistence::ExecutionStoreError::NativeClosureConflict
+            | forge_persistence::ExecutionStoreError::NativeClosureOutputConflict
+            | forge_persistence::ExecutionStoreError::NativeClosureArtifactConflict
             | forge_persistence::ExecutionStoreError::Terminal
             | forge_persistence::ExecutionStoreError::InvalidTransition
             | forge_persistence::ExecutionStoreError::RevisionConflict,
+        )
+        | WorkspaceStoreError::ExecutionStop(
+            forge_persistence::ExecutionStopStoreError::Conflict,
         ) => ControlErrorCode::ExecutionConflict,
         WorkspaceStoreError::ActivityNotFound(_) => ControlErrorCode::ActivityNotFound,
         WorkspaceStoreError::ActivityTerminal(_)
@@ -1342,6 +1615,8 @@ pub(crate) fn map_activity_store_error(error: WorkspaceStoreError) -> ControlErr
         | WorkspaceStoreError::InvalidLeaseWindow { .. }
         | WorkspaceStoreError::LeaseRevisionConflict { .. }
         | WorkspaceStoreError::ActivityLeaseRevisionOverflow { .. }
+        | WorkspaceStoreError::ActivityLeaseBatchOwnerMismatch { .. }
+        | WorkspaceStoreError::ActivityLeaseBatchDuplicate(_)
         | WorkspaceStoreError::AlreadyLive { .. }
         | WorkspaceStoreError::ExpiredRecoveryRequired { .. } => {
             ControlErrorCode::ActivityLeaseConflict
@@ -1349,6 +1624,12 @@ pub(crate) fn map_activity_store_error(error: WorkspaceStoreError) -> ControlErr
         WorkspaceStoreError::ActivityWorkspaceMismatch { .. }
         | WorkspaceStoreError::ActivityRevisionConflict { .. }
         | WorkspaceStoreError::ActivityIdConflict(_) => ControlErrorCode::ActivityConflict,
+        WorkspaceStoreError::ActivitySuccessorPredecessorNotTerminal { .. }
+        | WorkspaceStoreError::ActivitySuccessorConflict { .. }
+        | WorkspaceStoreError::ActivitySuccessorTargetAlreadyExists(_)
+        | WorkspaceStoreError::ActivitySuccessorTimestampOrder { .. } => {
+            ControlErrorCode::ActivityConflict
+        }
         WorkspaceStoreError::WorkspaceRevisionConflict { .. } => {
             ControlErrorCode::WorkspaceRevisionConflict
         }
@@ -1410,54 +1691,142 @@ mod tests {
     use super::*;
 
     #[test]
+    fn continuation_conflicts_do_not_masquerade_as_persistence_failure() {
+        use forge_persistence::UnstartedActivityContinuationStoreError as ContinuationError;
+
+        for (source, expected) in [
+            (
+                ContinuationError::Conflict("origin mismatch"),
+                ControlErrorCode::ActivityLeaseConflict,
+            ),
+            (
+                ContinuationError::Invalid("invalid caller fence"),
+                ControlErrorCode::InvalidInput,
+            ),
+            (
+                ContinuationError::Corrupt("damaged origin"),
+                ControlErrorCode::PersistenceFailure,
+            ),
+            (
+                ContinuationError::Sqlite(rusqlite::Error::InvalidQuery),
+                ControlErrorCode::PersistenceFailure,
+            ),
+        ] {
+            let error = map_activity_store_error(
+                WorkspaceStoreError::UnstartedActivityContinuation(source),
+            );
+            assert_eq!(error.code(), expected);
+            assert!(!error.is_committed());
+        }
+    }
+
+    #[test]
+    fn execution_journal_uncertainty_requires_readback() {
+        for mapper in [map_store_error, map_activity_store_error] {
+            for error in [
+                WorkspaceStoreError::ExecutionJournalCommittedUnconfirmed {
+                    source: Box::new(WorkspaceStoreError::Execution(
+                        forge_persistence::ExecutionStoreError::RecordMissing,
+                    )),
+                },
+                WorkspaceStoreError::Execution(
+                    forge_persistence::ExecutionStoreError::CommittedUnconfirmed {
+                        source: Box::new(forge_persistence::ExecutionStoreError::RecordMissing),
+                    },
+                ),
+            ] {
+                let mapped = mapper(error);
+                assert_eq!(mapped.code(), ControlErrorCode::CommittedButUnconfirmed);
+                assert!(mapped.is_committed());
+            }
+            let rejected = mapper(WorkspaceStoreError::Execution(
+                forge_persistence::ExecutionStoreError::RecordMissing,
+            ));
+            assert!(!rejected.is_committed());
+        }
+    }
+
+    #[test]
     fn remote_safe_error_view_has_no_path_or_source_text() {
-        let error = ControlError::new(ControlErrorCode::WorkspaceRootConflict);
+        let error = ControlError::with_source(
+            ControlErrorCode::WorkspaceRootConflict,
+            std::io::Error::other(
+                "private-adapter-marker /private/state.sqlite SELECT token-secret",
+            ),
+        );
         let view = error.view();
         assert_eq!(view.code(), ControlErrorCode::WorkspaceRootConflict);
         assert!(!view.summary().contains('/'));
         assert!(!error.to_string().contains('/'));
         assert!(!format!("{error:?}").contains('/'));
+        for rendered in [
+            error.to_string(),
+            format!("{error:?} {view:?}"),
+            view.recovery_hint().to_owned(),
+        ] {
+            for private in [
+                "private-adapter-marker",
+                "/private/state.sqlite",
+                "SELECT",
+                "token-secret",
+            ] {
+                assert!(!rendered.contains(private));
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod integration_tests {
     use std::ffi::OsString;
-    use std::fs;
-    use std::path::PathBuf;
+    use std::fs::{self, Permissions};
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use forge_domain::{
-        ActivityListLimit, ActivityLiveness, CloseActivity, DagAcceptanceCriterion,
-        DagNodeDefinition, DagNodeId, DagNodeObjective, DagNodeOrdinal, DagNodeTitle, DagRevision,
-        DagRevisionId, DagRevisionNumber, EstablishWorkspace, ExecutionArgument,
-        ExecutionAttribution, ExecutionId, ExecutionKind, ExecutionLimits, ExecutionOutputLimit,
-        ExecutionPermissions, ExecutionProgram, ExecutionRequest, ExecutionTimeoutMillis,
-        GoalAttribution, GoalContract, GoalId, GoalNodeAttribution, GoalObjective, GoalStatement,
-        GoalVerificationRequirement, LocationState, RegisteredDagNode, RegisteredGoal,
+        ActivityCoordinatorActor, ActivityListLimit, ActivityLiveness, AgentFocus, AgentFocusNode,
+        AgentInstanceRevision, AuthenticatedPrincipal, CloseActivity, CreateActivity,
+        DagAcceptanceCriterion, DagNodeDefinition, DagNodeId, DagNodeObjective, DagNodeOrdinal,
+        DagNodeTitle, DagRevision, DagRevisionId, DagRevisionNumber, EstablishWorkspace,
+        ExecutionArgument, ExecutionAttribution, ExecutionCommandId, ExecutionId, ExecutionKind,
+        ExecutionLimits, ExecutionOutputLimit, ExecutionPermissions, ExecutionProgram,
+        ExecutionRequest, ExecutionTimeoutMillis, GoalAttribution, GoalContract, GoalId,
+        GoalNodeAttribution, GoalObjective, GoalStatement, GoalVerificationRequirement,
+        LocationState, ProjectCommandEvidence, RegisteredDagNode, RegisteredGoal,
         RenewActivityLease, SetLocationState, WorkspaceRoot,
     };
+    use forge_execution::{
+        RUST_CI_SANDBOX_MARKER_ENV, RUST_CI_SANDBOX_MARKER_VALUE, RustCiDiscoveryInput,
+        RustCiHostArchitecture, RustCiToolchainCapability,
+    };
     use forge_persistence::{GlobalRegistry, WorkspaceStore};
-    use forge_workspace::{LocationService, WorkspaceStateLayout};
+    use forge_workspace::{FORGE_GIT_PROGRAM, LocationService, WorkspaceStateLayout};
     use uuid::Uuid;
 
     use super::{
         ActivityBootstrapStatus, ActivityOperationStatus, ForgeControl,
-        MAX_WORKSPACE_CATALOG_ENTRIES, OwnedActivityLease, ResolvedWorkspaceScope,
-        WorkspaceActivityProjectionRequest, WorkspaceCatalogStatus,
+        MAX_ACTIVITY_LEASE_OBSERVATION_IDS, MAX_WORKSPACE_CATALOG_ENTRIES, OwnedActivityLease,
+        ResolvedWorkspaceScope, SupervisedActivityLeaseRenewRequest,
+        WorkspaceActivityProjectionRequest,
     };
     use crate::error::ControlErrorCode;
     use crate::worker::{ControlClientError, ForgeControlWorker, PendingControl};
     use crate::{
-        ActivityId, ApprovalSubmissionStatus, DagNodeStartRequest, DagNodeUpdateRequest,
-        DagRevisionCreateRequest, ForgeApprovalCoordinator, ForgeExecutionCoordinator,
-        GoalCompletionRequest, LocationId, RuntimeInstanceId, SubmitExecutionForApproval,
-        TimestampMillis, WorkspaceId, WorkspaceRevision,
+        ActivityId, AgentExecutionAuthorityRequest, ApprovalSubmissionStatus, DagNodeStartRequest,
+        DagNodeUpdateRequest, FileActivityScope, ForgeApprovalCoordinator,
+        ForgeExecutionCoordinator, GoalCompletionRequest, LocationId, ProjectCommandId,
+        ProjectCommandListRequest, RuntimeInstanceId, SubmitExecutionForApproval, TimestampMillis,
+        WorkspaceId, WorkspaceRevision,
     };
 
     static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
+
+    const RUST_CI_TEST_POLICY_ENV: &str = "HETERARCHY_FORGE_RUST_CI_TEST_POLICY";
+    const RUST_CI_TEST_POLICY_VALUE: &str = "outer-rust-ci-v1";
 
     struct Fixture {
         control: ForgeControl,
@@ -1469,6 +1838,68 @@ mod integration_tests {
 
     fn timestamp(value: i64) -> Result<TimestampMillis, Box<dyn std::error::Error>> {
         Ok(TimestampMillis::new(value)?)
+    }
+
+    fn timestamp_now() -> Result<TimestampMillis, Box<dyn std::error::Error>> {
+        let millis = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())?;
+        Ok(TimestampMillis::new(millis)?)
+    }
+
+    fn cleanup_test_root(root: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+        fn restore_permissions(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+            let metadata = fs::symlink_metadata(path)?;
+            if metadata.file_type().is_symlink() {
+                return Ok(());
+            }
+            let mode = metadata.permissions().mode();
+            let restored = if metadata.is_dir() {
+                mode | 0o700
+            } else {
+                mode | 0o600
+            };
+            fs::set_permissions(path, Permissions::from_mode(restored))?;
+            if metadata.is_dir() {
+                for child in fs::read_dir(path)? {
+                    restore_permissions(&child?.path())?;
+                }
+            }
+            Ok(())
+        }
+
+        restore_permissions(&root)?;
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    fn nested_sandbox_execution_is_unavailable() -> bool {
+        std::env::var(RUST_CI_SANDBOX_MARKER_ENV).as_deref() == Ok(RUST_CI_SANDBOX_MARKER_VALUE)
+            && std::env::var(RUST_CI_TEST_POLICY_ENV).as_deref() == Ok(RUST_CI_TEST_POLICY_VALUE)
+    }
+
+    fn prepare_test_rust_ci_capability(
+        root: &Path,
+    ) -> Result<RustCiToolchainCapability, Box<dyn std::error::Error>> {
+        let architecture = RustCiHostArchitecture::current().ok_or("unsupported test host")?;
+        let root = fs::canonicalize(root)?;
+        let host = root.join("rust-ci-host-home");
+        let cargo = host.join(".cargo");
+        let rustup = host.join(".rustup");
+        fs::create_dir_all(cargo.join("bin"))?;
+        fs::create_dir_all(cargo.join("registry"))?;
+        fs::create_dir_all(rustup.join("toolchains").join(format!(
+            "{}-{}-apple-darwin",
+            forge_execution::RUST_CI_PINNED_VERSION,
+            architecture.as_str()
+        )))?;
+        fs::write(cargo.join("bin/rustup"), b"rustup")?;
+        fs::write(rustup.join("settings.toml"), b"version = 12\n")?;
+        let input = RustCiDiscoveryInput::new(
+            host,
+            root.join("rust-ci-cache"),
+            architecture,
+            forge_domain::RuntimeInstanceId::from_uuid(Uuid::from_u128(0xC101)),
+        )?;
+        Ok(RustCiToolchainCapability::prepare(&input)?)
     }
 
     fn id(value: u128) -> Uuid {
@@ -1495,14 +1926,425 @@ mod integration_tests {
         }
     }
 
+    fn attach_stdio_planner(
+        client: &crate::ForgeControlClient,
+        scope: &ResolvedWorkspaceScope,
+        activity_id: ActivityId,
+        agent_id: forge_domain::AgentInstanceId,
+        display_name: &str,
+        observed_at: TimestampMillis,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let session_id = forge_domain::AgentSessionId::from_uuid(agent_id.into_uuid());
+        let _session = client.agent_session_open(forge_domain::OpenAgentSession::new(
+            session_id,
+            forge_domain::AgentSessionOpenRequestId::from_uuid(id(agent_id
+                .into_uuid()
+                .as_u128()
+                .wrapping_add(0x100))),
+            forge_domain::AuthenticatedPrincipal::TrustedStdio,
+            observed_at,
+        ))?;
+        let agent = forge_domain::RegisteredAgentInstance::create_bound(
+            agent_id,
+            scope.workspace_id(),
+            activity_id,
+            session_id,
+            forge_domain::AgentDisplayName::new(display_name.to_owned())?,
+            forge_domain::AgentDeclaredRole::new("planner".to_owned())?,
+            forge_domain::AgentTransportKind::Stdio,
+            forge_domain::AuthenticatedPrincipal::TrustedStdio,
+            observed_at,
+        );
+        let _ = crate::legacy_agent_fixture::seed_client_agent(
+            client,
+            scope,
+            &agent,
+            forge_domain::AgentEventId::from_uuid(agent_id.into_uuid()),
+        )?;
+        Ok(())
+    }
+
+    fn claim_stdio_coordinator(
+        client: &crate::ForgeControlClient,
+        scope: &ResolvedWorkspaceScope,
+        activity_id: ActivityId,
+        agent_id: forge_domain::AgentInstanceId,
+        display_name: &str,
+        observed_at: TimestampMillis,
+    ) -> Result<forge_domain::ActivityCoordinatorActor, Box<dyn std::error::Error>> {
+        attach_stdio_planner(
+            client,
+            scope,
+            activity_id,
+            agent_id,
+            display_name,
+            observed_at,
+        )?;
+        let binding = client.activity_coordinator_claim(crate::CoordinatorClaimRequest {
+            session_id: forge_domain::AgentSessionId::from_uuid(agent_id.into_uuid()),
+            scope: scope.clone(),
+            activity_id,
+            agent_id,
+            principal: forge_domain::AuthenticatedPrincipal::TrustedStdio,
+            observed_at,
+        })?;
+        Ok(forge_domain::ActivityCoordinatorActor::new(
+            scope.workspace_id(),
+            activity_id,
+            binding.agent_id(),
+            binding.revision(),
+            forge_domain::AuthenticatedPrincipal::TrustedStdio,
+            forge_domain::AgentSessionId::from_uuid(agent_id.into_uuid()),
+        ))
+    }
+
+    #[test]
+    fn admitted_goal_write_uses_worker_clock_instead_of_old_audit_time()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = fixture("expired-goal-admission", &[0], 1)?;
+        let locator = locator_for(&fixture.control, fixture.location_id, "workspace-0")?;
+        let scope = fixture.control.resolve_workspace(
+            fixture.location_id,
+            forge_domain::LocationRevision::INITIAL,
+            &locator,
+        )?;
+        let activity_id = ActivityId::from_uuid(id(0xE2A0));
+        let live_since = timestamp_now()?;
+        let lease_until = TimestampMillis::new(
+            live_since
+                .get()
+                .checked_add(60_000)
+                .ok_or("Activity lease deadline overflow")?,
+        )?;
+        let _live = fixture.control.bootstrap_activity(
+            &scope,
+            activity_id,
+            RuntimeInstanceId::from_uuid(id(0xE2A1)),
+            timestamp(0)?,
+            lease_until,
+        )?;
+        let (client, mut worker) = fixture.control.start_worker()?;
+        let actor = claim_stdio_coordinator(
+            &client,
+            &scope,
+            activity_id,
+            forge_domain::AgentInstanceId::from_uuid(id(0xE2A2)),
+            "expired Activity planner",
+            timestamp(0)?,
+        )?;
+        let layout = WorkspaceStateLayout::inspect_existing(&fixture.workspaces[0])?
+            .ok_or("expired-admission Workspace layout missing")?;
+        let connection = rusqlite::Connection::open(layout.database_path())?;
+        let expired_until = TimestampMillis::new(
+            timestamp_now()?
+                .get()
+                .checked_sub(1)
+                .ok_or("test clock predates the Activity timestamp domain")?,
+        )?;
+        let changed = connection.execute(
+            "UPDATE activities SET lease_until_ms = ?1 WHERE activity_id = ?2",
+            rusqlite::params![expired_until.get(), activity_id.into_uuid().as_bytes()],
+        )?;
+        assert_eq!(
+            changed, 1,
+            "the fixture Activity lease deadline was updated"
+        );
+        drop(connection);
+        let goal_id = GoalId::from_uuid(id(0xE2A3));
+        let command = forge_domain::GoalMutationCommand::new(
+            forge_domain::GoalMutationRequestId::from_uuid(id(0xE2A4)),
+            actor,
+            scope.workspace_revision(),
+            goal_id,
+            None,
+            timestamp(0)?,
+            forge_domain::GoalMutationAction::Create(Box::new(GoalContract::new(
+                GoalObjective::new("Expired lease must block this Goal".to_owned())?,
+                vec![GoalStatement::new(
+                    "The audit timestamp remains zero".to_owned(),
+                )?],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )?)),
+        )?;
+        let request = crate::GoalMutationRequest {
+            scope: scope.clone(),
+            command,
+        };
+        let rejected = client.goal_mutation(request);
+        assert!(matches!(
+            rejected,
+            Err(error) if error.code() == ControlErrorCode::ActivityLeaseConflict
+        ));
+        assert!(
+            client
+                .goal_mutation_readback(crate::GoalMutationReadbackRequest {
+                    scope: scope.clone(),
+                    activity_id,
+                    goal_id,
+                    mutation_request_id: forge_domain::GoalMutationRequestId::from_uuid(id(0xE2A4)),
+                    expected_request_digest: None,
+                })?
+                .is_none()
+        );
+        worker.shutdown()?;
+        cleanup_test_root(fixture.root)?;
+        Ok(())
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct InitialAgentDagPlanIdentity {
+        request_id: forge_domain::AgentDagPlanRequestId,
+        history_update_id: forge_domain::AgentWorkUpdateId,
+        observed_at: TimestampMillis,
+    }
+
+    fn commit_initial_agent_dag_plan(
+        client: &crate::ForgeControlClient,
+        scope: &ResolvedWorkspaceScope,
+        actor: forge_domain::ActivityCoordinatorActor,
+        goal: GoalAttribution,
+        draft: forge_domain::AgentDagDraft,
+        identity: InitialAgentDagPlanIdentity,
+    ) -> Result<forge_persistence::AgentDagPlanCommitResult, Box<dyn std::error::Error>> {
+        let request = forge_domain::AgentDagPlanRequest::new(
+            identity.request_id,
+            actor,
+            goal,
+            None,
+            None,
+            draft,
+            identity.history_update_id,
+            forge_domain::AgentWorkUpdateSequence::INITIAL,
+            identity.observed_at,
+        );
+        Ok(
+            client.agent_dag_plan_commit(crate::AgentDagPlanCommitRequest {
+                scope: scope.clone(),
+                request,
+            })?,
+        )
+    }
+
+    fn create_dag_worker_goal_fixture(
+        client: &crate::ForgeControlClient,
+        scope: &ResolvedWorkspaceScope,
+        activity_id: ActivityId,
+        actor: forge_domain::ActivityCoordinatorActor,
+    ) -> Result<(RegisteredGoal, DagNodeDefinition), Box<dyn std::error::Error>> {
+        let goal = RegisteredGoal::create(
+            GoalId::from_uuid(id(0xEA10)),
+            scope.workspace_id(),
+            activity_id,
+            GoalContract::new(
+                GoalObjective::new("Persist one DAG node".to_owned())?,
+                vec![GoalStatement::new("Node completes".to_owned())?],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )?,
+            timestamp(10)?,
+        );
+        let _created = client.goal_create(scope.clone(), actor, goal.clone())?;
+        let definition = DagNodeDefinition::new(
+            DagNodeId::from_uuid(id(0xEA11)),
+            DagNodeOrdinal::new(0)?,
+            DagNodeTitle::new("Implement".to_owned())?,
+            DagNodeObjective::new("Implement the accepted slice".to_owned())?,
+            vec![DagAcceptanceCriterion::new(
+                "Implementation verified".to_owned(),
+            )?],
+        )?;
+        Ok((goal, definition))
+    }
+
+    struct CoordinatorDagPlanFixture {
+        goal: RegisteredGoal,
+        revision: DagRevision,
+        nodes: Vec<RegisteredDagNode>,
+        request: forge_domain::AgentDagPlanRequest,
+        stored: forge_persistence::AgentDagPlanCommitResult,
+    }
+
+    fn create_initial_coordinator_dag_plan_fixture(
+        client: &crate::ForgeControlClient,
+        scope: &ResolvedWorkspaceScope,
+        activity_id: ActivityId,
+        actor: forge_domain::ActivityCoordinatorActor,
+    ) -> Result<CoordinatorDagPlanFixture, Box<dyn std::error::Error>> {
+        let (goal, definition) = create_dag_worker_goal_fixture(client, scope, activity_id, actor)?;
+        let revision = DagRevision::new(
+            DagRevisionId::from_uuid(id(0xEA12)),
+            goal.id(),
+            goal.revision(),
+            DagRevisionNumber::INITIAL,
+            None,
+            vec![definition.clone()],
+            Vec::new(),
+            timestamp(11)?,
+        )?;
+        let nodes = vec![RegisteredDagNode::create(
+            goal.id(),
+            revision.number(),
+            definition,
+            timestamp(11)?,
+        )];
+        let draft = forge_domain::AgentDagDraft::new(revision.clone(), nodes.clone(), Vec::new())?;
+        let request = forge_domain::AgentDagPlanRequest::new(
+            forge_domain::AgentDagPlanRequestId::from_uuid(id(0xEA16)),
+            actor,
+            GoalAttribution::new(goal.id(), goal.revision()),
+            None,
+            None,
+            draft,
+            forge_domain::AgentWorkUpdateId::from_uuid(id(0xEA17)),
+            forge_domain::AgentWorkUpdateSequence::INITIAL,
+            timestamp(11)?,
+        );
+        let stored = client.agent_dag_plan_commit(crate::AgentDagPlanCommitRequest {
+            scope: scope.clone(),
+            request: request.clone(),
+        })?;
+        assert_eq!(stored.revision().revision(), &revision);
+        assert_eq!(
+            client.dag_get_current(scope.clone(), goal.id())?,
+            Some(stored.revision().clone())
+        );
+        Ok(CoordinatorDagPlanFixture {
+            goal,
+            revision,
+            nodes,
+            request,
+            stored,
+        })
+    }
+
+    fn transfer_and_commit_successor_dag(
+        client: &crate::ForgeControlClient,
+        scope: &ResolvedWorkspaceScope,
+        activity_id: ActivityId,
+        current_agent_id: forge_domain::AgentInstanceId,
+        current_actor: forge_domain::ActivityCoordinatorActor,
+        initial: &CoordinatorDagPlanFixture,
+    ) -> Result<Vec<RegisteredDagNode>, Box<dyn std::error::Error>> {
+        let successor_agent_id = forge_domain::AgentInstanceId::from_uuid(id(0xEA18));
+        attach_stdio_planner(
+            client,
+            scope,
+            activity_id,
+            successor_agent_id,
+            "Successor DAG coordinator",
+            timestamp(12)?,
+        )?;
+        let transferred =
+            client.activity_coordinator_transfer(crate::CoordinatorTransferRequest {
+                current_session_id: current_actor.session_id(),
+                scope: scope.clone(),
+                activity_id,
+                current_agent_id,
+                expected_coordinator_revision: current_actor.expected_revision(),
+                principal: forge_domain::AuthenticatedPrincipal::TrustedStdio,
+                next_agent_id: successor_agent_id,
+                observed_at: timestamp(12)?,
+            })?;
+        let successor_actor = forge_domain::ActivityCoordinatorActor::new(
+            scope.workspace_id(),
+            activity_id,
+            transferred.agent_id(),
+            transferred.revision(),
+            forge_domain::AuthenticatedPrincipal::TrustedStdio,
+            forge_domain::AgentSessionId::from_uuid(successor_agent_id.into_uuid()),
+        );
+        let Err(stale_replay) = client.agent_dag_plan_commit(crate::AgentDagPlanCommitRequest {
+            scope: scope.clone(),
+            request: initial.request.clone(),
+        }) else {
+            return Err("stale Coordinator replayed a committed DAG request after transfer".into());
+        };
+        assert_eq!(stale_replay.code(), ControlErrorCode::CoordinatorConflict);
+
+        let successor_definition = DagNodeDefinition::new(
+            DagNodeId::from_uuid(id(0xEA19)),
+            DagNodeOrdinal::new(0)?,
+            DagNodeTitle::new("Implement successor".to_owned())?,
+            DagNodeObjective::new(
+                "Continue the accepted slice after Coordinator transfer".to_owned(),
+            )?,
+            vec![DagAcceptanceCriterion::new(
+                "Successor implementation verified".to_owned(),
+            )?],
+        )?;
+        let successor_revision = DagRevision::new(
+            DagRevisionId::from_uuid(id(0xEA1A)),
+            initial.goal.id(),
+            initial.goal.revision(),
+            DagRevisionNumber::new(2)?,
+            Some(initial.revision.number()),
+            vec![successor_definition.clone()],
+            Vec::new(),
+            timestamp(13)?,
+        )?;
+        let successor_nodes = vec![RegisteredDagNode::create(
+            initial.goal.id(),
+            successor_revision.number(),
+            successor_definition.clone(),
+            timestamp(13)?,
+        )];
+        let successor_draft = forge_domain::AgentDagDraft::new(
+            successor_revision.clone(),
+            successor_nodes.clone(),
+            vec![forge_domain::DagNodeLineage::new(
+                initial.nodes[0].id(),
+                successor_definition.id(),
+                forge_domain::DagLineageKind::Replace,
+            )],
+        )?;
+        let successor = client.agent_dag_plan_commit(crate::AgentDagPlanCommitRequest {
+            scope: scope.clone(),
+            request: forge_domain::AgentDagPlanRequest::new(
+                forge_domain::AgentDagPlanRequestId::from_uuid(id(0xEA1B)),
+                successor_actor,
+                GoalAttribution::new(initial.goal.id(), initial.goal.revision()),
+                Some(initial.revision.number()),
+                Some(initial.stored.revision().head().revision()),
+                successor_draft,
+                forge_domain::AgentWorkUpdateId::from_uuid(id(0xEA1C)),
+                forge_domain::AgentWorkUpdateSequence::INITIAL,
+                timestamp(13)?,
+            ),
+        })?;
+        assert_eq!(successor.revision().revision(), &successor_revision);
+        Ok(successor_nodes)
+    }
+
     fn create_active_execution_goal_node(
         client: &crate::ForgeControlClient,
         scope: &ResolvedWorkspaceScope,
         request: &ExecutionRequest,
-    ) -> Result<(RegisteredGoal, RegisteredDagNode), Box<dyn std::error::Error>> {
+    ) -> Result<
+        (
+            RegisteredGoal,
+            RegisteredDagNode,
+            forge_domain::ActivityCoordinatorActor,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        let agent_id = forge_domain::AgentInstanceId::from_uuid(id(0xEBC7));
+        let actor = claim_stdio_coordinator(
+            client,
+            scope,
+            request.activity_id(),
+            agent_id,
+            "Execution coordinator",
+            timestamp(1)?,
+        )?;
         let goal = RegisteredGoal::create(
             GoalId::from_uuid(id(0xEBC1)),
             scope.workspace_id(),
+            request.activity_id(),
             GoalContract::new(
                 GoalObjective::new("Project one attributed execution through the DAG".to_owned())?,
                 vec![GoalStatement::new("The execution succeeds".to_owned())?],
@@ -1516,9 +2358,9 @@ mod integration_tests {
                 }],
                 Vec::new(),
             )?,
-            timestamp(1)?,
+            timestamp(2)?,
         );
-        let _created = client.goal_create(scope.clone(), goal.clone())?;
+        let _created = client.goal_create(scope.clone(), actor, goal.clone())?;
         let definition = DagNodeDefinition::new(
             DagNodeId::from_uuid(id(0xEBC2)),
             DagNodeOrdinal::new(0)?,
@@ -1540,22 +2382,107 @@ mod integration_tests {
         )?;
         let pending =
             RegisteredDagNode::create(goal.id(), revision.number(), definition, timestamp(2)?);
-        let stored = client.dag_revision_create(DagRevisionCreateRequest {
-            scope: scope.clone(),
-            revision,
-            nodes: vec![pending.clone()],
-            lineage: Vec::new(),
-            expected_head_revision: None,
-        })?;
-        assert_eq!(stored.nodes(), std::slice::from_ref(&pending));
+        let draft = forge_domain::AgentDagDraft::new(revision, vec![pending.clone()], Vec::new())?;
+        let stored = commit_initial_agent_dag_plan(
+            client,
+            scope,
+            actor,
+            GoalAttribution::new(goal.id(), goal.revision()),
+            draft,
+            InitialAgentDagPlanIdentity {
+                request_id: forge_domain::AgentDagPlanRequestId::from_uuid(id(0xEBC8)),
+                history_update_id: forge_domain::AgentWorkUpdateId::from_uuid(id(0xEBC9)),
+                observed_at: timestamp(2)?,
+            },
+        )?;
+        assert_eq!(stored.revision().nodes(), std::slice::from_ref(&pending));
         let active = client.dag_node_start(DagNodeStartRequest {
             scope: scope.clone(),
+            activity_id: request.activity_id(),
+            session_id: actor.session_id(),
+            principal: actor.principal(),
             goal_id: goal.id(),
+            expected_goal_revision: goal.revision(),
+            expected_dag_revision: pending.dag_revision(),
             node_id: pending.id(),
             expected_revision: pending.revision(),
             observed_at: timestamp(3)?,
         })?;
-        Ok((goal, active))
+        Ok((goal, active, actor))
+    }
+
+    fn sleeping_execution_request(
+        execution_id: ExecutionId,
+        workspace_id: WorkspaceId,
+        activity_id: ActivityId,
+    ) -> Result<ExecutionRequest, Box<dyn std::error::Error>> {
+        Ok(ExecutionRequest::new(
+            ExecutionAttribution::new(execution_id, workspace_id, activity_id),
+            ExecutionKind::Structured {
+                program: ExecutionProgram::new(PathBuf::from("/bin/sleep"))?,
+                arguments: vec![ExecutionArgument::new(OsString::from("30"))?],
+            },
+            None,
+            ExecutionLimits::new(
+                ExecutionTimeoutMillis::new(30_000)?,
+                ExecutionOutputLimit::new(1_024)?,
+            ),
+            ExecutionPermissions::new(false, false, false),
+        )?)
+    }
+
+    fn successful_execution_request(
+        execution_id: ExecutionId,
+        workspace_id: WorkspaceId,
+        activity_id: ActivityId,
+    ) -> Result<ExecutionRequest, Box<dyn std::error::Error>> {
+        Ok(ExecutionRequest::new(
+            ExecutionAttribution::new(execution_id, workspace_id, activity_id),
+            ExecutionKind::Structured {
+                program: ExecutionProgram::new(PathBuf::from("/usr/bin/true"))?,
+                arguments: Vec::new(),
+            },
+            None,
+            ExecutionLimits::new(
+                ExecutionTimeoutMillis::new(2_000)?,
+                ExecutionOutputLimit::new(1_024)?,
+            ),
+            ExecutionPermissions::new(false, false, false),
+        )?)
+    }
+
+    fn create_supervisor_goal(
+        client: &crate::ForgeControlClient,
+        scope: &ResolvedWorkspaceScope,
+        activity_id: ActivityId,
+    ) -> Result<(RegisteredGoal, forge_domain::ActivityCoordinatorActor), Box<dyn std::error::Error>>
+    {
+        let actor = claim_stdio_coordinator(
+            client,
+            scope,
+            activity_id,
+            forge_domain::AgentInstanceId::from_uuid(id(0xEB06)),
+            "Supervisor coordinator",
+            timestamp(1)?,
+        )?;
+        let goal = RegisteredGoal::create(
+            GoalId::from_uuid(id(0xEB04)),
+            scope.workspace_id(),
+            activity_id,
+            GoalContract::new(
+                GoalObjective::new("Observe one approved execution".to_owned())?,
+                vec![GoalStatement::new(
+                    "The linked approval and execution are terminal".to_owned(),
+                )?],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )?,
+            timestamp(2)?,
+        );
+        let _ = client.goal_create(scope.clone(), actor, goal.clone())?;
+        Ok((goal, actor))
     }
 
     fn assert_single_node_dag_projection(
@@ -1579,10 +2506,11 @@ mod integration_tests {
     fn assert_pending_approval_blocker(
         client: &crate::ForgeControlClient,
         scope: &ResolvedWorkspaceScope,
+        activity_id: ActivityId,
         goal_id: GoalId,
         approval_id: forge_domain::ApprovalRequestId,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let review = client.goal_review(scope.clone(), goal_id)?;
+        let review = client.goal_review(scope.clone(), activity_id, goal_id)?;
         assert!(review.blockers().iter().any(|blocker| {
             matches!(
                 blocker,
@@ -1595,6 +2523,7 @@ mod integration_tests {
     fn complete_attributed_goal_node(
         client: &crate::ForgeControlClient,
         scope: &ResolvedWorkspaceScope,
+        actor: forge_domain::ActivityCoordinatorActor,
         goal: &RegisteredGoal,
         active: &RegisteredDagNode,
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1610,6 +2539,8 @@ mod integration_tests {
         );
         let completed_goal = client.goal_complete(GoalCompletionRequest {
             scope: scope.clone(),
+            activity_id: goal.activity_id(),
+            actor,
             goal_id: goal.id(),
             expected_revision: goal.revision(),
             review_id: id(0xEBC7),
@@ -1673,7 +2604,7 @@ mod integration_tests {
         let location_root = root.join("location");
         fs::create_dir_all(&location_root)?;
         if with_git {
-            let status = Command::new("/usr/bin/git")
+            let status = Command::new(FORGE_GIT_PROGRAM)
                 .args([
                     "-C",
                     location_root.to_str().ok_or("non-UTF-8 fixture path")?,
@@ -1726,6 +2657,26 @@ mod integration_tests {
         })
     }
 
+    fn initialize_location_root_workspace(
+        fixture: &Fixture,
+    ) -> Result<(WorkspaceId, WorkspaceRevision), Box<dyn std::error::Error>> {
+        let location_root = fixture.root.join("location");
+        let layout = WorkspaceStateLayout::initialize(&location_root)?;
+        let durable_root = WorkspaceRoot::from_canonical(layout.workspace_root().to_path_buf())?;
+        let workspace_id =
+            WorkspaceId::from_uuid(id(0x9000 + u128::from(NEXT_FIXTURE.load(Ordering::Relaxed))));
+        let command = EstablishWorkspace::new(
+            workspace_id,
+            fixture.location_id,
+            durable_root,
+            layout.root_fingerprint()?,
+            timestamp(3)?,
+        );
+        let store = WorkspaceStore::open(&layout, &command)?;
+        let registered = store.get_workspace()?;
+        Ok((registered.id(), registered.revision()))
+    }
+
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct FileSnapshot {
         bytes: Option<Vec<u8>>,
@@ -1749,29 +2700,17 @@ mod integration_tests {
         })
     }
 
-    fn read_only_workspace_snapshots(
-        fixture: &Fixture,
-    ) -> Result<Vec<FileSnapshot>, Box<dyn std::error::Error>> {
-        let workspace = &fixture.workspaces[0];
-        Ok(vec![
-            snapshot(&workspace.join(".heterarchy-forge/state.sqlite3"))?,
-            snapshot(&workspace.join(".heterarchy-forge/state.sqlite3-wal"))?,
-            snapshot(&workspace.join(".heterarchy-forge/state.sqlite3-shm"))?,
-            snapshot(&fixture.root.join("location/.git/info/exclude"))?,
-        ])
-    }
-
     fn locator_for(
         control: &ForgeControl,
         location_id: LocationId,
         relative_name: &str,
     ) -> Result<forge_workspace::WorkspaceLocator, Box<dyn std::error::Error>> {
         let entries =
-            control.workspace_list(location_id, forge_domain::LocationRevision::INITIAL)?;
+            control.workspace_discover(location_id, forge_domain::LocationRevision::INITIAL)?;
         let entry = entries
             .iter()
             .find(|entry| entry.display_name() == relative_name)
-            .ok_or("workspace catalog entry missing")?;
+            .ok_or("workspace discovery entry missing")?;
         Ok(entry.locator().clone())
     }
 
@@ -1787,18 +2726,22 @@ mod integration_tests {
         let entries = fixture
             .control
             .workspace_list(fixture.location_id, forge_domain::LocationRevision::INITIAL)?;
-        assert!(entries.len() <= MAX_WORKSPACE_CATALOG_ENTRIES);
-        assert!(entries.iter().all(|entry| {
-            matches!(
-                entry.status(),
-                WorkspaceCatalogStatus::Uninitialized | WorkspaceCatalogStatus::Ready { .. }
-            )
-        }));
-        assert!(
-            entries
+        assert!(entries.is_empty());
+
+        let observations = fixture
+            .control
+            .workspace_discover(fixture.location_id, forge_domain::LocationRevision::INITIAL)?;
+        assert!(observations.len() <= MAX_WORKSPACE_CATALOG_ENTRIES);
+        assert_eq!(
+            observations
                 .iter()
-                .all(|entry| !format!("{entry:?}").contains('/'))
+                .filter(|entry| entry.display_name().starts_with("workspace-"))
+                .count(),
+            2
         );
+        assert!(observations.iter().all(|entry| {
+            !format!("{entry:?}").contains(&fixture.root.to_string_lossy().to_string())
+        }));
         for state_path in state_paths {
             assert!(!state_path.exists());
         }
@@ -1807,24 +2750,45 @@ mod integration_tests {
     }
 
     #[test]
-    fn read_only_list_and_resolve_preserve_database_sidecars_and_git_exclude()
+    fn live_read_only_list_and_resolve_preserve_database_wal_and_git_exclude()
     -> Result<(), Box<dyn std::error::Error>> {
-        let fixture = fixture_with_git("read-only", &[0], 1, true)?;
-        let before = read_only_workspace_snapshots(&fixture)?;
+        let fixture = fixture_with_git("read-only", &[], 1, true)?;
+        let (catalog_id, catalog_revision) = initialize_location_root_workspace(&fixture)?;
+        let layout = WorkspaceStateLayout::inspect_existing(fixture.root.join("location"))?
+            .ok_or("Location-root Workspace layout missing")?;
+        let mut active_store = WorkspaceStore::open_existing(&layout)?;
+        active_store.create_activity(&CreateActivity::new(
+            ActivityId::from_uuid(id(0x9010)),
+            catalog_id,
+            catalog_revision,
+            timestamp(4)?,
+        ))?;
+        let before = [
+            snapshot(
+                &fixture
+                    .root
+                    .join("location/.heterarchy-forge/state.sqlite3"),
+            )?,
+            snapshot(
+                &fixture
+                    .root
+                    .join("location/.heterarchy-forge/state.sqlite3-wal"),
+            )?,
+            snapshot(
+                &fixture
+                    .root
+                    .join("location/.heterarchy-forge/state.sqlite3-shm"),
+            )?,
+            snapshot(&fixture.root.join("location/.git/info/exclude"))?,
+        ];
+        assert!(before[1].bytes.is_some());
+        assert!(before[2].bytes.is_some());
         let entries = fixture
             .control
             .workspace_list(fixture.location_id, forge_domain::LocationRevision::INITIAL)?;
-        let entry = entries
-            .iter()
-            .find(|entry| entry.display_name() == "workspace-0")
-            .ok_or("ready catalog entry missing")?;
-        let (catalog_id, catalog_revision) = match entry.status() {
-            WorkspaceCatalogStatus::Ready {
-                workspace_id,
-                workspace_revision,
-            } => (workspace_id, workspace_revision),
-            status => return Err(format!("unexpected catalog status: {status:?}").into()),
-        };
+        let entry = entries.first().ok_or("ready catalog entry missing")?;
+        assert_eq!(entry.workspace_id(), catalog_id);
+        assert_eq!(entry.workspace_revision(), catalog_revision);
         let scope = fixture.control.resolve_workspace(
             fixture.location_id,
             forge_domain::LocationRevision::INITIAL,
@@ -1832,8 +2796,29 @@ mod integration_tests {
         )?;
         assert_eq!(Some(scope.workspace_id()), Some(catalog_id));
         assert_eq!(Some(scope.workspace_revision()), Some(catalog_revision));
-        let after = read_only_workspace_snapshots(&fixture)?;
-        assert_eq!(before, after);
+        let after = [
+            snapshot(
+                &fixture
+                    .root
+                    .join("location/.heterarchy-forge/state.sqlite3"),
+            )?,
+            snapshot(
+                &fixture
+                    .root
+                    .join("location/.heterarchy-forge/state.sqlite3-wal"),
+            )?,
+            snapshot(
+                &fixture
+                    .root
+                    .join("location/.heterarchy-forge/state.sqlite3-shm"),
+            )?,
+            snapshot(&fixture.root.join("location/.git/info/exclude"))?,
+        ];
+        assert!(before[0] == after[0], "Workspace database bytes changed");
+        assert!(before[1] == after[1], "Workspace WAL bytes changed");
+        assert_eq!(before[2].bytes.is_some(), after[2].bytes.is_some());
+        assert!(before[3] == after[3], "Git exclude bytes changed");
+        drop(active_store);
         fs::remove_dir_all(fixture.root)?;
         Ok(())
     }
@@ -1937,7 +2922,7 @@ mod integration_tests {
         drop(sender);
         assert!(matches!(
             disconnected.try_recv(),
-            Err(ControlClientError::WorkerClosed)
+            Err(ControlClientError::ResponseDropped)
         ));
 
         let fixture = fixture("pending-client", &[], 1)?;
@@ -2169,6 +3154,142 @@ mod integration_tests {
         Ok(())
     }
 
+    #[test]
+    fn supervised_lease_renew_authenticates_coordinator_session_before_workspace_open()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = fixture("supervised-lease-session-auth", &[0], 1)?;
+        let locator = locator_for(&fixture.control, fixture.location_id, "workspace-0")?;
+        let scope = fixture.control.resolve_workspace(
+            fixture.location_id,
+            forge_domain::LocationRevision::INITIAL,
+            &locator,
+        )?;
+        let activity_id = ActivityId::from_uuid(id(0xA100));
+        let owner = RuntimeInstanceId::from_uuid(id(0xA101));
+        let request = SupervisedActivityLeaseRenewRequest {
+            scope: scope.clone(),
+            actor: ActivityCoordinatorActor::new(
+                scope.workspace_id(),
+                activity_id,
+                forge_domain::AgentInstanceId::from_uuid(id(0xA102)),
+                forge_domain::ActivityCoordinatorRevision::INITIAL,
+                forge_domain::AuthenticatedPrincipal::TrustedStdio,
+                forge_domain::AgentSessionId::from_uuid(id(0xA103)),
+            ),
+            goal_id: GoalId::from_uuid(id(0xA104)),
+            goal_created_at: timestamp(1)?,
+            command: RenewActivityLease::new(
+                activity_id,
+                owner,
+                forge_domain::ActivityLeaseRevision::INITIAL,
+                timestamp(20)?,
+                timestamp(10)?,
+            ),
+        };
+        let Err(error) = fixture.control.renew_supervised_activity_lease(&request) else {
+            return Err("unauthenticated Session reached Source lease mutation".into());
+        };
+        assert_eq!(error.code(), ControlErrorCode::AgentSessionNotFound);
+        fs::remove_dir_all(fixture.root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn single_activity_uncertainty_preserves_zero_or_one_committed_projection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = fixture("single-lease-unknown", &[0], 1)?;
+        let locator = locator_for(&fixture.control, fixture.location_id, "workspace-0")?;
+        let scope = fixture.control.resolve_workspace(
+            fixture.location_id,
+            forge_domain::LocationRevision::INITIAL,
+            &locator,
+        )?;
+        let bootstrap = fixture.control.bootstrap_activity(
+            &scope,
+            ActivityId::from_uuid(id(0x3450)),
+            RuntimeInstanceId::from_uuid(id(0x3460)),
+            timestamp(10)?,
+            timestamp(20)?,
+        )?;
+        let activity = bootstrap
+            .activity()
+            .ok_or("committed fixture Activity missing")?
+            .clone();
+        for status in [
+            ActivityOperationStatus::Renewed,
+            ActivityOperationStatus::Closed,
+            ActivityOperationStatus::Released,
+        ] {
+            for rows in [Vec::new(), vec![activity.clone()]] {
+                let expected = rows.first().cloned();
+                let result = super::ActivityOperation::uncertain(scope.clone(), None, rows)
+                    .into_single(status)?;
+                assert_eq!(
+                    result.status(),
+                    ActivityOperationStatus::CommittedButUnconfirmed
+                );
+                assert!(result.is_committed());
+                assert!(result.is_committed_but_unconfirmed());
+                assert_eq!(result.activity(), expected.as_ref());
+                assert!(result.activities().is_empty());
+            }
+        }
+        fs::remove_dir_all(fixture.root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn activity_lease_observation_preserves_exact_ids_and_is_bounded()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = fixture("activity-observation", &[0], 1)?;
+        let locator = locator_for(&fixture.control, fixture.location_id, "workspace-0")?;
+        let scope = fixture.control.resolve_workspace(
+            fixture.location_id,
+            forge_domain::LocationRevision::INITIAL,
+            &locator,
+        )?;
+        let owner = RuntimeInstanceId::from_uuid(id(0x3500));
+        let first_id = ActivityId::from_uuid(id(0x3501));
+        let second_id = ActivityId::from_uuid(id(0x3502));
+        let _ = fixture.control.bootstrap_activity(
+            &scope,
+            first_id,
+            owner,
+            timestamp(10)?,
+            timestamp(20)?,
+        )?;
+        let _ = fixture.control.bootstrap_activity(
+            &scope,
+            second_id,
+            owner,
+            timestamp(10)?,
+            timestamp(20)?,
+        )?;
+
+        let observed = fixture
+            .control
+            .observe_activity_leases(&scope, &[second_id, first_id, second_id])?;
+        assert_eq!(
+            observed
+                .iter()
+                .map(forge_domain::RegisteredActivity::id)
+                .collect::<Vec<_>>(),
+            vec![second_id, first_id, second_id]
+        );
+
+        let too_many = vec![first_id; MAX_ACTIVITY_LEASE_OBSERVATION_IDS + 1];
+        assert_eq!(
+            fixture
+                .control
+                .observe_activity_leases(&scope, &too_many)
+                .err()
+                .map(|error| error.code()),
+            Some(ControlErrorCode::CapacityExceeded)
+        );
+        fs::remove_dir_all(fixture.root)?;
+        Ok(())
+    }
+
     type LeaseBatchInputs = (Vec<ActivityId>, Vec<RenewActivityLease>, Vec<CloseActivity>);
 
     fn create_lease_batch_inputs(
@@ -2374,7 +3495,7 @@ mod integration_tests {
         let fixture = fixture("isolation", &[0, 1], 2)?;
         let entries = fixture
             .control
-            .workspace_list(fixture.location_id, forge_domain::LocationRevision::INITIAL)?;
+            .workspace_discover(fixture.location_id, forge_domain::LocationRevision::INITIAL)?;
         let mut locators = entries
             .iter()
             .filter(|entry| entry.display_name().starts_with("workspace-"))
@@ -2467,7 +3588,7 @@ mod integration_tests {
     {
         let fixture = fixture("worker", &[], 1)?;
         let (client, mut worker) = ForgeControlWorker::start(fixture.control)?;
-        assert_eq!(ForgeControlWorker::queue_capacity(), 16);
+        assert_eq!(ForgeControlWorker::queue_capacity(), 128);
         let _ =
             client.workspace_list(fixture.location_id, forge_domain::LocationRevision::INITIAL)?;
         worker.shutdown()?;
@@ -2477,6 +3598,43 @@ mod integration_tests {
             .ok_or("client unexpectedly admitted work after shutdown")?;
         assert!(matches!(error, ControlClientError::WorkerShuttingDown));
         fs::remove_dir_all(fixture.root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_queue_save_uses_worker_time_instead_of_caller_time()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = fixture("queue-worker-time", &[0], 1)?;
+        let locator = locator_for(&fixture.control, fixture.location_id, "workspace-0")?;
+        let cleanup_root = fixture.root.clone();
+        let location_id = fixture.location_id;
+        let (client, mut worker) = ForgeControlWorker::start(fixture.control)?;
+        let scope = client.resolve_workspace(
+            location_id,
+            forge_domain::LocationRevision::INITIAL,
+            locator,
+        )?;
+        let future =
+            client.replace_workspace_queue_settings(crate::WorkspaceQueueSettingsRequest {
+                scope: scope.clone(),
+                settings: forge_persistence::QueueSettings::new(crate::QueueCapacity::C64),
+                expected_revision: None,
+                observed_at: timestamp(i64::MAX)?,
+            })?;
+        assert!(future.updated_at().get() > 1_000_000_000_000);
+        assert_ne!(future.updated_at().get(), i64::MAX);
+        let past =
+            client.replace_workspace_queue_settings(crate::WorkspaceQueueSettingsRequest {
+                scope: scope.clone(),
+                settings: forge_persistence::QueueSettings::new(crate::QueueCapacity::C32),
+                expected_revision: Some(future.revision()),
+                observed_at: timestamp(0)?,
+            })?;
+        assert_eq!(past.revision().get(), future.revision().get() + 1);
+        assert!(past.updated_at() >= future.updated_at());
+        assert_eq!(client.workspace_queue_settings(scope)?, Some(past));
+        worker.shutdown()?;
+        fs::remove_dir_all(cleanup_root)?;
         Ok(())
     }
 
@@ -2546,7 +3704,6 @@ mod integration_tests {
                 activity_id,
                 runtime_id,
                 activity.lease_revision(),
-                timestamp(12)?,
             )
             .err()
             .ok_or("client unexpectedly admitted after owned shutdown")?;
@@ -2610,7 +3767,7 @@ mod integration_tests {
     }
 
     #[test]
-    fn control_worker_round_trips_dag_revision_and_node_lifecycle()
+    fn control_worker_round_trips_coordinator_owned_dag_plan_and_node_lifecycle()
     -> Result<(), Box<dyn std::error::Error>> {
         let fixture = fixture("dag-worker", &[0], 1)?;
         let locator = locator_for(&fixture.control, fixture.location_id, "workspace-0")?;
@@ -2621,65 +3778,52 @@ mod integration_tests {
             forge_domain::LocationRevision::INITIAL,
             locator,
         )?;
-        let goal = RegisteredGoal::create(
-            GoalId::from_uuid(id(0xEA10)),
-            scope.workspace_id(),
-            GoalContract::new(
-                GoalObjective::new("Persist one DAG node".to_owned())?,
-                vec![GoalStatement::new("Node completes".to_owned())?],
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-            )?,
-            timestamp(10)?,
-        );
-        let _ = client.goal_create(scope.clone(), goal.clone())?;
-        let definition = DagNodeDefinition::new(
-            DagNodeId::from_uuid(id(0xEA11)),
-            DagNodeOrdinal::new(0)?,
-            DagNodeTitle::new("Implement".to_owned())?,
-            DagNodeObjective::new("Implement the accepted slice".to_owned())?,
-            vec![DagAcceptanceCriterion::new(
-                "Implementation verified".to_owned(),
-            )?],
+        let activity_id = ActivityId::from_uuid(id(0xEA13));
+        let owner = RuntimeInstanceId::from_uuid(id(0xEA14));
+        let _activity = client.bootstrap_activity(
+            scope.clone(),
+            activity_id,
+            owner,
+            timestamp(8)?,
+            timestamp(60_000)?,
         )?;
-        let revision = DagRevision::new(
-            DagRevisionId::from_uuid(id(0xEA12)),
-            goal.id(),
-            goal.revision(),
-            DagRevisionNumber::INITIAL,
-            None,
-            vec![definition.clone()],
-            Vec::new(),
-            timestamp(11)?,
+        let agent_id = forge_domain::AgentInstanceId::from_uuid(id(0xEA15));
+        let coordinator_actor = claim_stdio_coordinator(
+            &client,
+            &scope,
+            activity_id,
+            agent_id,
+            "DAG planner",
+            timestamp(9)?,
         )?;
-        let nodes = vec![RegisteredDagNode::create(
-            goal.id(),
-            revision.number(),
-            definition,
-            timestamp(11)?,
-        )];
-        let stored = client.dag_revision_create(DagRevisionCreateRequest {
-            scope: scope.clone(),
-            revision: revision.clone(),
-            nodes: nodes.clone(),
-            lineage: Vec::new(),
-            expected_head_revision: None,
-        })?;
-        assert_eq!(stored.revision(), &revision);
-        assert_eq!(
-            client.dag_get_current(scope.clone(), goal.id())?,
-            Some(stored)
-        );
+        let initial = create_initial_coordinator_dag_plan_fixture(
+            &client,
+            &scope,
+            activity_id,
+            coordinator_actor,
+        )?;
+        let successor_nodes = transfer_and_commit_successor_dag(
+            &client,
+            &scope,
+            activity_id,
+            agent_id,
+            coordinator_actor,
+            &initial,
+        )?;
+
         let active = client.dag_node_start(DagNodeStartRequest {
             scope: scope.clone(),
-            goal_id: goal.id(),
-            node_id: nodes[0].id(),
-            expected_revision: nodes[0].revision(),
-            observed_at: timestamp(12)?,
+            activity_id,
+            session_id: coordinator_actor.session_id(),
+            principal: coordinator_actor.principal(),
+            goal_id: initial.goal.id(),
+            expected_goal_revision: initial.goal.revision(),
+            expected_dag_revision: successor_nodes[0].dag_revision(),
+            node_id: successor_nodes[0].id(),
+            expected_revision: successor_nodes[0].revision(),
+            observed_at: timestamp(14)?,
         })?;
-        let completed = active.complete(active.revision(), timestamp(13)?)?;
+        let completed = active.complete(active.revision(), timestamp(15)?)?;
         assert_eq!(
             client.dag_node_update(DagNodeUpdateRequest {
                 scope,
@@ -2696,6 +3840,9 @@ mod integration_tests {
     #[test]
     fn execution_supervisor_and_control_worker_complete_without_blocking_leases()
     -> Result<(), Box<dyn std::error::Error>> {
+        if nested_sandbox_execution_is_unavailable() {
+            return Ok(());
+        }
         let fixture = fixture("worker-execution-supervisor", &[0], 1)?;
         let locator = locator_for(&fixture.control, fixture.location_id, "workspace-0")?;
         let cleanup_root = fixture.root.clone();
@@ -2720,47 +3867,20 @@ mod integration_tests {
             .ok_or("execution Activity missing")?;
         let observed_at = activity.created_at();
         let execution_id = ExecutionId::from_uuid(id(0xEB03));
-        let request = ExecutionRequest::new(
-            ExecutionAttribution::new(execution_id, scope.workspace_id(), activity_id),
-            ExecutionKind::Structured {
-                program: ExecutionProgram::new(PathBuf::from("/bin/sleep"))?,
-                arguments: vec![ExecutionArgument::new(OsString::from("30"))?],
-            },
-            None,
-            ExecutionLimits::new(
-                ExecutionTimeoutMillis::new(30_000)?,
-                ExecutionOutputLimit::new(1_024)?,
-            ),
-            ExecutionPermissions::new(false, false, false),
-        )?;
+        let request = sleeping_execution_request(execution_id, scope.workspace_id(), activity_id)?;
         let mut execution_coordinator = ForgeExecutionCoordinator::start(client.clone(), 1)?;
         let execution_client = execution_coordinator.client();
         let mut approval_coordinator =
             ForgeApprovalCoordinator::start(client.clone(), execution_client.clone())?;
         let approval_client = approval_coordinator.client();
-        let goal = RegisteredGoal::create(
-            GoalId::from_uuid(id(0xEB04)),
-            scope.workspace_id(),
-            GoalContract::new(
-                GoalObjective::new("Observe one approved execution".to_owned())?,
-                vec![GoalStatement::new(
-                    "The linked approval and execution are terminal".to_owned(),
-                )?],
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-            )?,
-            timestamp(1)?,
-        );
-        let _ = client.goal_create(scope.clone(), goal.clone())?;
+        let (goal, coordinator_actor) = create_supervisor_goal(&client, &scope, activity_id)?;
         let submitted = approval_client.submit_execution(
             SubmitExecutionForApproval::direct(scope.clone(), activity_id, owner, request)
                 .with_goal(GoalAttribution::new(goal.id(), goal.revision())),
         )?;
         assert_eq!(submitted.status(), ApprovalSubmissionStatus::Pending);
         assert_eq!(approval_client.list_pending(scope.clone())?.len(), 1);
-        let pending_review = client.goal_review(scope.clone(), goal.id())?;
+        let pending_review = client.goal_review(scope.clone(), activity_id, goal.id())?;
         assert!(pending_review.blockers().iter().any(|blocker| matches!(
             blocker,
             forge_domain::GoalCompletionBlocker::PendingApproval(_)
@@ -2780,9 +3900,15 @@ mod integration_tests {
             .execution_get(scope.clone(), execution_id)?
             .ok_or("coordinator terminal record missing")?;
         assert_eq!(completed.state(), forge_domain::ExecutionState::Cancelled);
-        assert!(client.goal_review(scope.clone(), goal.id())?.can_complete());
+        assert!(
+            client
+                .goal_review(scope.clone(), activity_id, goal.id())?
+                .can_complete()
+        );
         let completed_goal = client.goal_complete(GoalCompletionRequest {
             scope,
+            activity_id,
+            actor: coordinator_actor,
             goal_id: goal.id(),
             expected_revision: goal.revision(),
             review_id: id(0xEB05),
@@ -2804,6 +3930,9 @@ mod integration_tests {
     #[test]
     fn explicit_approval_runs_structured_process_to_durable_success()
     -> Result<(), Box<dyn std::error::Error>> {
+        if nested_sandbox_execution_is_unavailable() {
+            return Ok(());
+        }
         let fixture = fixture("explicit-approval-success", &[0], 1)?;
         let workspace_root = fixture.workspaces[0].clone();
         let locator = locator_for(&fixture.control, fixture.location_id, "workspace-0")?;
@@ -2904,6 +4033,9 @@ mod integration_tests {
     #[test]
     fn attributed_execution_projects_goal_and_dag_evidence_without_auto_completing_node()
     -> Result<(), Box<dyn std::error::Error>> {
+        if nested_sandbox_execution_is_unavailable() {
+            return Ok(());
+        }
         let fixture = fixture("goal-dag-execution-evidence", &[0], 1)?;
         let workspace_root = fixture.workspaces[0].clone();
         let locator = locator_for(&fixture.control, fixture.location_id, "workspace-0")?;
@@ -2928,20 +4060,10 @@ mod integration_tests {
             .cloned()
             .ok_or("Goal/DAG execution Activity missing")?;
         let execution_id = ExecutionId::from_uuid(id(0xEBC6));
-        let request = ExecutionRequest::new(
-            ExecutionAttribution::new(execution_id, scope.workspace_id(), activity_id),
-            ExecutionKind::Structured {
-                program: ExecutionProgram::new(PathBuf::from("/usr/bin/true"))?,
-                arguments: Vec::new(),
-            },
-            None,
-            ExecutionLimits::new(
-                ExecutionTimeoutMillis::new(2_000)?,
-                ExecutionOutputLimit::new(1_024)?,
-            ),
-            ExecutionPermissions::new(false, false, false),
-        )?;
-        let (goal, active) = create_active_execution_goal_node(&client, &scope, &request)?;
+        let request =
+            successful_execution_request(execution_id, scope.workspace_id(), activity_id)?;
+        let (goal, active, coordinator_actor) =
+            create_active_execution_goal_node(&client, &scope, &request)?;
         let attribution = GoalNodeAttribution::new(
             goal.id(),
             goal.revision(),
@@ -2965,7 +4087,13 @@ mod integration_tests {
             1,
             &forge_domain::DagNodeLifecycle::Active,
         )?;
-        assert_pending_approval_blocker(&client, &scope, goal.id(), submitted.approval_id())?;
+        assert_pending_approval_blocker(
+            &client,
+            &scope,
+            activity_id,
+            goal.id(),
+            submitted.approval_id(),
+        )?;
 
         assert_eq!(
             approval_client.approve_once(submitted.approval_id())?,
@@ -2983,7 +4111,7 @@ mod integration_tests {
             2,
             &forge_domain::DagNodeLifecycle::Active,
         )?;
-        let review = client.goal_review(scope.clone(), goal.id())?;
+        let review = client.goal_review(scope.clone(), activity_id, goal.id())?;
         assert!(
             review
                 .hard_checks()
@@ -2991,7 +4119,7 @@ mod integration_tests {
                 .all(forge_domain::GoalHardCheck::is_passed)
         );
         assert!(review.blockers().is_empty());
-        complete_attributed_goal_node(&client, &scope, &goal, &active)?;
+        complete_attributed_goal_node(&client, &scope, coordinator_actor, &goal, &active)?;
 
         let approval_report = approval_coordinator.shutdown()?;
         assert_eq!(approval_report.pending_cancelled(), 0);
@@ -3008,9 +4136,77 @@ mod integration_tests {
         Ok(())
     }
 
+    fn prepare_discovered_command_authority(
+        client: &crate::ForgeControlClient,
+        scope: &ResolvedWorkspaceScope,
+        activity_id: ActivityId,
+        runtime_instance_id: RuntimeInstanceId,
+        request: &ExecutionRequest,
+    ) -> Result<
+        (
+            GoalNodeAttribution,
+            AgentExecutionAuthorityRequest,
+            ProjectCommandEvidence,
+            ExecutionRequest,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        let command_snapshot = client.project_command_list(ProjectCommandListRequest {
+            scope: scope.clone(),
+            activity: FileActivityScope {
+                activity_id,
+                runtime_instance_id,
+                observed_at: timestamp(4)?,
+            },
+        })?;
+        let resolved = command_snapshot
+            .resolve_execution(&ProjectCommandId::new("make:ci".to_owned())?, request.id())?;
+        let command_evidence =
+            ProjectCommandEvidence::new(resolved.class(), resolved.fingerprint());
+        let resolved_request = resolved.request().clone();
+        let (goal, node, actor) =
+            create_active_execution_goal_node(client, scope, &resolved_request)?;
+        let focus = AgentFocus::new(
+            Some(GoalAttribution::new(goal.id(), goal.revision())),
+            Some(node.dag_revision()),
+            Some(AgentFocusNode::new(node.id(), node.revision())),
+        )?;
+        let focused = client.agent_set_focus(crate::AgentFocusRequest {
+            scope: scope.clone(),
+            activity_id,
+            actor,
+            agent_id: actor.agent_id(),
+            expected_revision: AgentInstanceRevision::INITIAL,
+            focus,
+            observed_at: timestamp(4)?,
+        })?;
+        let attribution = GoalNodeAttribution::new(
+            goal.id(),
+            goal.revision(),
+            node.dag_revision(),
+            node.id(),
+            node.revision(),
+        );
+        let authority = AgentExecutionAuthorityRequest {
+            session_id: forge_domain::AgentSessionId::from_uuid(focused.id().into_uuid()),
+            scope: scope.clone(),
+            activity_id,
+            agent_id: focused.id(),
+            expected_revision: focused.revision(),
+            principal: AuthenticatedPrincipal::TrustedStdio,
+            attribution,
+            command_id: ExecutionCommandId::new("make:ci".to_owned())?,
+        };
+        Ok((attribution, authority, command_evidence, resolved_request))
+    }
+
     #[test]
-    fn bounded_auto_approval_starts_only_discovered_command_and_leaves_audit()
+    #[allow(clippy::too_many_lines)]
+    fn bounded_auto_approval_starts_discovered_and_analyzed_shell_and_leaves_audit()
     -> Result<(), Box<dyn std::error::Error>> {
+        if nested_sandbox_execution_is_unavailable() {
+            return Ok(());
+        }
         let fixture = fixture("auto-approval", &[0], 1)?;
         let workspace_root = fixture.workspaces[0].clone();
         let locator = locator_for(&fixture.control, fixture.location_id, "workspace-0")?;
@@ -3031,10 +4227,14 @@ mod integration_tests {
             timestamp(0)?,
             timestamp(60_000)?,
         )?;
-        let _activity = bootstrap
-            .activity()
-            .ok_or("auto approval Activity missing")?;
-        let mut execution_coordinator = ForgeExecutionCoordinator::start(client.clone(), 1)?;
+        assert!(bootstrap.activity().is_some());
+        fs::write(fixture.workspaces[0].join("Makefile"), "ci:\n\t@true\n")?;
+        let capability = prepare_test_rust_ci_capability(&fixture.root)?;
+        let mut execution_coordinator = ForgeExecutionCoordinator::start_with_rust_ci_capability(
+            client.clone(),
+            2,
+            Some(capability),
+        )?;
         let mut approval_coordinator =
             ForgeApprovalCoordinator::start(client.clone(), execution_coordinator.client())?;
         let approval_client = approval_coordinator.client();
@@ -3047,8 +4247,8 @@ mod integration_tests {
         let request = ExecutionRequest::new(
             ExecutionAttribution::new(execution_id, scope.workspace_id(), activity_id),
             ExecutionKind::Structured {
-                program: ExecutionProgram::new(PathBuf::from("/usr/bin/true"))?,
-                arguments: Vec::new(),
+                program: ExecutionProgram::new(PathBuf::from(crate::command::RUST_CI_PROGRAM))?,
+                arguments: vec![ExecutionArgument::new(OsString::from("ci"))?],
             },
             None,
             ExecutionLimits::new(
@@ -3057,10 +4257,44 @@ mod integration_tests {
             ),
             ExecutionPermissions::new(true, false, false),
         )?;
+        let (attribution, authority, command_evidence, command_request) =
+            prepare_discovered_command_authority(&client, &scope, activity_id, owner, &request)?;
+        let mut shell_authority = authority.clone();
         let submission = approval_client.submit_execution(
-            SubmitExecutionForApproval::discovered(scope, activity_id, owner, request)?,
+            SubmitExecutionForApproval::project_command(
+                scope.clone(),
+                activity_id,
+                owner,
+                command_request,
+                command_evidence,
+            )?
+            .with_goal_node(attribution)
+            .with_agent_authority(authority),
         )?;
         assert_eq!(submission.status(), ApprovalSubmissionStatus::Started);
+
+        let analyzed = crate::shell::analyze_shell_script("printf auto-shell".to_owned())?;
+        let shell_execution_id = ExecutionId::from_uuid(id(0xEC04));
+        let shell_request = ExecutionRequest::new(
+            ExecutionAttribution::new(shell_execution_id, scope.workspace_id(), activity_id),
+            ExecutionKind::Shell {
+                script: analyzed.script().clone(),
+            },
+            None,
+            ExecutionLimits::new(
+                ExecutionTimeoutMillis::new(1_000)?,
+                ExecutionOutputLimit::new(1_024)?,
+            ),
+            analyzed.permissions(),
+        )?;
+        shell_authority.command_id = analyzed.intent_id().clone();
+        let shell_attribution = shell_authority.attribution;
+        let shell_submission = approval_client.submit_execution(
+            SubmitExecutionForApproval::analyzed_shell(scope, activity_id, owner, shell_request)?
+                .with_goal_node(shell_attribution)
+                .with_agent_authority(shell_authority),
+        )?;
+        assert_eq!(shell_submission.status(), ApprovalSubmissionStatus::Started);
         let _cancelled = approval_client.emergency_stop()?;
         let _approval_report = approval_coordinator.shutdown()?;
         let _execution_report = execution_coordinator.shutdown()?;
@@ -3069,8 +4303,24 @@ mod integration_tests {
         let layout = WorkspaceStateLayout::inspect_existing(&workspace_root)?
             .ok_or("auto approval layout missing")?;
         let store = WorkspaceStore::open_existing(&layout)?;
+        for (approval_id, execution_id) in [
+            (submission.approval_id(), execution_id),
+            (shell_submission.approval_id(), shell_execution_id),
+        ] {
+            assert_auto_approval_audit(&store, approval_id, execution_id)?;
+        }
+        drop(store);
+        cleanup_test_root(cleanup_root)?;
+        Ok(())
+    }
+
+    fn assert_auto_approval_audit(
+        store: &WorkspaceStore,
+        approval_id: forge_domain::ApprovalRequestId,
+        execution_id: ExecutionId,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let approval = store
-            .get_approval_request(submission.approval_id())?
+            .get_approval_request(approval_id)?
             .ok_or("auto approval audit missing")?;
         assert_eq!(
             approval.state(),
@@ -3080,7 +4330,6 @@ mod integration_tests {
             .get_execution(execution_id)?
             .ok_or("auto approved execution missing")?;
         assert!(execution.state().is_terminal());
-        fs::remove_dir_all(cleanup_root)?;
         Ok(())
     }
 }

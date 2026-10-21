@@ -7,7 +7,21 @@ use std::str::FromStr;
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::{ActivityId, TimestampMillis, WorkspaceId, WorkspaceRelativePath};
+use crate::{
+    ActivityId, AgentInstanceId, AgentInstanceRevision, AuthenticatedPrincipal,
+    GoalNodeAttribution, RuntimeInstanceId, TimestampMillis, WorkspaceId, WorkspaceRelativePath,
+};
+
+mod native_closure;
+mod observation;
+pub use native_closure::{
+    ExecutionNativeClosureFact, ExecutionNativeClosureFactError, ExecutionNativeClosureFactParts,
+    NativeClosureLaunch, NativeClosureProcess, NativeClosureRuntime,
+};
+pub use observation::{
+    ExecutionObservationHeader, ExecutionObservationLifecycle, ExecutionObservationSelection,
+    ExecutionOutputSummary, ExecutionTerminalSummary, VerificationEvidenceSnapshot,
+};
 
 const MAX_PROGRAM_BYTES: usize = 4_096;
 const MAX_ARGUMENT_BYTES: usize = 4_096;
@@ -19,6 +33,27 @@ const MAX_TIMEOUT_MILLIS: u64 = 10 * 60 * 1_000;
 const MAX_OUTPUT_BYTES: u64 = 1024 * 1024;
 const MAX_EXECUTION_LIST_LIMIT: u16 = 256;
 const EXECUTION_REQUEST_DIGEST_BYTES: usize = 32;
+pub const MAX_EXECUTION_COMMAND_ID_BYTES: usize = 128;
+
+/// Maximum size of one retained incremental execution output chunk.
+pub const EXECUTION_OUTPUT_CHUNK_BYTES: usize = 4 * 1024;
+
+/// Fixed bounded metadata charge used by durable output reads.
+///
+/// The charge is intentionally independent of event kind and payload length:
+/// a gap marker must consume read budget just like a chunk, so omitted output
+/// cannot bypass a caller's byte bound.
+pub const EXECUTION_OUTPUT_EVENT_METADATA_BYTES: u64 = 64;
+
+/// Smallest useful durable read budget: one maximum chunk plus its metadata.
+pub const MIN_EXECUTION_OUTPUT_READ_BYTES: u64 =
+    EXECUTION_OUTPUT_CHUNK_BYTES as u64 + EXECUTION_OUTPUT_EVENT_METADATA_BYTES;
+
+/// Maximum number of events accepted by one durable output read.
+pub const MAX_EXECUTION_OUTPUT_READ_EVENTS: usize = 128;
+
+/// Maximum byte budget accepted by one durable output read.
+pub const MAX_EXECUTION_OUTPUT_READ_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ExecutionId(Uuid);
@@ -123,6 +158,705 @@ pub enum ExecutionFailureCode {
     InvalidWorkingDirectory,
     ProcessSpawn,
     Supervision,
+}
+
+/// The process stream that produced an incremental output event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ExecutionOutputStream {
+    Stdout,
+    Stderr,
+}
+
+/// Monotonic sequence assigned by one execution-local output authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ExecutionOutputSequence(u64);
+
+impl ExecutionOutputSequence {
+    pub const INITIAL: Self = Self(1);
+
+    pub const fn new(value: u64) -> Result<Self, ExecutionOutputSequenceError> {
+        if value == 0 {
+            Err(ExecutionOutputSequenceError::Zero)
+        } else {
+            Ok(Self(value))
+        }
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    pub const fn checked_next(self) -> Result<Self, ExecutionOutputSequenceError> {
+        match self.0.checked_add(1) {
+            Some(value) => Ok(Self(value)),
+            None => Err(ExecutionOutputSequenceError::Overflow { current: self.0 }),
+        }
+    }
+}
+
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionOutputSequenceError {
+    #[error("execution output sequence must be at least 1")]
+    Zero,
+    #[error("execution output sequence overflowed at {current}")]
+    Overflow { current: u64 },
+}
+
+/// Cursor position for a single execution's output stream.
+///
+/// A cursor starts at zero, before the first event. It carries execution
+/// identity so a cursor cannot accidentally be applied to another execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ExecutionOutputCursor {
+    execution_id: ExecutionId,
+    after_sequence: u64,
+}
+
+impl ExecutionOutputCursor {
+    pub const fn initial(execution_id: ExecutionId) -> Self {
+        Self {
+            execution_id,
+            after_sequence: 0,
+        }
+    }
+
+    pub const fn from_sequence(
+        execution_id: ExecutionId,
+        sequence: ExecutionOutputSequence,
+    ) -> Self {
+        Self {
+            execution_id,
+            after_sequence: sequence.get(),
+        }
+    }
+
+    pub const fn execution_id(self) -> ExecutionId {
+        self.execution_id
+    }
+
+    pub const fn after_sequence(self) -> u64 {
+        self.after_sequence
+    }
+}
+
+/// A bounded chunk of stdout or stderr output.
+#[must_use]
+#[derive(Clone, PartialEq, Eq)]
+pub struct ExecutionOutputChunk {
+    execution_id: ExecutionId,
+    sequence: ExecutionOutputSequence,
+    stream: ExecutionOutputStream,
+    bytes: Vec<u8>,
+}
+
+impl fmt::Debug for ExecutionOutputChunk {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ExecutionOutputChunk")
+            .field("execution_id", &self.execution_id)
+            .field("sequence", &self.sequence)
+            .field("stream", &self.stream)
+            .field("byte_len", &self.bytes.len())
+            .finish()
+    }
+}
+
+impl ExecutionOutputChunk {
+    pub fn new(
+        execution_id: ExecutionId,
+        sequence: ExecutionOutputSequence,
+        stream: ExecutionOutputStream,
+        bytes: &[u8],
+    ) -> Result<Self, ExecutionOutputChunkError> {
+        if bytes.is_empty() || bytes.len() > EXECUTION_OUTPUT_CHUNK_BYTES {
+            return Err(ExecutionOutputChunkError::InvalidLength {
+                actual: bytes.len(),
+                maximum: EXECUTION_OUTPUT_CHUNK_BYTES,
+            });
+        }
+        Ok(Self {
+            execution_id,
+            sequence,
+            stream,
+            bytes: bytes.to_vec(),
+        })
+    }
+
+    pub const fn execution_id(&self) -> ExecutionId {
+        self.execution_id
+    }
+
+    pub const fn sequence(&self) -> ExecutionOutputSequence {
+        self.sequence
+    }
+
+    pub const fn stream(&self) -> ExecutionOutputStream {
+        self.stream
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub const fn metadata_bytes(&self) -> u64 {
+        EXECUTION_OUTPUT_EVENT_METADATA_BYTES
+    }
+}
+
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionOutputChunkError {
+    #[error("execution output chunk contains {actual} bytes; maximum is {maximum}")]
+    InvalidLength { actual: usize, maximum: usize },
+}
+
+/// Why bytes were omitted from the incremental output event stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ExecutionOutputGapCause {
+    Backpressure,
+    OutputLimit,
+    BackpressureAndOutputLimit,
+}
+
+/// An explicit indication that one or more output chunks were not retained.
+#[must_use]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionOutputGap {
+    execution_id: ExecutionId,
+    sequence: ExecutionOutputSequence,
+    first_missing: ExecutionOutputSequence,
+    last_missing: ExecutionOutputSequence,
+    stream: Option<ExecutionOutputStream>,
+    omitted_bytes: u64,
+    omitted_chunks: u64,
+    cause: ExecutionOutputGapCause,
+}
+
+/// Validated payload describing the omitted range represented by a gap.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ExecutionOutputGapParts {
+    first_missing: ExecutionOutputSequence,
+    last_missing: ExecutionOutputSequence,
+    stream: Option<ExecutionOutputStream>,
+    omitted_bytes: u64,
+    omitted_chunks: u64,
+    cause: ExecutionOutputGapCause,
+}
+
+impl ExecutionOutputGapParts {
+    pub const fn new(
+        first_missing: ExecutionOutputSequence,
+        last_missing: ExecutionOutputSequence,
+        stream: Option<ExecutionOutputStream>,
+        omitted_bytes: u64,
+        omitted_chunks: u64,
+        cause: ExecutionOutputGapCause,
+    ) -> Self {
+        Self {
+            first_missing,
+            last_missing,
+            stream,
+            omitted_bytes,
+            omitted_chunks,
+            cause,
+        }
+    }
+
+    pub const fn first_missing(self) -> ExecutionOutputSequence {
+        self.first_missing
+    }
+
+    pub const fn last_missing(self) -> ExecutionOutputSequence {
+        self.last_missing
+    }
+
+    pub const fn stream(self) -> Option<ExecutionOutputStream> {
+        self.stream
+    }
+
+    pub const fn omitted_bytes(self) -> u64 {
+        self.omitted_bytes
+    }
+
+    pub const fn omitted_chunks(self) -> u64 {
+        self.omitted_chunks
+    }
+
+    pub const fn cause(self) -> ExecutionOutputGapCause {
+        self.cause
+    }
+}
+
+impl ExecutionOutputGap {
+    pub fn new(
+        execution_id: ExecutionId,
+        sequence: ExecutionOutputSequence,
+        parts: ExecutionOutputGapParts,
+    ) -> Result<Self, ExecutionOutputGapError> {
+        if parts.omitted_chunks == 0 || parts.omitted_bytes == 0 {
+            return Err(ExecutionOutputGapError::Empty);
+        }
+        if parts.first_missing > parts.last_missing {
+            return Err(ExecutionOutputGapError::InvalidRange);
+        }
+        let expected_chunks = parts
+            .last_missing
+            .get()
+            .checked_sub(parts.first_missing.get())
+            .and_then(|count| count.checked_add(1))
+            .ok_or(ExecutionOutputGapError::InvalidRange)?;
+        if parts.omitted_chunks != expected_chunks {
+            return Err(ExecutionOutputGapError::ChunkCountMismatch);
+        }
+        let expected_marker = parts
+            .last_missing
+            .checked_next()
+            .map_err(|_| ExecutionOutputGapError::MarkerNotAdjacent)?;
+        if sequence != expected_marker {
+            return Err(ExecutionOutputGapError::MarkerNotAdjacent);
+        }
+        Ok(Self {
+            execution_id,
+            sequence,
+            first_missing: parts.first_missing,
+            last_missing: parts.last_missing,
+            stream: parts.stream,
+            omitted_bytes: parts.omitted_bytes,
+            omitted_chunks: parts.omitted_chunks,
+            cause: parts.cause,
+        })
+    }
+
+    pub const fn execution_id(&self) -> ExecutionId {
+        self.execution_id
+    }
+
+    /// Sequence of this gap marker. The marker is after the missing range.
+    pub const fn sequence(&self) -> ExecutionOutputSequence {
+        self.sequence
+    }
+
+    pub const fn first_missing(&self) -> ExecutionOutputSequence {
+        self.first_missing
+    }
+
+    pub const fn last_missing(&self) -> ExecutionOutputSequence {
+        self.last_missing
+    }
+
+    /// `None` means the omitted range contained both stdout and stderr.
+    pub const fn stream(&self) -> Option<ExecutionOutputStream> {
+        self.stream
+    }
+
+    pub const fn omitted_bytes(&self) -> u64 {
+        self.omitted_bytes
+    }
+
+    pub const fn omitted_chunks(&self) -> u64 {
+        self.omitted_chunks
+    }
+
+    pub const fn cause(&self) -> ExecutionOutputGapCause {
+        self.cause
+    }
+
+    pub const fn metadata_bytes(&self) -> u64 {
+        EXECUTION_OUTPUT_EVENT_METADATA_BYTES
+    }
+}
+
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionOutputGapError {
+    #[error("execution output gap must omit at least one non-empty chunk")]
+    Empty,
+    #[error("execution output gap missing range is invalid")]
+    InvalidRange,
+    #[error("execution output gap chunk count does not match its missing range")]
+    ChunkCountMismatch,
+    #[error("execution output gap marker must immediately follow its missing range")]
+    MarkerNotAdjacent,
+}
+
+/// Incremental output event. Terminal execution events are represented by the
+/// separate supervisor event stream.
+#[must_use]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecutionOutputEvent {
+    Chunk(ExecutionOutputChunk),
+    Gap(ExecutionOutputGap),
+}
+
+impl ExecutionOutputEvent {
+    pub const fn execution_id(&self) -> ExecutionId {
+        match self {
+            Self::Chunk(chunk) => chunk.execution_id(),
+            Self::Gap(gap) => gap.execution_id(),
+        }
+    }
+
+    pub const fn sequence(&self) -> ExecutionOutputSequence {
+        match self {
+            Self::Chunk(chunk) => chunk.sequence(),
+            Self::Gap(gap) => gap.sequence(),
+        }
+    }
+
+    pub const fn key(&self) -> ExecutionOutputEventKey {
+        ExecutionOutputEventKey {
+            execution_id: self.execution_id(),
+            sequence: self.sequence(),
+        }
+    }
+
+    pub fn read_cost_bytes(&self) -> u64 {
+        match self {
+            Self::Chunk(chunk) => chunk
+                .metadata_bytes()
+                .saturating_add(u64::try_from(chunk.bytes().len()).unwrap_or(u64::MAX)),
+            Self::Gap(gap) => gap.metadata_bytes(),
+        }
+    }
+}
+
+/// Stable identity for one retained output event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ExecutionOutputEventKey {
+    execution_id: ExecutionId,
+    sequence: ExecutionOutputSequence,
+}
+
+impl ExecutionOutputEventKey {
+    pub const fn new(execution_id: ExecutionId, sequence: ExecutionOutputSequence) -> Self {
+        Self {
+            execution_id,
+            sequence,
+        }
+    }
+
+    pub const fn execution_id(self) -> ExecutionId {
+        self.execution_id
+    }
+
+    pub const fn sequence(self) -> ExecutionOutputSequence {
+        self.sequence
+    }
+}
+
+/// A bounded, non-destructive output read.
+#[must_use]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionOutputRead {
+    events: Vec<ExecutionOutputEvent>,
+    ack_key: Option<ExecutionOutputEventKey>,
+    next_cursor: ExecutionOutputCursor,
+    terminal_state: Option<ExecutionState>,
+    truncated: bool,
+}
+
+impl ExecutionOutputRead {
+    pub fn empty() -> Self {
+        Self::empty_for(ExecutionId::from_uuid(Uuid::nil()))
+    }
+
+    pub fn empty_for(execution_id: ExecutionId) -> Self {
+        Self {
+            events: Vec::new(),
+            ack_key: None,
+            next_cursor: ExecutionOutputCursor::initial(execution_id),
+            terminal_state: None,
+            truncated: false,
+        }
+    }
+
+    /// Construct a supervisor peek. The cursor and terminal projection are
+    /// filled by the durable read path when it has those observations.
+    pub fn new(events: Vec<ExecutionOutputEvent>) -> Self {
+        let ack_key = events.last().map(ExecutionOutputEvent::key);
+        let next_cursor = ack_key.map_or_else(
+            || {
+                events.first().map_or_else(
+                    || ExecutionOutputCursor::initial(ExecutionId::from_uuid(Uuid::nil())),
+                    |event| {
+                        ExecutionOutputCursor::from_sequence(event.execution_id(), event.sequence())
+                    },
+                )
+            },
+            |key| ExecutionOutputCursor::from_sequence(key.execution_id(), key.sequence()),
+        );
+        Self {
+            events,
+            ack_key,
+            next_cursor,
+            terminal_state: None,
+            truncated: false,
+        }
+    }
+
+    pub fn from_parts(
+        execution_id: ExecutionId,
+        events: Vec<ExecutionOutputEvent>,
+        next_cursor: ExecutionOutputCursor,
+        terminal_state: Option<ExecutionState>,
+        truncated: bool,
+    ) -> Self {
+        let ack_key = events.last().map(ExecutionOutputEvent::key);
+        let next_cursor = events.last().map_or_else(
+            || {
+                if next_cursor.execution_id() == execution_id {
+                    next_cursor
+                } else {
+                    ExecutionOutputCursor::initial(execution_id)
+                }
+            },
+            |event| ExecutionOutputCursor::from_sequence(event.execution_id(), event.sequence()),
+        );
+        Self {
+            events,
+            ack_key,
+            next_cursor,
+            terminal_state,
+            truncated,
+        }
+    }
+
+    pub fn events(&self) -> &[ExecutionOutputEvent] {
+        &self.events
+    }
+
+    pub const fn ack_key(&self) -> Option<ExecutionOutputEventKey> {
+        self.ack_key
+    }
+
+    pub const fn next_cursor(&self) -> ExecutionOutputCursor {
+        self.next_cursor
+    }
+
+    pub const fn terminal_state(&self) -> Option<ExecutionState> {
+        self.terminal_state
+    }
+
+    pub const fn truncated(&self) -> bool {
+        self.truncated
+    }
+}
+
+/// One authorized execution observation from a single durable snapshot.
+///
+/// The record metadata and bounded output are intentionally carried together
+/// so an authority-scoped caller cannot accidentally pair observations from
+/// two different `SQLite` snapshots.  Authorization is still performed by the
+/// persistence boundary; this type only carries its resulting observation.
+#[must_use]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizedExecutionRead {
+    record: RegisteredExecution,
+    output: ExecutionOutputRead,
+}
+
+impl AuthorizedExecutionRead {
+    pub const fn new(record: RegisteredExecution, output: ExecutionOutputRead) -> Self {
+        Self { record, output }
+    }
+
+    pub const fn record(&self) -> &RegisteredExecution {
+        &self.record
+    }
+
+    pub const fn output(&self) -> &ExecutionOutputRead {
+        &self.output
+    }
+
+    pub fn into_parts(self) -> (RegisteredExecution, ExecutionOutputRead) {
+        (self.record, self.output)
+    }
+}
+
+/// Bounded, server-discovered identity of a command that may be executed.
+///
+/// The command identifier is not an executable path or shell expression. It
+/// is an opaque identity resolved by the control boundary from trusted
+/// Workspace metadata.
+#[must_use]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ExecutionCommandId(String);
+
+impl ExecutionCommandId {
+    pub fn new(value: String) -> Result<Self, ExecutionCommandIdError> {
+        if value.is_empty() {
+            return Err(ExecutionCommandIdError::Empty);
+        }
+        if value.len() > MAX_EXECUTION_COMMAND_ID_BYTES {
+            return Err(ExecutionCommandIdError::TooLong {
+                actual: value.len(),
+                maximum: MAX_EXECUTION_COMMAND_ID_BYTES,
+            });
+        }
+        if value.chars().any(char::is_control) {
+            return Err(ExecutionCommandIdError::ControlCharacter);
+        }
+        if value.chars().any(char::is_whitespace) {
+            return Err(ExecutionCommandIdError::Whitespace);
+        }
+        if !value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b':' | b'-')
+        }) {
+            return Err(ExecutionCommandIdError::InvalidCharacter);
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ExecutionCommandId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl AsRef<str> for ExecutionCommandId {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl FromStr for ExecutionCommandId {
+    type Err = ExecutionCommandIdError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value.to_owned())
+    }
+}
+
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionCommandIdError {
+    #[error("execution command id must not be empty")]
+    Empty,
+    #[error("execution command id has {actual} bytes; maximum is {maximum}")]
+    TooLong { actual: usize, maximum: usize },
+    #[error("execution command id must not contain control characters")]
+    ControlCharacter,
+    #[error("execution command id must not contain whitespace")]
+    Whitespace,
+    #[error("execution command id contains a character outside [a-z0-9:-]")]
+    InvalidCharacter,
+}
+
+/// Immutable Agent/Goal/DAG/Node attribution persisted with an execution.
+///
+/// This value is only present for an Agent-originated execution. Internal
+/// Harness execution deliberately remains representable with no provenance.
+#[must_use]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ExecutionAgentProvenance {
+    session_id: Option<crate::AgentSessionId>,
+    project_command: Option<crate::ProjectCommandEvidence>,
+    execution_id: ExecutionId,
+    agent_id: AgentInstanceId,
+    agent_revision: AgentInstanceRevision,
+    principal: AuthenticatedPrincipal,
+    attribution: GoalNodeAttribution,
+    command_id: ExecutionCommandId,
+}
+
+impl ExecutionAgentProvenance {
+    pub fn new(
+        execution_id: ExecutionId,
+        agent_id: AgentInstanceId,
+        agent_revision: AgentInstanceRevision,
+        principal: AuthenticatedPrincipal,
+        attribution: GoalNodeAttribution,
+        command_id: ExecutionCommandId,
+        session_id: crate::AgentSessionId,
+    ) -> Self {
+        Self::from_parts(
+            execution_id,
+            agent_id,
+            agent_revision,
+            principal,
+            attribution,
+            command_id,
+            Some(session_id),
+        )
+    }
+
+    /// Rehydrate immutable evidence, retaining an explicitly unresolved
+    /// session for historical records. Such records are never new authority.
+    pub fn from_parts(
+        execution_id: ExecutionId,
+        agent_id: AgentInstanceId,
+        agent_revision: AgentInstanceRevision,
+        principal: AuthenticatedPrincipal,
+        attribution: GoalNodeAttribution,
+        command_id: ExecutionCommandId,
+        session_id: Option<crate::AgentSessionId>,
+    ) -> Self {
+        Self {
+            session_id,
+            project_command: None,
+            execution_id,
+            agent_id,
+            agent_revision,
+            principal,
+            attribution,
+            command_id,
+        }
+    }
+
+    pub const fn execution_id(&self) -> ExecutionId {
+        self.execution_id
+    }
+
+    pub const fn session_id(&self) -> Option<crate::AgentSessionId> {
+        self.session_id
+    }
+
+    /// Attach exact server-side project-command catalog evidence to a new
+    /// execution. Legacy evidence remains explicitly absent when rehydrated.
+    pub const fn with_project_command(mut self, value: crate::ProjectCommandEvidence) -> Self {
+        self.project_command = Some(value);
+        self
+    }
+
+    pub const fn project_command(&self) -> Option<crate::ProjectCommandEvidence> {
+        self.project_command
+    }
+
+    /// Compare the durable actor authority fields that govern execution
+    /// reads/cancellation. Project-command evidence is immutable execution
+    /// metadata and is deliberately not re-supplied by those read endpoints.
+    pub fn matches_actor_authority(&self, other: &Self) -> bool {
+        self.session_id == other.session_id
+            && self.execution_id == other.execution_id
+            && self.agent_id == other.agent_id
+            && self.agent_revision == other.agent_revision
+            && self.principal == other.principal
+            && self.attribution == other.attribution
+            && self.command_id == other.command_id
+    }
+
+    pub const fn agent_id(&self) -> AgentInstanceId {
+        self.agent_id
+    }
+
+    pub const fn agent_revision(&self) -> AgentInstanceRevision {
+        self.agent_revision
+    }
+
+    pub const fn principal(&self) -> AuthenticatedPrincipal {
+        self.principal
+    }
+
+    pub const fn attribution(&self) -> GoalNodeAttribution {
+        self.attribution
+    }
+
+    pub const fn command_id(&self) -> &ExecutionCommandId {
+        &self.command_id
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -589,6 +1323,8 @@ pub struct BeginExecution {
     permissions: ExecutionPermissions,
     request_digest: ExecutionRequestDigest,
     observed_at: TimestampMillis,
+    runtime_owner: Option<RuntimeInstanceId>,
+    provenance: Option<ExecutionAgentProvenance>,
 }
 
 impl BeginExecution {
@@ -605,6 +1341,8 @@ impl BeginExecution {
             permissions: request.permissions,
             request_digest,
             observed_at,
+            runtime_owner: None,
+            provenance: None,
         }
     }
 
@@ -648,6 +1386,30 @@ impl BeginExecution {
         self.observed_at
     }
 
+    pub const fn runtime_owner(&self) -> Option<RuntimeInstanceId> {
+        self.runtime_owner
+    }
+
+    pub const fn with_runtime_owner(mut self, runtime_owner: RuntimeInstanceId) -> Self {
+        self.runtime_owner = Some(runtime_owner);
+        self
+    }
+
+    pub const fn provenance(&self) -> Option<&ExecutionAgentProvenance> {
+        self.provenance.as_ref()
+    }
+
+    pub fn with_provenance(
+        mut self,
+        provenance: ExecutionAgentProvenance,
+    ) -> Result<Self, ExecutionRecordError> {
+        if provenance.execution_id() != self.id() {
+            return Err(ExecutionRecordError::ProvenanceExecutionMismatch);
+        }
+        self.provenance = Some(provenance);
+        Ok(self)
+    }
+
     pub fn with_observed_at(&self, observed_at: TimestampMillis) -> Self {
         Self {
             attribution: self.attribution,
@@ -657,6 +1419,8 @@ impl BeginExecution {
             permissions: self.permissions,
             request_digest: self.request_digest,
             observed_at,
+            runtime_owner: self.runtime_owner,
+            provenance: self.provenance.clone(),
         }
     }
 }
@@ -914,6 +1678,63 @@ pub struct RegisteredExecution {
     revision: ExecutionRevision,
     outcome: Option<ExecutionOutcome>,
     failure_code: Option<ExecutionFailureCode>,
+    provenance: Option<ExecutionAgentProvenance>,
+}
+
+#[must_use]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionRecordDefinition {
+    mode: ExecutionMode,
+    cwd: Option<WorkspaceRelativePath>,
+    limits: ExecutionLimits,
+    permissions: ExecutionPermissions,
+    request_digest: ExecutionRequestDigest,
+}
+
+impl ExecutionRecordDefinition {
+    pub const fn new(
+        mode: ExecutionMode,
+        cwd: Option<WorkspaceRelativePath>,
+        limits: ExecutionLimits,
+        permissions: ExecutionPermissions,
+        request_digest: ExecutionRequestDigest,
+    ) -> Self {
+        Self {
+            mode,
+            cwd,
+            limits,
+            permissions,
+            request_digest,
+        }
+    }
+}
+
+#[must_use]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionRecordLifecycle {
+    state: ExecutionState,
+    timestamps: ExecutionTimestamps,
+    revision: ExecutionRevision,
+    outcome: Option<ExecutionOutcome>,
+    failure_code: Option<ExecutionFailureCode>,
+}
+
+impl ExecutionRecordLifecycle {
+    pub const fn new(
+        state: ExecutionState,
+        timestamps: ExecutionTimestamps,
+        revision: ExecutionRevision,
+        outcome: Option<ExecutionOutcome>,
+        failure_code: Option<ExecutionFailureCode>,
+    ) -> Self {
+        Self {
+            state,
+            timestamps,
+            revision,
+            outcome,
+            failure_code,
+        }
+    }
 }
 
 impl RegisteredExecution {
@@ -931,42 +1752,45 @@ impl RegisteredExecution {
         outcome: Option<ExecutionOutcome>,
         failure_code: Option<ExecutionFailureCode>,
     ) -> Result<Self, ExecutionRecordError> {
-        let evidence_is_valid = match state {
-            ExecutionState::Starting | ExecutionState::Running | ExecutionState::Interrupted => {
-                outcome.is_none() && failure_code.is_none()
-            }
-            ExecutionState::Completed | ExecutionState::TimedOut | ExecutionState::Cancelled => {
-                outcome.as_ref().is_some_and(|value| {
-                    value.id() == attribution.id() && state == execution_state_for_outcome(value)
-                }) && failure_code.is_none()
-            }
-            ExecutionState::Failed => {
-                (outcome.as_ref().is_some_and(|value| {
-                    value.id() == attribution.id()
-                        && execution_state_for_outcome(value) == ExecutionState::Failed
-                }) && failure_code.is_none())
-                    || (outcome.is_none() && failure_code.is_some())
-            }
-        };
-        if !evidence_is_valid {
-            return Err(ExecutionRecordError::InvalidEvidence);
+        Self::from_parts_with_provenance(
+            attribution,
+            ExecutionRecordDefinition::new(mode, cwd, limits, permissions, request_digest),
+            ExecutionRecordLifecycle::new(state, timestamps, revision, outcome, failure_code),
+            None,
+        )
+    }
+
+    pub fn from_parts_with_provenance(
+        attribution: ExecutionAttribution,
+        definition: ExecutionRecordDefinition,
+        lifecycle: ExecutionRecordLifecycle,
+        provenance: Option<ExecutionAgentProvenance>,
+    ) -> Result<Self, ExecutionRecordError> {
+        if provenance
+            .as_ref()
+            .is_some_and(|value| value.execution_id() != attribution.id())
+        {
+            return Err(ExecutionRecordError::ProvenanceExecutionMismatch);
         }
-        if let Some(outcome) = &outcome {
-            validate_bounded_output(outcome.stdout())?;
-            validate_bounded_output(outcome.stderr())?;
-        }
+        validate_execution_evidence(
+            attribution.id(),
+            lifecycle.state,
+            lifecycle.outcome.as_ref(),
+            lifecycle.failure_code,
+        )?;
         Ok(Self {
             attribution,
-            mode,
-            cwd,
-            limits,
-            permissions,
-            request_digest,
-            state,
-            timestamps,
-            revision,
-            outcome,
-            failure_code,
+            mode: definition.mode,
+            cwd: definition.cwd,
+            limits: definition.limits,
+            permissions: definition.permissions,
+            request_digest: definition.request_digest,
+            state: lifecycle.state,
+            timestamps: lifecycle.timestamps,
+            revision: lifecycle.revision,
+            outcome: lifecycle.outcome,
+            failure_code: lifecycle.failure_code,
+            provenance,
         })
     }
 
@@ -1021,12 +1845,67 @@ impl RegisteredExecution {
     pub const fn failure_code(&self) -> Option<ExecutionFailureCode> {
         self.failure_code
     }
+
+    pub const fn provenance(&self) -> Option<&ExecutionAgentProvenance> {
+        self.provenance.as_ref()
+    }
+}
+
+fn validate_execution_evidence(
+    execution_id: ExecutionId,
+    state: ExecutionState,
+    outcome: Option<&ExecutionOutcome>,
+    failure_code: Option<ExecutionFailureCode>,
+) -> Result<(), ExecutionRecordError> {
+    if outcome.is_some_and(|value| value.id() != execution_id) {
+        return Err(ExecutionRecordError::InvalidEvidence);
+    }
+    validate_execution_termination_evidence(
+        state,
+        outcome.map(|value| value.termination),
+        failure_code,
+    )?;
+    if let Some(outcome) = outcome {
+        validate_bounded_output(outcome.stdout())?;
+        validate_bounded_output(outcome.stderr())?;
+    }
+    Ok(())
+}
+
+fn validate_execution_termination_evidence(
+    state: ExecutionState,
+    termination: Option<ExecutionTermination>,
+    failure_code: Option<ExecutionFailureCode>,
+) -> Result<(), ExecutionRecordError> {
+    let evidence_is_valid = match state {
+        ExecutionState::Starting | ExecutionState::Running | ExecutionState::Interrupted => {
+            termination.is_none() && failure_code.is_none()
+        }
+        ExecutionState::Completed | ExecutionState::TimedOut | ExecutionState::Cancelled => {
+            termination.is_some_and(|value| state == execution_state_for_termination(value))
+                && failure_code.is_none()
+        }
+        ExecutionState::Failed => {
+            (termination.is_some_and(|value| {
+                execution_state_for_termination(value) == ExecutionState::Failed
+            }) && failure_code.is_none())
+                || (termination.is_none() && failure_code.is_some())
+        }
+    };
+    if !evidence_is_valid {
+        return Err(ExecutionRecordError::InvalidEvidence);
+    }
+    Ok(())
 }
 
 pub fn execution_state_for_outcome(outcome: &ExecutionOutcome) -> ExecutionState {
-    match outcome.status() {
+    execution_state_for_termination(outcome.termination)
+}
+
+fn execution_state_for_termination(termination: ExecutionTermination) -> ExecutionState {
+    match termination.status() {
         ExecutionCompletionStatus::Exited => {
-            if outcome.exit_code() == Some(0) {
+            if termination.exit_code() == Some(0) {
                 ExecutionState::Completed
             } else {
                 ExecutionState::Failed
@@ -1055,11 +1934,88 @@ pub enum ExecutionRecordError {
     InvalidEvidence,
     #[error("Execution output evidence is inconsistent")]
     InvalidOutput,
+    #[error("Execution provenance refers to a different execution")]
+    ProvenanceExecutionMismatch,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incremental_output_values_are_bounded_and_debug_redacts_bytes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let execution_id = ExecutionId::from_uuid(Uuid::from_u128(90));
+        let sequence = ExecutionOutputSequence::new(1)?;
+        assert!(
+            ExecutionOutputChunk::new(
+                execution_id,
+                sequence,
+                ExecutionOutputStream::Stdout,
+                &vec![b'x'; EXECUTION_OUTPUT_CHUNK_BYTES + 1],
+            )
+            .is_err()
+        );
+        let chunk = ExecutionOutputChunk::new(
+            execution_id,
+            sequence,
+            ExecutionOutputStream::Stdout,
+            b"secret-output",
+        )?;
+        let debug = format!("{chunk:?}");
+        assert!(!debug.contains("secret-output"));
+        assert_eq!(chunk.metadata_bytes() + 13, 64 + 13);
+        assert_eq!(
+            ExecutionOutputGap::new(
+                execution_id,
+                ExecutionOutputSequence::new(1)?,
+                ExecutionOutputGapParts::new(
+                    sequence,
+                    sequence,
+                    None,
+                    1,
+                    1,
+                    ExecutionOutputGapCause::Backpressure,
+                ),
+            )
+            .err(),
+            Some(ExecutionOutputGapError::MarkerNotAdjacent)
+        );
+        let gap_parts = ExecutionOutputGapParts::new(
+            ExecutionOutputSequence::new(2)?,
+            ExecutionOutputSequence::new(3)?,
+            None,
+            8,
+            2,
+            ExecutionOutputGapCause::Backpressure,
+        );
+        assert!(
+            ExecutionOutputGap::new(execution_id, ExecutionOutputSequence::new(4)?, gap_parts,)
+                .is_ok()
+        );
+        assert_eq!(
+            ExecutionOutputGap::new(execution_id, ExecutionOutputSequence::new(5)?, gap_parts,)
+                .err(),
+            Some(ExecutionOutputGapError::MarkerNotAdjacent)
+        );
+        assert_eq!(
+            ExecutionOutputGap::new(
+                execution_id,
+                ExecutionOutputSequence::new(4)?,
+                ExecutionOutputGapParts::new(
+                    ExecutionOutputSequence::new(2)?,
+                    ExecutionOutputSequence::new(3)?,
+                    None,
+                    8,
+                    1,
+                    ExecutionOutputGapCause::Backpressure,
+                ),
+            )
+            .err(),
+            Some(ExecutionOutputGapError::ChunkCountMismatch)
+        );
+        Ok(())
+    }
 
     #[test]
     fn structured_and_shell_requests_remain_distinct_and_bounded()
@@ -1109,6 +2065,75 @@ mod tests {
         let script = ExecutionScript::new("echo do-not-log".to_owned())?;
         assert!(!format!("{argument:?}").contains("do-not-log"));
         assert!(!format!("{script:?}").contains("do-not-log"));
+        Ok(())
+    }
+
+    #[test]
+    fn agent_provenance_is_bounded_and_execution_bound() -> Result<(), Box<dyn std::error::Error>> {
+        let execution_id = ExecutionId::from_uuid(Uuid::from_u128(10));
+        let agent_id = AgentInstanceId::from_uuid(Uuid::from_u128(11));
+        let goal_id = crate::GoalId::from_uuid(Uuid::from_u128(12));
+        let node_id = crate::DagNodeId::from_uuid(Uuid::from_u128(13));
+        let attribution = GoalNodeAttribution::new(
+            goal_id,
+            crate::GoalRevision::INITIAL,
+            crate::DagRevisionNumber::INITIAL,
+            node_id,
+            crate::DagNodeRevision::INITIAL,
+        );
+        let command_id = ExecutionCommandId::new("make:ci".to_owned())?;
+        let provenance = ExecutionAgentProvenance::new(
+            execution_id,
+            agent_id,
+            AgentInstanceRevision::INITIAL,
+            AuthenticatedPrincipal::TrustedStdio,
+            attribution,
+            command_id.clone(),
+            crate::AgentSessionId::from_uuid(Uuid::from_u128(16)),
+        );
+        assert_eq!(provenance.execution_id(), execution_id);
+        assert_eq!(provenance.command_id(), &command_id);
+        assert!(ExecutionCommandId::new("make: ci".to_owned()).is_err());
+        assert!(matches!(
+            ExecutionCommandId::new("make:CI".to_owned()),
+            Err(ExecutionCommandIdError::InvalidCharacter)
+        ));
+        assert!(ExecutionCommandId::new("x".repeat(MAX_EXECUTION_COMMAND_ID_BYTES + 1)).is_err());
+
+        let request = ExecutionRequest::new(
+            ExecutionAttribution::new(
+                execution_id,
+                WorkspaceId::from_uuid(Uuid::from_u128(14)),
+                ActivityId::from_uuid(Uuid::from_u128(15)),
+            ),
+            ExecutionKind::Structured {
+                program: ExecutionProgram::new(PathBuf::from("/usr/bin/true"))?,
+                arguments: Vec::new(),
+            },
+            None,
+            ExecutionLimits::new(
+                ExecutionTimeoutMillis::new(1_000)?,
+                ExecutionOutputLimit::DEFAULT,
+            ),
+            ExecutionPermissions::new(true, false, false),
+        )?;
+        let begin = BeginExecution::from_request(
+            &request,
+            ExecutionRequestDigest::from_bytes([1; EXECUTION_REQUEST_DIGEST_BYTES]),
+            TimestampMillis::new(20)?,
+        );
+        let with_provenance = begin.clone().with_provenance(provenance.clone())?;
+        assert_eq!(with_provenance.provenance(), Some(&provenance));
+        let other = ExecutionAgentProvenance::new(
+            ExecutionId::from_uuid(Uuid::from_u128(99)),
+            agent_id,
+            AgentInstanceRevision::INITIAL,
+            AuthenticatedPrincipal::TrustedStdio,
+            attribution,
+            command_id,
+            crate::AgentSessionId::from_uuid(Uuid::from_u128(17)),
+        );
+        assert!(begin.with_provenance(other).is_err());
         Ok(())
     }
 }

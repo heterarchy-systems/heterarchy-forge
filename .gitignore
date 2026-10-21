@@ -32,3 +32,9 @@ PRODUCT.md
 opencode.json
 .opencode
 DESIGN.md
+
+# Local agent harness material — never pushed
+.agents/
+
+# Docker compose smoke runtime material (generated secrets/state) — never pushed
+docker/smoke/secrets/

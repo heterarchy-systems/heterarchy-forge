@@ -9,6 +9,7 @@ use forge_domain::{
 };
 use thiserror::Error;
 
+use crate::discovery::resolve_locator_candidate;
 use crate::{
     WorkspaceCandidate, WorkspaceCandidateKey, WorkspaceDiscovery, WorkspaceDiscoveryError,
     WorkspaceKeyResolveError, WorkspaceLocator, WorkspaceLocatorError, WorkspaceResolveError,
@@ -58,6 +59,14 @@ pub enum LocationRepositoryError {
     RevisionOverflow {
         id: LocationId,
         current: LocationRevision,
+    },
+    #[error("Location state commit for {id} requires durable readback")]
+    CommittedUnconfirmed {
+        id: LocationId,
+        expected_revision: LocationRevision,
+        desired_state: forge_domain::LocationState,
+        #[source]
+        source: BoxedRepositoryError,
     },
     #[error("Location repository operation {operation} failed")]
     Backend {
@@ -136,11 +145,11 @@ where
             .map_err(LocationServiceError::Repository)
     }
 
-    pub fn discover_current(
+    pub fn get_current_location(
         &self,
         id: LocationId,
         expected_revision: LocationRevision,
-    ) -> Result<WorkspaceDiscovery, LocationServiceError> {
+    ) -> Result<RegisteredLocation, LocationServiceError> {
         let location = self
             .get_location(id)?
             .ok_or(LocationServiceError::Repository(
@@ -155,6 +164,15 @@ where
                 },
             ));
         }
+        Ok(location)
+    }
+
+    pub fn discover_current(
+        &self,
+        id: LocationId,
+        expected_revision: LocationRevision,
+    ) -> Result<WorkspaceDiscovery, LocationServiceError> {
+        let location = self.get_current_location(id, expected_revision)?;
         self.discover(&location)
     }
 
@@ -171,15 +189,25 @@ where
             .map_err(LocationServiceError::WorkspaceKey)
     }
 
-    /// Resolve a previously encoded candidate locator against the current
-    /// Location revision and filesystem scan.  The locator is correlation data
-    /// only; it never authorizes a fallback Workspace or bypasses revalidation.
+    /// Resolve a previously encoded locator against the current Location
+    /// revision and exact bounded filesystem path.
+    ///
+    /// Unlike discovery and selector resolution, this operation never scans
+    /// sibling candidates or inspects Forge-owned Workspace state. The locator
+    /// remains correlation data: durable Workspace identity and fingerprint
+    /// validation belong to the caller opening that registered Workspace.
     pub fn resolve_locator_current(
         &self,
         locator: &WorkspaceLocator,
     ) -> Result<WorkspaceCandidate, LocationServiceError> {
-        let key = locator.candidate_key();
-        self.resolve_candidate_current(locator.location_id(), locator.expected_revision(), &key)
+        let location =
+            self.get_current_location(locator.location_id(), locator.expected_revision())?;
+        resolve_locator_candidate(&location, locator)?
+            .ok_or_else(|| WorkspaceKeyResolveError::NotFound {
+                location_id: location.id(),
+                relative_root: locator.relative_root().to_path_buf(),
+            })
+            .map_err(LocationServiceError::WorkspaceKey)
     }
 
     /// Resolve a user-facing selector using a fresh Location revision and
@@ -252,7 +280,7 @@ mod tests {
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::str::FromStr;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -263,7 +291,7 @@ mod tests {
 
     use super::{
         LocationRepository, LocationRepositoryError, LocationService, LocationServiceError,
-        WorkspaceKeyResolveError,
+        WorkspaceDiscoveryError, WorkspaceKeyResolveError, WorkspaceLocator,
     };
 
     #[derive(Debug, Default)]
@@ -619,6 +647,62 @@ mod tests {
             Err(LocationServiceError::Repository(
                 LocationRepositoryError::RevisionConflict { actual, .. }
             )) if actual == disabled.revision()
+        ));
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn locator_resolution_ignores_discovery_state_but_rejects_symlink_rebinding()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = unique_test_root("registered-locator")?;
+        let child = root.join("child");
+        let replacement = root.join("replacement");
+        fs::create_dir_all(child.join(".heterarchy-forge"))?;
+        fs::create_dir_all(&replacement)?;
+        fs::write(
+            child.join(".heterarchy-forge/state.sqlite3-wal"),
+            b"active-wal-observation",
+        )?;
+        let canonical_child = fs::canonicalize(&child)?;
+        let id = LocationId::from_str("018f47a2-4d8b-7ca0-a9bd-0e2f2bc12169")?;
+        let mut service = LocationService::new(MemoryLocationRepository::default());
+        let registered = service.register_selected_path(
+            id,
+            "Registered Locator",
+            &root,
+            TimestampMillis::new(1)?,
+        )?;
+        let locator = WorkspaceLocator::new(id, registered.revision(), Path::new("child"))?;
+
+        assert_eq!(
+            service.resolve_locator_current(&locator)?.absolute_root(),
+            canonical_child.as_path()
+        );
+
+        fs::remove_dir_all(&child)?;
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&replacement, &child)?;
+        assert!(matches!(
+            service.resolve_locator_current(&locator),
+            Err(LocationServiceError::WorkspaceKey(
+                WorkspaceKeyResolveError::NotFound { .. }
+            ))
+        ));
+
+        let disabled = service.set_location_state(&SetLocationState::new(
+            id,
+            registered.revision(),
+            LocationState::Disabled,
+            TimestampMillis::new(2)?,
+        ))?;
+        let disabled_locator = WorkspaceLocator::new(id, disabled.revision(), Path::new("."))?;
+        assert!(matches!(
+            service.resolve_locator_current(&disabled_locator),
+            Err(LocationServiceError::Discovery(
+                WorkspaceDiscoveryError::LocationDisabled(disabled_id)
+            )) if disabled_id == id
         ));
 
         fs::remove_dir_all(root)?;

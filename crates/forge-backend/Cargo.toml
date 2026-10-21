@@ -1,0 +1,35 @@
+[package]
+name = "forge-backend"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Typed HTTP JSON + resumable SSE transport adapter over forge-control"
+
+[dependencies]
+forge-control = { path = "../forge-control" }
+forge-domain = { path = "../forge-domain" }
+forge-execution = { path = "../forge-execution" }
+forge-persistence = { path = "../forge-persistence" }
+forge-workspace = { path = "../forge-workspace" }
+axum.workspace = true
+base64.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures-core.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+rustix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+rusqlite.workspace = true

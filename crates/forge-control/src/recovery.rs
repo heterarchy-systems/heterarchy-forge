@@ -6,15 +6,15 @@
 //! mutation before reporting success.
 
 use forge_domain::{
-    ActivityListLimit, ClaimRecoveryLease, ExecutionListLimit, ReconcileExpiredActivities,
-    RecoveryLeaseDurationMillis, RecoveryLeaseTransitionError, RecoveryMaintenanceLease,
-    RegisteredActivity, RegisteredExecution, ReleaseRecoveryLease, RenewRecoveryLease,
-    RuntimeInstanceId, TimestampMillis,
+    ActivityListLimit, ClaimRecoveryLease, ExecutionListLimit, RecoveryLeaseDurationMillis,
+    RecoveryLeaseTransitionError, RecoveryMaintenanceLease, RegisteredActivity,
+    RegisteredExecution, ReleaseRecoveryLease, RenewRecoveryLease, RuntimeInstanceId,
+    TimestampMillis,
 };
 use forge_persistence::{RecoveryLeaseClaimStatus, RecoveryStoreError, WorkspaceStoreError};
 
 use crate::error::{ControlError, ControlErrorCode};
-use crate::service::{ForgeControl, ResolvedWorkspaceScope, map_activity_store_error};
+use crate::service::{ForgeControl, ResolvedWorkspaceScope};
 
 /// Outcome classification of one recovery-lease claim attempt.
 ///
@@ -99,11 +99,74 @@ impl RecoveryLeaseClaimOperation {
 #[must_use]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecoveryMaintenanceRequest {
+    pub request_id: uuid::Uuid,
+    pub request_digest: [u8; 32],
     pub scope: ResolvedWorkspaceScope,
     pub owner_id: RuntimeInstanceId,
     pub duration: RecoveryLeaseDurationMillis,
     pub claimed_at: TimestampMillis,
     pub classify_at: TimestampMillis,
+    pub activity_limit: ActivityListLimit,
+    pub execution_limit: ExecutionListLimit,
+}
+
+impl RecoveryMaintenanceRequest {
+    /// Canonical native business intent; refreshed observations never change
+    /// the identity of a previously admitted request.
+    pub fn native(
+        scope: ResolvedWorkspaceScope,
+        request_id: uuid::Uuid,
+        owner_id: RuntimeInstanceId,
+        duration: RecoveryLeaseDurationMillis,
+        observed_at: TimestampMillis,
+        limits: (ActivityListLimit, ExecutionListLimit),
+    ) -> Result<Self, ControlError> {
+        use sha2::{Digest, Sha256};
+        if request_id.is_nil() || owner_id.into_uuid().is_nil() {
+            return Err(ControlError::new(ControlErrorCode::InvalidInput));
+        }
+        let mut hash = Sha256::new();
+        hash.update(b"forge.recovery.maintenance.native.v1\0");
+        hash.update(request_id.as_bytes());
+        hash.update(scope.workspace_id().into_uuid().as_bytes());
+        hash.update(scope.workspace_revision().get().to_le_bytes());
+        hash.update(scope.locator().location_id().into_uuid().as_bytes());
+        hash.update(scope.locator().expected_revision().get().to_le_bytes());
+        let root = scope.locator().relative_root_bytes();
+        hash.update(
+            u64::try_from(root.len())
+                .map_err(|_| ControlError::new(ControlErrorCode::InvalidInput))?
+                .to_le_bytes(),
+        );
+        hash.update(root);
+        hash.update(owner_id.into_uuid().as_bytes());
+        hash.update(duration.get().to_le_bytes());
+        hash.update(limits.0.get().to_le_bytes());
+        hash.update(limits.1.get().to_le_bytes());
+        Ok(Self {
+            request_id,
+            request_digest: hash.finalize().into(),
+            scope,
+            owner_id,
+            duration,
+            claimed_at: observed_at,
+            classify_at: observed_at,
+            activity_limit: limits.0,
+            execution_limit: limits.1,
+        })
+    }
+}
+
+/// Internal-service intent; runtime ownership and wall time are supplied by the
+/// configured backend and Control worker, never by arbitrary HTTP clock fields.
+#[derive(Debug, Clone)]
+pub struct DurableRecoveryMaintenanceRequest {
+    pub scope: ResolvedWorkspaceScope,
+    pub request_id: uuid::Uuid,
+    pub original_owner_id: RuntimeInstanceId,
+    pub configured_owner_id: RuntimeInstanceId,
+    pub request_digest: [u8; 32],
+    pub duration: RecoveryLeaseDurationMillis,
     pub activity_limit: ActivityListLimit,
     pub execution_limit: ExecutionListLimit,
 }
@@ -139,6 +202,8 @@ pub struct RecoveryMaintenanceReport {
     reconciled_executions: Vec<RegisteredExecution>,
     binding_confirmed: bool,
     release_uncertain: bool,
+    receipt: Option<forge_persistence::RecoveryRunReceipt>,
+    replayed: bool,
 }
 
 impl RecoveryMaintenanceReport {
@@ -155,11 +220,34 @@ impl RecoveryMaintenanceReport {
             reconciled_executions: Vec::new(),
             binding_confirmed: true,
             release_uncertain: false,
+            receipt: None,
+            replayed: false,
         }
     }
 
     pub const fn scope(&self) -> &ResolvedWorkspaceScope {
         &self.scope
+    }
+
+    pub fn receipt(&self) -> Option<&forge_persistence::RecoveryRunReceipt> {
+        self.receipt.as_ref()
+    }
+    pub const fn replayed(&self) -> bool {
+        self.replayed
+    }
+    pub fn activity_count(&self) -> usize {
+        self.receipt
+            .as_ref()
+            .map_or(self.reconciled_activities.len(), |receipt| {
+                receipt.activities().len()
+            })
+    }
+    pub fn execution_count(&self) -> usize {
+        self.receipt
+            .as_ref()
+            .map_or(self.reconciled_executions.len(), |receipt| {
+                receipt.executions().len()
+            })
     }
 
     pub const fn outcome(&self) -> RecoveryMaintenanceOutcome {
@@ -172,12 +260,12 @@ impl RecoveryMaintenanceReport {
         &self.lease
     }
 
-    pub fn reconciled_activities(&self) -> &[RegisteredActivity] {
-        &self.reconciled_activities
+    pub fn reconciled_activities(&self) -> Option<&[RegisteredActivity]> {
+        (!self.replayed).then_some(self.reconciled_activities.as_slice())
     }
 
-    pub fn reconciled_executions(&self) -> &[RegisteredExecution] {
-        &self.reconciled_executions
+    pub fn reconciled_executions(&self) -> Option<&[RegisteredExecution]> {
+        (!self.replayed).then_some(self.reconciled_executions.as_slice())
     }
 
     /// Whether the Workspace/root binding still matched after classification.
@@ -195,6 +283,68 @@ impl RecoveryMaintenanceReport {
 }
 
 impl ForgeControl {
+    pub fn recovery_maintenance_get(
+        &self,
+        scope: &ResolvedWorkspaceScope,
+        request_id: uuid::Uuid,
+        request_digest: [u8; 32],
+    ) -> Result<Option<forge_persistence::RecoveryRunReceipt>, ControlError> {
+        if request_id.is_nil() {
+            return Err(ControlError::new(ControlErrorCode::InvalidInput));
+        }
+        let (_fresh, store) = self.open_recovery_workspace(scope)?;
+        let binding = store.journal_binding().map_err(map_recovery_store_error)?;
+        let receipt = store
+            .recovery_run_for_request(&binding, request_id, request_digest)
+            .map_err(map_recovery_store_error)?;
+        if !self.committed_scope_matches_with_store(scope, &store) {
+            return Err(ControlError::new(ControlErrorCode::WorkspaceRootConflict));
+        }
+        Ok(receipt)
+    }
+
+    pub fn run_durable_recovery_maintenance(
+        &self,
+        request: &DurableRecoveryMaintenanceRequest,
+        now: TimestampMillis,
+    ) -> Result<RecoveryMaintenanceReport, ControlError> {
+        if let Some(receipt) = self.recovery_maintenance_get(
+            &request.scope,
+            request.request_id,
+            request.request_digest,
+        )? {
+            let original = receipt.request();
+            if original.owner_id != request.original_owner_id
+                || original.duration != request.duration
+                || original.activity_limit != request.activity_limit
+                || original.execution_limit != request.execution_limit
+            {
+                return Err(ControlError::new(ControlErrorCode::RecoveryLeaseConflict));
+            }
+            return Ok(report_from_operation(
+                request.scope.clone(),
+                forge_persistence::RecoveryRunOperation::Replay(receipt),
+            ));
+        }
+        if request.original_owner_id != request.configured_owner_id
+            || request.configured_owner_id.into_uuid().is_nil()
+        {
+            return Err(ControlError::new(
+                ControlErrorCode::ExecutionProvenanceConflict,
+            ));
+        }
+        self.run_recovery_maintenance(&RecoveryMaintenanceRequest {
+            request_id: request.request_id,
+            request_digest: request.request_digest,
+            scope: request.scope.clone(),
+            owner_id: request.configured_owner_id,
+            duration: request.duration,
+            claimed_at: now,
+            classify_at: now,
+            activity_limit: request.activity_limit,
+            execution_limit: request.execution_limit,
+        })
+    }
     /// Run one explicit recovery-maintenance pass behind the Workspace
     /// recovery-maintenance lease.
     ///
@@ -211,82 +361,32 @@ impl ForgeControl {
         if request.classify_at.get() < request.claimed_at.get() {
             return Err(ControlError::new(ControlErrorCode::InvalidInput));
         }
-        let command = ClaimRecoveryLease::new(
-            request.scope.workspace_id(),
-            request.owner_id,
+        let (_fresh_scope, mut store) = self.open_recovery_workspace(&request.scope)?;
+        let binding = store.journal_binding().map_err(map_recovery_store_error)?;
+        if binding.workspace_id() != request.scope.workspace_id()
+            || binding.workspace_revision() != request.scope.workspace_revision()
+            || binding.location_id() != request.scope.locator().location_id()
+        {
+            return Err(ControlError::new(ControlErrorCode::WorkspaceRootConflict));
+        }
+        let native = forge_persistence::RecoveryRunRequest::new(
+            (
+                request.request_id,
+                request.scope.workspace_id(),
+                request.owner_id,
+            ),
+            request.request_digest,
+            binding.recovery_history_digest(),
             request.duration,
-            request.claimed_at,
+            (request.claimed_at, request.classify_at),
+            (request.activity_limit, request.execution_limit),
         )
         .map_err(|source| ControlError::with_source(ControlErrorCode::InvalidInput, source))?;
-        let (_fresh_scope, mut store) = self.open_recovery_workspace(&request.scope)?;
-        let claim = store
-            .claim_recovery_maintenance_lease(command)
+        let operation = store
+            .run_recovery_request(&binding, &native)
             .map_err(map_recovery_store_error)?;
-        let outcome = match claim.status() {
-            RecoveryLeaseClaimStatus::Acquired | RecoveryLeaseClaimStatus::AlreadyOwned => {
-                RecoveryMaintenanceOutcome::Completed
-            }
-            RecoveryLeaseClaimStatus::Busy => RecoveryMaintenanceOutcome::Busy,
-            RecoveryLeaseClaimStatus::ClaimConflict => RecoveryMaintenanceOutcome::ClaimConflict,
-        };
-        let mut report =
-            RecoveryMaintenanceReport::new(request.scope.clone(), outcome, claim.lease().clone());
-        if !outcome.classified() {
-            return Ok(report);
-        }
-
-        let claimed_lease = claim.into_lease();
-        match classify_under_lease(&mut store, request) {
-            Ok((activities, executions)) => {
-                report.reconciled_activities = activities;
-                report.reconciled_executions = executions;
-                report.binding_confirmed =
-                    self.committed_scope_matches_with_store(&request.scope, &store);
-                if report.binding_confirmed {
-                    let release = ReleaseRecoveryLease::new(
-                        request.scope.workspace_id(),
-                        request.owner_id,
-                        claimed_lease.epoch(),
-                        claimed_lease.revision(),
-                        request.classify_at,
-                    );
-                    if let Ok(released) = store.release_recovery_maintenance_lease(release) {
-                        report.lease = released;
-                    } else {
-                        report.release_uncertain = true;
-                        tracing::warn!(
-                            "recovery maintenance release compare-and-swap failed; \
-                             TTL expiry will free the fence"
-                        );
-                    }
-                } else {
-                    report.release_uncertain = true;
-                    tracing::warn!(
-                        "recovery maintenance binding drifted after classification; \
-                         release skipped and TTL expiry will free the fence"
-                    );
-                }
-                Ok(report)
-            }
-            Err(error) => {
-                // Classification failed before any observable commit effect;
-                // best-effort release avoids pinning the fence until TTL.
-                let release = ReleaseRecoveryLease::new(
-                    request.scope.workspace_id(),
-                    request.owner_id,
-                    claimed_lease.epoch(),
-                    claimed_lease.revision(),
-                    request.classify_at,
-                );
-                if store.release_recovery_maintenance_lease(release).is_err() {
-                    tracing::warn!(
-                        "recovery maintenance release failed after a failed classification; \
-                         TTL expiry will free the fence"
-                    );
-                }
-                Err(error)
-            }
-        }
+        self.confirm_recovery_write(&request.scope, &store)?;
+        Ok(report_from_operation(request.scope.clone(), operation))
     }
 
     /// Observe the durable Workspace recovery-maintenance lease.
@@ -297,12 +397,30 @@ impl ForgeControl {
         &self,
         scope: &ResolvedWorkspaceScope,
     ) -> Result<RecoveryMaintenanceLease, ControlError> {
-        let (fresh_scope, store) = self.open_recovery_workspace(scope)?;
-        let lease = store
-            .get_recovery_maintenance_lease()
+        let (fresh_scope, layout, _) = self.inspect_resolved_workspace(
+            scope.locator().location_id(),
+            scope.locator().expected_revision(),
+            scope.locator(),
+        )?;
+        if fresh_scope != *scope {
+            return Err(ControlError::new(
+                ControlErrorCode::WorkspaceRevisionConflict,
+            ));
+        }
+        let lease =
+            forge_persistence::WorkspaceStore::inspect_recovery_maintenance_lease_live_read_only(
+                &layout,
+            )
             .map_err(map_recovery_store_error)?;
-        if !self.committed_scope_matches_with_store(&fresh_scope, &store) {
-            return Err(ControlError::new(ControlErrorCode::WorkspaceRootConflict));
+        let (after_scope, _, _) = self.inspect_resolved_workspace(
+            scope.locator().location_id(),
+            scope.locator().expected_revision(),
+            scope.locator(),
+        )?;
+        if after_scope != fresh_scope {
+            return Err(ControlError::new(
+                ControlErrorCode::WorkspaceRevisionConflict,
+            ));
         }
         Ok(lease)
     }
@@ -322,6 +440,43 @@ impl ForgeControl {
         let (fresh_scope, mut store) = self.open_recovery_workspace(scope)?;
         let result = store
             .claim_recovery_maintenance_lease(command)
+            .map_err(map_recovery_store_error)?;
+        let acquisition = RecoveryLeaseAcquisition::from(result.status());
+        if acquisition.is_acquired() {
+            self.confirm_recovery_write(scope, &store)?;
+        } else if !self.committed_scope_matches_with_store(scope, &store) {
+            return Err(ControlError::new(ControlErrorCode::WorkspaceRootConflict));
+        }
+        Ok(RecoveryLeaseClaimOperation::new(
+            fresh_scope,
+            acquisition,
+            result.into_lease(),
+        ))
+    }
+
+    /// Claim the recovery-maintenance lease with a runtime-owned clock that
+    /// the persistence boundary invokes after acquiring its IMMEDIATE writer
+    /// lock.  The caller's command contributes identity and duration only;
+    /// its observation timestamp is never used as a worker-time fallback.
+    pub(crate) fn claim_recovery_maintenance_lease_with_clock<F>(
+        &self,
+        scope: &ResolvedWorkspaceScope,
+        command: &ClaimRecoveryLease,
+        clock: F,
+    ) -> Result<RecoveryLeaseClaimOperation, ControlError>
+    where
+        F: FnOnce() -> Result<TimestampMillis, WorkspaceStoreError>,
+    {
+        validate_recovery_command_scope(scope, command.workspace_id())?;
+        let duration = requested_recovery_lease_duration(command)?;
+        let (fresh_scope, mut store) = self.open_recovery_workspace(scope)?;
+        let result = store
+            .claim_recovery_maintenance_lease_with_clock(
+                command.workspace_id(),
+                command.owner_id(),
+                duration,
+                clock,
+            )
             .map_err(map_recovery_store_error)?;
         let acquisition = RecoveryLeaseAcquisition::from(result.status());
         if acquisition.is_acquired() {
@@ -413,33 +568,78 @@ fn validate_recovery_command_scope(
     Ok(())
 }
 
-fn classify_under_lease(
-    store: &mut forge_persistence::WorkspaceStore,
-    request: &RecoveryMaintenanceRequest,
-) -> Result<(Vec<RegisteredActivity>, Vec<RegisteredExecution>), ControlError> {
-    let reconcile = ReconcileExpiredActivities::new(request.classify_at);
-    let activities = store
-        .reconcile_expired_activities_limited(&reconcile, request.activity_limit)
-        .map_err(map_activity_store_error)?;
-    let executions = store
-        .reconcile_expired_authority_executions(request.classify_at, request.execution_limit)
-        .map_err(map_activity_store_error)?;
-    Ok((activities, executions))
+fn report_from_operation(
+    scope: ResolvedWorkspaceScope,
+    operation: forge_persistence::RecoveryRunOperation,
+) -> RecoveryMaintenanceReport {
+    use forge_persistence::RecoveryRunOperation;
+    match operation {
+        RecoveryRunOperation::Recorded {
+            receipt,
+            activities,
+            executions,
+        } => {
+            let mut report = RecoveryMaintenanceReport::new(
+                scope,
+                RecoveryMaintenanceOutcome::Completed,
+                receipt.released_lease().clone(),
+            );
+            report.reconciled_activities = activities;
+            report.reconciled_executions = executions;
+            report.receipt = Some(receipt);
+            report
+        }
+        RecoveryRunOperation::Replay(receipt) => {
+            let mut report = RecoveryMaintenanceReport::new(
+                scope,
+                RecoveryMaintenanceOutcome::Completed,
+                receipt.released_lease().clone(),
+            );
+            report.receipt = Some(receipt);
+            report.replayed = true;
+            report
+        }
+        RecoveryRunOperation::Busy(lease) => {
+            RecoveryMaintenanceReport::new(scope, RecoveryMaintenanceOutcome::Busy, lease)
+        }
+        RecoveryRunOperation::ClaimConflict(lease) => {
+            RecoveryMaintenanceReport::new(scope, RecoveryMaintenanceOutcome::ClaimConflict, lease)
+        }
+    }
 }
 
 pub(crate) fn map_recovery_store_error(error: WorkspaceStoreError) -> ControlError {
+    if matches!(
+        &error,
+        WorkspaceStoreError::RecoveryMaintenanceLeaseCommittedUnconfirmed { .. }
+            | WorkspaceStoreError::RecoveryClassificationCommittedUnconfirmed { .. }
+            | WorkspaceStoreError::RecoveryClassificationRollbackUnconfirmed { .. }
+    ) {
+        return ControlError::committed();
+    }
     let code = match &error {
-        WorkspaceStoreError::Recovery(RecoveryStoreError::Transition(
-            RecoveryLeaseTransitionError::Busy
-            | RecoveryLeaseTransitionError::ClaimConflict
-            | RecoveryLeaseTransitionError::StaleOwner
-            | RecoveryLeaseTransitionError::StaleEpoch
-            | RecoveryLeaseTransitionError::StaleRevision
-            | RecoveryLeaseTransitionError::Expired
-            | RecoveryLeaseTransitionError::LeaseNotForward
-            | RecoveryLeaseTransitionError::EpochOverflow { .. }
-            | RecoveryLeaseTransitionError::RevisionOverflow { .. },
-        )) => ControlErrorCode::RecoveryLeaseConflict,
+        WorkspaceStoreError::RecoveryLeaseClockObservation { .. } => ControlErrorCode::InvalidInput,
+        WorkspaceStoreError::RecoveryRun(forge_persistence::RecoveryRunStoreError::Conflict) => {
+            ControlErrorCode::RecoveryLeaseConflict
+        }
+        WorkspaceStoreError::RecoveryRun(forge_persistence::RecoveryRunStoreError::Invalid(_)) => {
+            ControlErrorCode::InvalidInput
+        }
+        WorkspaceStoreError::Recovery(
+            RecoveryStoreError::Transition(
+                RecoveryLeaseTransitionError::Busy
+                | RecoveryLeaseTransitionError::ClaimConflict
+                | RecoveryLeaseTransitionError::StaleOwner
+                | RecoveryLeaseTransitionError::StaleEpoch
+                | RecoveryLeaseTransitionError::StaleRevision
+                | RecoveryLeaseTransitionError::Expired
+                | RecoveryLeaseTransitionError::TimestampInversion
+                | RecoveryLeaseTransitionError::LeaseNotForward
+                | RecoveryLeaseTransitionError::EpochOverflow { .. }
+                | RecoveryLeaseTransitionError::RevisionOverflow { .. },
+            )
+            | RecoveryStoreError::CompareAndSwapConflict,
+        ) => ControlErrorCode::RecoveryLeaseConflict,
         WorkspaceStoreError::Recovery(RecoveryStoreError::WorkspaceMismatch { .. }) => {
             ControlErrorCode::WorkspaceIdentityConflict
         }
@@ -447,6 +647,7 @@ pub(crate) fn map_recovery_store_error(error: WorkspaceStoreError) -> ControlErr
             ControlErrorCode::WorkspaceRevisionConflict
         }
         WorkspaceStoreError::WorkspaceRootBindingConflict { .. }
+        | WorkspaceStoreError::RecoveryClassificationBindingConflict
         | WorkspaceStoreError::ExistingWorkspaceBindingMismatch { .. }
         | WorkspaceStoreError::WorkspaceRootFingerprintChanged { .. }
         | WorkspaceStoreError::WorkspaceRootCanonicalPathChanged { .. } => {
@@ -457,9 +658,67 @@ pub(crate) fn map_recovery_store_error(error: WorkspaceStoreError) -> ControlErr
     ControlError::with_source(code, error)
 }
 
+fn requested_recovery_lease_duration(
+    command: &ClaimRecoveryLease,
+) -> Result<RecoveryLeaseDurationMillis, ControlError> {
+    let duration = command
+        .lease_until()
+        .get()
+        .checked_sub(command.observed_at().get())
+        .ok_or_else(|| ControlError::new(ControlErrorCode::InvalidInput))?;
+    RecoveryLeaseDurationMillis::new(duration)
+        .map_err(|source| ControlError::with_source(ControlErrorCode::InvalidInput, source))
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
+    mod atomic_classification;
+    #[test]
+    fn recovery_lease_commit_uncertainty_preserves_committed_control_outcome() {
+        let error = super::map_recovery_store_error(
+            forge_persistence::WorkspaceStoreError::RecoveryMaintenanceLeaseCommittedUnconfirmed {
+                source: Box::new(forge_persistence::WorkspaceStoreError::WorkspaceIdentityMissing),
+            },
+        );
+        assert_eq!(
+            error.code(),
+            crate::ControlErrorCode::CommittedButUnconfirmed
+        );
+        assert!(error.is_committed());
+    }
+
+    #[test]
+    fn recovery_classification_unknown_commit_and_rollback_preserve_control_uncertainty() {
+        for source in [
+            forge_persistence::WorkspaceStoreError::RecoveryClassificationCommittedUnconfirmed {
+                source: Box::new(forge_persistence::WorkspaceStoreError::WorkspaceIdentityMissing),
+            },
+            forge_persistence::WorkspaceStoreError::RecoveryClassificationRollbackUnconfirmed {
+                source: Box::new(forge_persistence::WorkspaceStoreError::WorkspaceIdentityMissing),
+                rollback: rusqlite::Error::InvalidQuery,
+            },
+        ] {
+            let error = super::map_recovery_store_error(source);
+            assert_eq!(
+                error.code(),
+                crate::ControlErrorCode::CommittedButUnconfirmed
+            );
+            assert!(error.is_committed());
+        }
+    }
+
+    #[test]
+    fn recovery_lease_clock_observation_is_invalid_input() {
+        let error = super::map_recovery_store_error(
+            forge_persistence::WorkspaceStoreError::RecoveryLeaseClockObservation {
+                source: Box::new(std::io::Error::other("clock unavailable")),
+            },
+        );
+        assert_eq!(error.code(), crate::ControlErrorCode::InvalidInput);
+        assert!(!error.is_committed());
+    }
+
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -546,52 +805,110 @@ mod tests {
         })
     }
 
-    /// Resolve the single ready Workspace scope for a fixture.
-    ///
-    /// The catalog deliberately reports a transient observation failure as
-    /// `Unavailable` instead of guessing health.  Under heavily parallel test
-    /// execution that conservative mapping can win a race against filesystem
-    /// quiescence, so setup polls briefly for readiness; deterministic
-    /// breakage still fails after the bounded window.
+    /// Resolve the fixture child Workspace through the read-only discovery projection.
     fn resolved_scope(
         control: &ForgeControl,
         location_id: LocationId,
     ) -> Result<ResolvedWorkspaceScope, Box<dyn std::error::Error>> {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        loop {
-            let entries = control.workspace_list(location_id, LocationRevision::INITIAL)?;
-            if let Some(entry) = entries.iter().find(|entry| entry.status().is_ready()) {
-                return Ok(control.resolve_workspace(
-                    location_id,
-                    LocationRevision::INITIAL,
-                    entry.locator(),
-                )?);
-            }
-            if std::time::Instant::now() >= deadline {
-                return Err("ready workspace catalog entry missing".into());
-            }
-            std::thread::sleep(std::time::Duration::from_millis(25));
-        }
+        let entries = control.workspace_discover(location_id, LocationRevision::INITIAL)?;
+        let entry = entries
+            .iter()
+            .find(|entry| entry.display_name() == "workspace-0")
+            .ok_or("workspace discovery entry missing")?;
+        Ok(control.resolve_workspace(location_id, LocationRevision::INITIAL, entry.locator())?)
+    }
+
+    #[test]
+    fn recovery_lease_worker_owns_durable_time_for_past_and_future_requests()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = fixture("worker-time")?;
+        let scope = resolved_scope(&fixture.control, fixture.location_id)?;
+        let (client, mut worker) = fixture.control.start_worker()?;
+        let owner = runtime_id(0xA100);
+        let before = observed_wall_time()?;
+        let claim = ClaimRecoveryLease::new(
+            fixture.workspace_id,
+            owner,
+            forge_domain::RecoveryLeaseDurationMillis::new(60_000)?,
+            timestamp(1)?,
+        )?;
+        let acquired = client.claim_recovery_maintenance_lease(scope.clone(), claim)?;
+        assert_eq!(acquired.acquisition(), RecoveryLeaseAcquisition::Acquired);
+        assert!(acquired.lease().updated_at().get() >= before);
+        assert_eq!(
+            acquired
+                .lease()
+                .lease_until()
+                .ok_or("owned expiry missing")?
+                .get()
+                - acquired.lease().updated_at().get(),
+            60_000,
+        );
+        let future = timestamp(i64::MAX - 300_000)?;
+        let renew = RenewRecoveryLease::new(
+            fixture.workspace_id,
+            owner,
+            acquired.lease().epoch(),
+            acquired.lease().revision(),
+            forge_domain::RecoveryLeaseDurationMillis::new(120_000)?,
+            future,
+        )?;
+        let renewed = client.renew_recovery_maintenance_lease(scope.clone(), renew)?;
+        assert_eq!(renewed.epoch(), acquired.lease().epoch());
+        assert_eq!(
+            renewed.revision().get(),
+            acquired.lease().revision().get() + 1
+        );
+        assert_eq!(
+            renewed.lease_until().ok_or("renewed expiry missing")?.get()
+                - renewed.updated_at().get(),
+            120_000,
+        );
+        assert!(renewed.updated_at().get() <= observed_wall_time()?);
+        let release = ReleaseRecoveryLease::new(
+            fixture.workspace_id,
+            owner,
+            renewed.epoch(),
+            renewed.revision(),
+            future,
+        );
+        let released = client.release_recovery_maintenance_lease(scope.clone(), release)?;
+        assert!(released.is_released());
+        assert_eq!(released.epoch(), renewed.epoch());
+        assert_eq!(released.revision().get(), renewed.revision().get() + 1);
+        assert!(released.updated_at().get() <= observed_wall_time()?);
+        assert_eq!(client.recovery_maintenance_lease(scope)?, released);
+        worker.shutdown()?;
+        fs::remove_dir_all(fixture.root)?;
+        Ok(())
+    }
+
+    fn observed_wall_time() -> Result<i64, Box<dyn std::error::Error>> {
+        Ok(i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_millis(),
+        )?)
     }
 
     #[test]
     #[allow(clippy::too_many_lines)]
-    fn recovery_lease_contract_is_fenced_through_control_worker()
+    fn recovery_lease_contract_is_fenced_with_explicit_control_time()
     -> Result<(), Box<dyn std::error::Error>> {
         let fixture = fixture("lifecycle")?;
         let scope = resolved_scope(&fixture.control, fixture.location_id)?;
-        let (client, mut worker) = fixture.control.start_worker()?;
+        let control = &fixture.control;
         let owner_a = runtime_id(0xA001);
         let owner_b = runtime_id(0xB001);
 
-        let initial = client.recovery_maintenance_lease(scope.clone())?;
+        let initial = control.recovery_maintenance_lease(&scope)?;
         assert!(initial.is_released());
         assert_eq!(initial.epoch().get(), 0);
 
         // A released lease is acquired and the epoch advances exactly once.
         let first_command =
             ClaimRecoveryLease::new(fixture.workspace_id, owner_a, duration()?, timestamp(10)?)?;
-        let first = client.claim_recovery_maintenance_lease(scope.clone(), first_command)?;
+        let first = control.claim_recovery_maintenance_lease(&scope, &first_command)?;
         assert_eq!(first.acquisition(), RecoveryLeaseAcquisition::Acquired);
         assert_eq!(first.lease().owner_id(), Some(owner_a));
         assert_eq!(first.lease().epoch().get(), 1);
@@ -599,14 +916,14 @@ mod tests {
         assert_eq!(first.scope().workspace_id(), fixture.workspace_id);
 
         // The exact same owner and expiry is an idempotent retry.
-        let retry = client.claim_recovery_maintenance_lease(scope.clone(), first_command)?;
+        let retry = control.claim_recovery_maintenance_lease(&scope, &first_command)?;
         assert_eq!(retry.acquisition(), RecoveryLeaseAcquisition::AlreadyOwned);
         assert_eq!(retry.lease(), first.lease());
 
         // A different live owner is rejected without mutating the snapshot.
         let competing =
             ClaimRecoveryLease::new(fixture.workspace_id, owner_b, duration()?, timestamp(11)?)?;
-        let busy = client.claim_recovery_maintenance_lease(scope.clone(), competing)?;
+        let busy = control.claim_recovery_maintenance_lease(&scope, &competing)?;
         assert_eq!(busy.acquisition(), RecoveryLeaseAcquisition::Busy);
         assert_eq!(busy.lease(), first.lease());
 
@@ -617,7 +934,7 @@ mod tests {
             forge_domain::RecoveryLeaseDurationMillis::new(2_000)?,
             timestamp(12)?,
         )?;
-        let conflict = client.claim_recovery_maintenance_lease(scope.clone(), conflicting)?;
+        let conflict = control.claim_recovery_maintenance_lease(&scope, &conflicting)?;
         assert_eq!(
             conflict.acquisition(),
             RecoveryLeaseAcquisition::ClaimConflict
@@ -633,7 +950,7 @@ mod tests {
             duration()?,
             timestamp(50)?,
         )?;
-        let renewed = client.renew_recovery_maintenance_lease(scope.clone(), renewal)?;
+        let renewed = control.renew_recovery_maintenance_lease(&scope, &renewal)?;
         assert_eq!(renewed.lease_until(), Some(timestamp(1_050)?));
         assert_eq!(renewed.revision().get(), 3);
 
@@ -646,8 +963,8 @@ mod tests {
             duration()?,
             timestamp(60)?,
         )?;
-        let stale_error = client
-            .renew_recovery_maintenance_lease(scope.clone(), stale_renewal)
+        let stale_error = control
+            .renew_recovery_maintenance_lease(&scope, &stale_renewal)
             .expect_err("stale renewal must fail");
         assert_eq!(stale_error.code(), ControlErrorCode::RecoveryLeaseConflict);
 
@@ -658,7 +975,7 @@ mod tests {
             duration()?,
             timestamp(1_050)?,
         )?;
-        let taken = client.claim_recovery_maintenance_lease(scope.clone(), takeover)?;
+        let taken = control.claim_recovery_maintenance_lease(&scope, &takeover)?;
         assert_eq!(taken.acquisition(), RecoveryLeaseAcquisition::Acquired);
         assert_eq!(taken.lease().owner_id(), Some(owner_b));
         assert_eq!(taken.lease().epoch().get(), 2);
@@ -671,8 +988,8 @@ mod tests {
             first.lease().revision(),
             timestamp(1_060)?,
         );
-        let stale_release_error = client
-            .release_recovery_maintenance_lease(scope.clone(), stale_release)
+        let stale_release_error = control
+            .release_recovery_maintenance_lease(&scope, &stale_release)
             .expect_err("stale release must fail");
         assert_eq!(
             stale_release_error.code(),
@@ -687,7 +1004,7 @@ mod tests {
             taken.lease().revision(),
             timestamp(1_070)?,
         );
-        let released = client.release_recovery_maintenance_lease(scope.clone(), release_command)?;
+        let released = control.release_recovery_maintenance_lease(&scope, &release_command)?;
         assert!(released.is_released());
         assert_eq!(released.epoch(), taken.lease().epoch());
         assert_eq!(
@@ -696,10 +1013,9 @@ mod tests {
         );
 
         // Reads stay observational after every transition.
-        let observed_again = client.recovery_maintenance_lease(scope.clone())?;
+        let observed_again = control.recovery_maintenance_lease(&scope)?;
         assert_eq!(observed_again, released);
 
-        worker.shutdown()?;
         fs::remove_dir_all(fixture.root)?;
         Ok(())
     }
@@ -765,14 +1081,19 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let fixture = fixture("race")?;
 
+        // Resolve authority before starting the competing workers. Recovery lease
+        // transitions do not change Workspace identity, so one exact scope is
+        // sufficient for both independent workers and the final observation.
+        let scope = resolved_scope(&fixture.control, fixture.location_id)?;
+        let scope_a = scope.clone();
+        let scope_b = scope.clone();
+
         // Two fully independent control services over the same Registry and
         // Workspace, each with its own bounded worker thread.
         let (client_a, mut worker_a) =
             ForgeControl::new(GlobalRegistry::open(&fixture.registry_path)?).start_worker()?;
         let (client_b, mut worker_b) =
             ForgeControl::new(GlobalRegistry::open(&fixture.registry_path)?).start_worker()?;
-        let scope_a = resolved_scope(&fixture.control, fixture.location_id)?;
-        let scope_b = resolved_scope(&fixture.control, fixture.location_id)?;
 
         let command_a = ClaimRecoveryLease::new(
             fixture.workspace_id,
@@ -808,7 +1129,6 @@ mod tests {
         assert_eq!(winner.lease().revision().get(), 2);
 
         // An independent observational read confirms exactly one winner.
-        let scope = resolved_scope(&fixture.control, fixture.location_id)?;
         let persisted = fixture.control.recovery_maintenance_lease(&scope)?;
         assert_eq!(persisted.owner_id(), winner.lease().owner_id());
         assert_eq!(persisted, *winner.lease());
@@ -864,15 +1184,14 @@ mod tests {
         owner_value: u128,
         claimed_at: i64,
     ) -> Result<RecoveryMaintenanceRequest, Box<dyn std::error::Error>> {
-        Ok(RecoveryMaintenanceRequest {
-            scope: scope.clone(),
-            owner_id: runtime_id(owner_value),
-            duration: duration()?,
-            claimed_at: timestamp(claimed_at)?,
-            classify_at: timestamp(claimed_at)?,
-            activity_limit: ActivityListLimit::DEFAULT,
-            execution_limit: ExecutionListLimit::DEFAULT,
-        })
+        Ok(RecoveryMaintenanceRequest::native(
+            scope.clone(),
+            Uuid::now_v7(),
+            runtime_id(owner_value),
+            duration()?,
+            timestamp(claimed_at)?,
+            (ActivityListLimit::DEFAULT, ExecutionListLimit::DEFAULT),
+        )?)
     }
 
     #[test]
@@ -918,11 +1237,20 @@ mod tests {
         assert_eq!(report.outcome(), RecoveryMaintenanceOutcome::Completed);
         assert!(report.binding_confirmed());
         assert!(!report.release_uncertain());
-        assert_eq!(report.reconciled_activities().len(), 1);
-        assert_eq!(report.reconciled_activities()[0].id(), expired_activity);
-        assert_eq!(report.reconciled_executions().len(), 1);
+        assert_eq!(report.activity_count(), 1);
         assert_eq!(
-            report.reconciled_executions()[0].id(),
+            report
+                .reconciled_activities()
+                .ok_or("first-run activity projection missing")?[0]
+                .id(),
+            expired_activity
+        );
+        assert_eq!(report.execution_count(), 1);
+        assert_eq!(
+            report
+                .reconciled_executions()
+                .ok_or("first-run execution projection missing")?[0]
+                .id(),
             ExecutionId::from_uuid(Uuid::from_u128(0x51))
         );
         assert!(report.lease().is_released());
@@ -938,12 +1266,22 @@ mod tests {
         }
         drop(store);
 
-        // A second run is idempotent: nothing remains to classify.
-        let second = client.run_recovery_maintenance(request)?;
+        // Exact replay preserves the original historical result and epoch.
+        let second = client.run_recovery_maintenance(request.clone())?;
         assert_eq!(second.outcome(), RecoveryMaintenanceOutcome::Completed);
-        assert!(second.reconciled_activities().is_empty());
-        assert!(second.reconciled_executions().is_empty());
-        assert_eq!(second.lease().epoch().get(), 2);
+        assert!(second.replayed());
+        assert_eq!(second.receipt(), report.receipt());
+        assert_eq!(second.activity_count(), 1);
+        assert_eq!(second.execution_count(), 1);
+        assert!(second.reconciled_activities().is_none());
+        assert!(second.reconciled_executions().is_none());
+        assert_eq!(second.lease().epoch().get(), 1);
+        let new_request = maintenance_request(&scope, 0x999, 100)?;
+        let next = client.run_recovery_maintenance(new_request)?;
+        assert!(!next.replayed());
+        assert_eq!(next.activity_count(), 0);
+        assert_eq!(next.execution_count(), 0);
+        assert_eq!(next.lease().epoch().get(), 2);
 
         worker.shutdown()?;
         fs::remove_dir_all(fixture.root)?;
@@ -972,18 +1310,22 @@ mod tests {
         let foreign_claim = ClaimRecoveryLease::new(
             fixture.workspace_id,
             runtime_id(0xF01),
-            duration()?,
+            forge_domain::RecoveryLeaseDurationMillis::new(60_000)?,
             timestamp(50)?,
         )?;
         let claimed = client.claim_recovery_maintenance_lease(scope.clone(), foreign_claim)?;
         assert_eq!(claimed.acquisition(), RecoveryLeaseAcquisition::Acquired);
 
-        let report = client.run_recovery_maintenance(maintenance_request(&scope, 0x999, 60)?)?;
+        let report = client.run_recovery_maintenance(maintenance_request(
+            &scope,
+            0x999,
+            claimed.lease().updated_at().get(),
+        )?)?;
         assert_eq!(report.outcome(), RecoveryMaintenanceOutcome::Busy);
         assert!(!report.outcome().classified());
         assert_eq!(report.lease().owner_id(), Some(runtime_id(0xF01)));
-        assert!(report.reconciled_activities().is_empty());
-        assert!(report.reconciled_executions().is_empty());
+        assert_eq!(report.activity_count(), 0);
+        assert_eq!(report.execution_count(), 0);
 
         // Durable rows were not touched while the fence was held.
         let store = seed_store(&fixture.root)?;
@@ -1001,11 +1343,14 @@ mod tests {
             claimed.lease().revision(),
             timestamp(70)?,
         );
-        let _released =
-            client.release_recovery_maintenance_lease(scope.clone(), foreign_release)?;
-        let report = client.run_recovery_maintenance(maintenance_request(&scope, 0x999, 80)?)?;
+        let released = client.release_recovery_maintenance_lease(scope.clone(), foreign_release)?;
+        let report = client.run_recovery_maintenance(maintenance_request(
+            &scope,
+            0x999,
+            released.updated_at().get(),
+        )?)?;
         assert_eq!(report.outcome(), RecoveryMaintenanceOutcome::Completed);
-        assert_eq!(report.reconciled_executions().len(), 1);
+        assert_eq!(report.execution_count(), 1);
         assert!(report.lease().is_released());
 
         worker.shutdown()?;
@@ -1044,7 +1389,7 @@ mod tests {
         let holder_claim = ClaimRecoveryLease::new(
             fixture.workspace_id,
             runtime_id(0xF10),
-            duration()?,
+            forge_domain::RecoveryLeaseDurationMillis::new(60_000)?,
             timestamp(90)?,
         )?;
         let (client_holder, mut worker_holder) =
@@ -1053,8 +1398,8 @@ mod tests {
         assert_eq!(held.acquisition(), RecoveryLeaseAcquisition::Acquired);
 
         // Two independent maintenance workers race while the fence is held.
-        let request_a = maintenance_request(&scope, 0xE01, 95)?;
-        let request_b = maintenance_request(&scope, 0xE02, 95)?;
+        let request_a = maintenance_request(&scope, 0xE01, held.lease().updated_at().get())?;
+        let request_b = maintenance_request(&scope, 0xE02, held.lease().updated_at().get())?;
         let (first_joined, second_joined) = std::thread::scope(|threads| {
             let first = threads.spawn(move || client_a.run_recovery_maintenance(request_a));
             let second = threads.spawn(move || client_b.run_recovery_maintenance(request_b));
@@ -1068,10 +1413,7 @@ mod tests {
         // Neither worker may classify under someone else's fence.
         assert!(!first.outcome().classified());
         assert!(!second.outcome().classified());
-        assert_eq!(
-            first.reconciled_executions().len() + second.reconciled_executions().len(),
-            0
-        );
+        assert_eq!(first.execution_count() + second.execution_count(), 0);
 
         // Durable rows are untouched and the holder's lease is unchanged.
         let store = seed_store(&fixture.root)?;
@@ -1094,12 +1436,15 @@ mod tests {
             held.lease().revision(),
             timestamp(120)?,
         );
-        let _released =
+        let released =
             client_holder.release_recovery_maintenance_lease(scope.clone(), holder_release)?;
-        let report =
-            client_holder.run_recovery_maintenance(maintenance_request(&scope, 0xE03, 130)?)?;
+        let report = client_holder.run_recovery_maintenance(maintenance_request(
+            &scope,
+            0xE03,
+            released.updated_at().get(),
+        )?)?;
         assert_eq!(report.outcome(), RecoveryMaintenanceOutcome::Completed);
-        assert_eq!(report.reconciled_executions().len(), seeded.len());
+        assert_eq!(report.execution_count(), seeded.len());
         assert!(report.lease().is_released());
 
         worker_a.shutdown()?;

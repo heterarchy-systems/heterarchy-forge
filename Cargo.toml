@@ -2,70 +2,52 @@
 members = [
     "xtask",
     "crates/forge-domain",
-    "crates/forge-platform",
-    "crates/forge-runtime",
     "crates/forge-workspace",
     "crates/forge-execution",
     "crates/forge-persistence",
     "crates/forge-control",
-    "crates/forge-mcp",
-    "crates/forge-ui",
-    "crates/forge-desktop",
+    "crates/forge-backend",
 ]
 resolver = "3"
+exclude = ["vendor/heterarchy-orchestration-policy"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.92"
+rust-version = "1.98"
 authors = ["Heterarchy Systems"]
 repository = "https://github.com/heterarchy-systems/heterarchy-forge"
 
 [workspace.dependencies]
-axum = { version = "=0.8.9", default-features = false, features = ["http1", "tokio"] }
+heterarchy-orchestration-policy = { version = "=0.1.0" }
+axum = { version = "=0.8.9", default-features = false, features = ["form", "http1", "json", "query", "tokio"] }
 base64 = { version = "=0.22.1", default-features = false, features = ["std"] }
 blake3 = { version = "=1.8.7", default-features = false, features = ["std"] }
-directories = "6.0.0"
 getrandom = { version = "=0.4.3", default-features = false }
-objc2 = { version = "=0.6.4", default-features = false, features = ["std"] }
-objc2-app-kit = { version = "=0.3.2", default-features = false, features = [
-    "NSApplication",
-    "NSOpenPanel",
-    "NSPanel",
-    "NSResponder",
-    "NSSavePanel",
-    "NSWindow",
-] }
+http-body-util = { version = "=0.1.5", default-features = false }
+hyper = { version = "1.11.0", default-features = false, features = ["client", "http1", "server"] }
+hyper-util = { version = "=0.1.20", default-features = false, features = ["service", "tokio"] }
 rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled"] }
-rmcp = { version = "=3.1.4", default-features = false, features = ["server", "transport-io", "transport-streamable-http-server"] }
 rustix = { version = "=1.1.4", default-features = false, features = ["fs", "std"] }
 rustix-process = { package = "rustix", version = "=1.1.4", default-features = false, features = ["fs", "process", "std"] }
 similar = { version = "=3.2.0", default-features = false, features = ["std", "text"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
 sha2 = "=0.10.9"
-slint = { version = "=1.17.1", default-features = false, features = [
-    "accessibility",
-    "backend-winit",
-    "compat-1-2",
-    "renderer-femtovg",
-    "std",
-    "system-tray",
-] }
-slint-build = "=1.17.1"
-security-framework = { version = "=3.7.0", default-features = false }
 thiserror = "2.0.20"
 toml = "=0.9.12"
-tokio = { version = "1.53.1", default-features = false, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1.53.1", default-features = false, features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "0.7.19", default-features = false, features = ["rt"] }
+futures-core = "0.3.31"
 tracing = { version = "0.1.44", default-features = false, features = ["std", "attributes"] }
-tracing-appender = "0.2.5"
-tracing-subscriber = { version = "0.3.23", default-features = false, features = ["ansi", "env-filter", "fmt", "json", "registry"] }
-uuid = { version = "=1.25.0", features = ["v7"] }
+uuid = { version = "=1.25.0", features = ["serde", "v7"] }
 zstd = { version = "=0.13.3", default-features = false }
 
+[patch.crates-io]
+heterarchy-orchestration-policy = { path = "vendor/heterarchy-orchestration-policy" }
+
 [workspace.lints.rust]
-unsafe_code = "deny"
+unsafe_code = "forbid"
 unsafe_op_in_unsafe_fn = "deny"
 unused_must_use = "deny"
 missing_debug_implementations = "warn"

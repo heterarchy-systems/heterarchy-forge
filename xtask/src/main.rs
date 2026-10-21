@@ -3,13 +3,19 @@
 //! This active Rust workspace uses `xtask` for rules, locked metadata,
 //! formatting, build/test/Clippy, dependency, and doctor gates.
 
+mod doctor;
 mod package;
+mod policy_package;
+mod test_runner;
+
+use doctor::doctor;
 
 use std::env;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
 use std::io::{self, Read};
+use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -68,7 +74,7 @@ const ASYNC_RULES: &[&str] = &[
     "10-async-observability-performance-rules.md",
 ];
 const REQUIRED_SKILL: &str = "skills/rust-engineering/SKILL.md";
-const SHARED_HARNESS_SOURCE_COUNT: usize = 40;
+const SHARED_HARNESS_SOURCE_COUNT: usize = 73;
 const FORBIDDEN_IMPLEMENTATION_EXTENSIONS: &[&str] = &[
     "py", "pyi", "js", "jsx", "ts", "tsx", "mjs", "cjs", "go", "java", "kt", "kts", "swift", "c",
     "cc", "cpp", "cxx", "m", "mm",
@@ -79,6 +85,7 @@ const WALK_SKIP_DIRS: &[&str] = &[
     ".chatgpt2codex",
     ".heterarchy-forge",
     ".opencode",
+    ".omx",
     "target",
 ];
 const MAX_POLICY_TEXT_BYTES: usize = 1_048_576;
@@ -89,9 +96,20 @@ const PROCESS_CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const PROCESS_CAPTURE_STREAM_COUNT: usize = 2;
 const REQUIRED_CARGO_DENY_VERSION: &str = "cargo-deny 0.20.2";
 const REQUIRED_CARGO_AUDIT_VERSION: &str = "cargo-audit 0.22.2";
-const MSRV_TOOLCHAIN: &str = "1.92.0";
+const MSRV_TOOLCHAIN: &str = "1.98.0";
+const RUST_CI_SANDBOX_MARKER_ENV: &str = "HETERARCHY_FORGE_RUST_CI_SANDBOX";
+const RUST_CI_SANDBOX_MARKER_VALUE: &str = "v1";
+const RUST_CI_TEST_POLICY_ENV: &str = "HETERARCHY_FORGE_RUST_CI_TEST_POLICY";
+const RUST_CI_TEST_POLICY_VALUE: &str = "outer-rust-ci-v1";
+const FORGE_EXECUTION_PACKAGE: &str = "forge-execution";
+const RUST_TEST_THREADS_ENV: &str = "RUST_TEST_THREADS";
+const FORGE_EXECUTION_TEST_THREADS: &str = "1";
+const OUTER_RUST_CI_PROFILE_NOTICE: &str = "Heterarchy Forge CI profile: PARTIAL (outer Rust CI sandbox); native sandbox/process/loopback coverage gaps are explicitly skipped. Canonical host CI remains required.";
 
 fn main() {
+    if env::args_os().nth(1).as_deref() == Some(OsStr::new(test_runner::COMMAND)) {
+        test_runner::run(env::args_os().skip(2));
+    }
     if let Err(error) = run() {
         eprintln!("cargo xtask: {error}");
         std::process::exit(1);
@@ -113,9 +131,10 @@ fn run() -> Result<(), String> {
         "msrv" => msrv(),
         "persistence" => persistence(),
         "package" => package::run(&workspace_root()),
+        "policy-package" => policy_package::run(&workspace_root(), env::args().skip(2)),
         "help" | "--help" | "-h" => {
             println!(
-                "usage: cargo xtask <rules|fmt|check|test|ci|doctor|deps|supply-chain|extended|perf|msrv|persistence|package>"
+                "usage: cargo xtask <rules|fmt|check|test|ci|doctor|deps|supply-chain|extended|perf|msrv|persistence|package|policy-package>"
             );
             Ok(())
         }
@@ -145,7 +164,54 @@ fn check() -> Result<(), String> {
 }
 
 fn test() -> Result<(), String> {
-    cargo(&["test", "--locked", "--workspace", "--all-targets"])
+    if outer_rust_ci_test_profile_enabled() {
+        println!("{OUTER_RUST_CI_PROFILE_NOTICE}");
+        test_workspace(
+            true,
+            &[(RUST_CI_TEST_POLICY_ENV, RUST_CI_TEST_POLICY_VALUE)],
+        )
+    } else {
+        test_workspace(false, &[])
+    }
+}
+
+fn test_workspace(quiet: bool, environment: &[(&str, &str)]) -> Result<(), String> {
+    let mut workspace_arguments = vec!["test"];
+    if quiet {
+        workspace_arguments.push("--quiet");
+    }
+    workspace_arguments.extend([
+        "--locked",
+        "--workspace",
+        "--all-targets",
+        "--exclude",
+        FORGE_EXECUTION_PACKAGE,
+    ]);
+    cargo_test_with_runner_policy(&workspace_arguments, environment)?;
+
+    let mut execution_arguments = vec!["test"];
+    if quiet {
+        execution_arguments.push("--quiet");
+    }
+    execution_arguments.extend(["--locked", "-p", FORGE_EXECUTION_PACKAGE, "--all-targets"]);
+    let mut execution_environment = environment.to_vec();
+    execution_environment.push((RUST_TEST_THREADS_ENV, FORGE_EXECUTION_TEST_THREADS));
+    cargo_test_with_runner_policy(&execution_arguments, &execution_environment)
+}
+
+fn outer_rust_ci_test_profile_enabled() -> bool {
+    outer_rust_ci_test_profile_enabled_for(
+        std::env::var(RUST_CI_SANDBOX_MARKER_ENV).ok().as_deref(),
+        std::env::var(RUST_CI_TEST_POLICY_ENV).ok().as_deref(),
+    )
+}
+
+fn outer_rust_ci_test_profile_enabled_for(
+    sandbox_marker: Option<&str>,
+    test_policy: Option<&str>,
+) -> bool {
+    sandbox_marker == Some(RUST_CI_SANDBOX_MARKER_VALUE)
+        && test_policy == Some(RUST_CI_TEST_POLICY_VALUE)
 }
 
 fn persistence() -> Result<(), String> {
@@ -180,122 +246,25 @@ fn persistence() -> Result<(), String> {
     Ok(())
 }
 
-fn doctor() -> Result<(), String> {
-    let root = workspace_root();
-    let sandbox = DoctorSandbox::create()?;
-    rules()?;
-    command("rustc", &["--version"])?;
-    command("cargo", &["--version"])?;
-    command("cargo", &["fmt", "--version"])?;
-    command("cargo", &["clippy", "--version"])?;
-    command("rustup", &["run", MSRV_TOOLCHAIN, "rustc", "--version"])?;
-    require_tool_version("cargo-deny", REQUIRED_CARGO_DENY_VERSION, &root)?;
-    require_tool_version("cargo-audit", REQUIRED_CARGO_AUDIT_VERSION, &root)?;
-    require_nonempty_file(&root.join("Cargo.lock"), "Cargo lockfile")?;
-    cargo(&[
-        "build",
-        "--locked",
-        "-p",
-        "forge-desktop",
-        "-p",
-        "forge-mcp",
-    ])?;
-    run_doctor_binary(
-        &root,
-        "forge-desktop",
-        &[
-            "Heterarchy Forge doctor: PASS_WITH_WARNINGS",
-            "registry_health=NOT_INITIALIZED",
-            "runtime_phase=Running",
-        ],
-        sandbox.registry_path(),
-        sandbox.home(),
-    )?;
-    run_doctor_binary(
-        &root,
-        "forge-mcp",
-        &[
-            "mcp_doctor=PASS_WITH_WARNINGS",
-            "registry_health=NOT_INITIALIZED",
-            "runtime_ownership=PASS",
-            "tool_names=PASS",
-            "shutdown=PASS",
-        ],
-        sandbox.registry_path(),
-        sandbox.home(),
-    )?;
-    if sandbox.registry_path().exists() {
-        return Err(format!(
-            "doctor created the isolated registry {}",
-            sandbox.registry_path().display()
-        ));
-    }
-    println!("Heterarchy Forge Rust harness doctor passed");
-    Ok(())
+enum DoctorRetention {
+    UnreapedProcess(u32),
+    DiagnosticsFailed,
 }
 
-fn run_doctor_binary(
-    root: &Path,
-    binary_name: &str,
-    markers: &[&str],
-    registry_path: &Path,
-    home: &Path,
-) -> Result<(), String> {
-    let doctor_binary = root.join("target/debug").join(binary_name);
-    let environment = [
-        (
-            OsStr::new("HETERARCHY_FORGE_REGISTRY_PATH"),
-            registry_path.as_os_str(),
-        ),
-        (OsStr::new("HOME"), home.as_os_str()),
-    ];
-    let captured = capture_process_with_env(
-        &doctor_binary,
-        &["--doctor"],
-        root,
-        MAX_DOCTOR_OUTPUT_BYTES,
-        &environment,
-    )?;
-    if !captured.status.success() {
-        return Err(format!(
-            "{} --doctor exited with status {}",
-            doctor_binary.display(),
-            captured.status
-        ));
-    }
-    if captured.stdout_total > MAX_DOCTOR_OUTPUT_BYTES
-        || captured.stderr_total > MAX_DOCTOR_OUTPUT_BYTES
-    {
-        return Err(format!(
-            "{} --doctor output exceeded the {}-byte per-stream cap",
-            doctor_binary.display(),
-            MAX_DOCTOR_OUTPUT_BYTES
-        ));
-    }
-    let stdout = String::from_utf8_lossy(&captured.stdout);
-    for marker in markers {
-        if !stdout.contains(marker) {
-            return Err(format!(
-                "{} --doctor output is missing required marker {marker:?}",
-                doctor_binary.display()
-            ));
+impl fmt::Display for DoctorRetention {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnreapedProcess(pid) => write!(formatter, "unreaped process {pid}"),
+            Self::DiagnosticsFailed => formatter.write_str("unconfirmed diagnostics"),
         }
     }
-    print!("{stdout}");
-    if !captured.stderr.is_empty() {
-        eprint!(
-            "{} --doctor stderr:\n{}",
-            doctor_binary.display(),
-            String::from_utf8_lossy(&captured.stderr)
-        );
-    }
-    Ok(())
 }
 
 struct DoctorSandbox {
     root: PathBuf,
     home: PathBuf,
     registry: PathBuf,
+    retention: Option<DoctorRetention>,
 }
 
 impl DoctorSandbox {
@@ -306,17 +275,30 @@ impl DoctorSandbox {
             unique_suffix()
         ));
         let home = root.join("home");
-        fs::create_dir_all(&home).map_err(|error| {
-            format!(
-                "cannot create isolated doctor HOME {}: {error}",
-                home.display()
-            )
-        })?;
-        Ok(Self {
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&root)
+            .map_err(|error| {
+                format!(
+                    "cannot create private doctor root {}: {error}",
+                    root.display()
+                )
+            })?;
+        let mut sandbox = Self {
             registry: root.join("support").join("registry.sqlite3"),
             root,
             home,
-        })
+            retention: None,
+        };
+        fs::create_dir(&sandbox.home).map_err(|error| {
+            format!(
+                "cannot create isolated doctor HOME {}: {error}",
+                sandbox.home.display()
+            )
+        })?;
+        sandbox.home = fs::canonicalize(&sandbox.home)
+            .map_err(|error| format!("cannot canonicalize isolated doctor home: {error}"))?;
+        Ok(sandbox)
     }
 
     fn home(&self) -> &Path {
@@ -326,11 +308,40 @@ impl DoctorSandbox {
     fn registry_path(&self) -> &Path {
         &self.registry
     }
+
+    fn cleanup(&self) -> Result<(), String> {
+        if let Some(reason) = &self.retention {
+            return Err(format!(
+                "doctor sandbox retained for {reason}: {}",
+                self.root.display()
+            ));
+        }
+        fs::remove_dir_all(&self.root).map_err(|error| {
+            format!(
+                "cannot clean doctor sandbox {}: {error}",
+                self.root.display()
+            )
+        })
+    }
 }
 
 impl Drop for DoctorSandbox {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.root);
+        if let Some(reason) = &self.retention {
+            eprintln!(
+                "doctor sandbox retained for {reason}: {}",
+                self.root.display()
+            );
+            return;
+        }
+        if let Err(error) = fs::remove_dir_all(&self.root)
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            eprintln!(
+                "cannot clean doctor sandbox {} on drop: {error}",
+                self.root.display()
+            );
+        }
     }
 }
 
@@ -458,6 +469,7 @@ fn rules() -> Result<(), String> {
     let metadata = cargo_metadata(&root)?;
     verify_manifest_lints(&metadata)?;
     verify_locked_metadata(&metadata)?;
+    policy_package::verify(&root)?;
 
     println!("Heterarchy Forge Rust rules verification passed");
     Ok(())
@@ -739,11 +751,11 @@ fn verify_workspace_manifest(root: &Path) -> Result<(), String> {
         .map_err(|error| format!("invalid workspace Cargo.toml: {error}"))?;
     require_toml_str(&manifest, &["workspace", "resolver"], "3")?;
     require_toml_str(&manifest, &["workspace", "package", "edition"], "2024")?;
-    require_toml_str(&manifest, &["workspace", "package", "rust-version"], "1.92")?;
+    require_toml_str(&manifest, &["workspace", "package", "rust-version"], "1.98")?;
     require_toml_str(
         &manifest,
         &["workspace", "lints", "rust", "unsafe_code"],
-        "deny",
+        "forbid",
     )?;
     for lint in ["unsafe_op_in_unsafe_fn", "unused_must_use"] {
         if toml_at(&manifest, &["workspace", "lints", "rust", lint]).is_none() {
@@ -871,11 +883,14 @@ fn verify_locked_metadata(metadata: &JsonValue) -> Result<(), String> {
 fn cargo_metadata(root: &Path) -> Result<JsonValue, String> {
     let arguments =
         pinned_cargo_arguments(["metadata", "--locked", "--no-deps", "--format-version", "1"]);
-    let captured = capture_process(
+    let pinned_path = pinned_toolchain_path(root, &[])?;
+    let environment = [(OsStr::new("PATH"), pinned_path.as_os_str())];
+    let captured = capture_process_with_env(
         Path::new("rustup"),
         &arguments,
         root,
         MAX_DOCTOR_OUTPUT_BYTES * 16,
+        &environment,
     )?;
     if !captured.status.success() {
         return Err(format!(
@@ -885,6 +900,15 @@ fn cargo_metadata(root: &Path) -> Result<JsonValue, String> {
     }
     serde_json::from_slice(&captured.stdout)
         .map_err(|error| format!("invalid cargo metadata JSON: {error}"))
+}
+
+fn cargo_target_directory(root: &Path) -> Result<PathBuf, String> {
+    let metadata = cargo_metadata(root)?;
+    let target = metadata
+        .get("target_directory")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| "cargo metadata is missing target_directory".to_owned())?;
+    Ok(PathBuf::from(target))
 }
 
 fn workspace_has_bench_target() -> Result<bool, String> {
@@ -1408,8 +1432,60 @@ fn wait_for_child(
 }
 
 fn cargo(arguments: &[&str]) -> Result<(), String> {
-    let pinned_arguments = pinned_cargo_arguments(arguments.iter().copied());
-    command_in("rustup", &pinned_arguments, &workspace_root())
+    cargo_with_environment(arguments, &[])
+}
+
+fn cargo_with_environment(arguments: &[&str], environment: &[(&str, &str)]) -> Result<(), String> {
+    cargo_with_optional_test_runner(arguments, environment, None)
+}
+
+fn cargo_test_with_runner_policy(
+    arguments: &[&str],
+    environment: &[(&str, &str)],
+) -> Result<(), String> {
+    if outer_rust_ci_test_profile_enabled() {
+        cargo_with_environment(arguments, environment)
+    } else {
+        let runner_config = test_runner::cargo_runner_config(&workspace_root())?;
+        cargo_with_optional_test_runner(arguments, environment, Some(&runner_config))
+    }
+}
+
+fn cargo_with_optional_test_runner(
+    arguments: &[&str],
+    environment: &[(&str, &str)],
+    runner_config: Option<&str>,
+) -> Result<(), String> {
+    let temporary_config = verification_temp_config(env::var_os("FORGE_VERIFY_TMPDIR").as_deref())?;
+    let mut pinned_arguments = pinned_cargo_arguments(arguments.iter().copied());
+    if let Some(config) = runner_config {
+        pinned_arguments.splice(3..3, ["--config", config]);
+    }
+    if let Some(config) = temporary_config.as_deref() {
+        // Cargo [env] force=true can override the parent process's TMPDIR.
+        // Carry this explicit verification-only setting to each child Cargo,
+        // without modifying inherited, repository or product storage policy.
+        pinned_arguments.splice(
+            3..3,
+            ["--config", config, "--config", "env.TMPDIR.force=true"],
+        );
+    }
+    command_in_with_environment("rustup", &pinned_arguments, &workspace_root(), environment)
+}
+
+fn verification_temp_config(directory: Option<&OsStr>) -> Result<Option<String>, String> {
+    let Some(directory) = directory else {
+        return Ok(None);
+    };
+    let directory = Path::new(directory);
+    let directory = test_runner::validate_internal_directory(directory)?;
+    let directory = directory
+        .to_str()
+        .ok_or_else(|| "FORGE_VERIFY_TMPDIR must be representable in Cargo TOML".to_owned())?;
+    Ok(Some(format!(
+        "env.TMPDIR.value={}",
+        toml::Value::String(directory.to_owned())
+    )))
 }
 
 fn pinned_cargo_arguments<'a>(arguments: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
@@ -1426,10 +1502,22 @@ fn command(program: &str, arguments: &[&str]) -> Result<(), String> {
 }
 
 fn command_in(program: impl AsRef<OsStr>, arguments: &[&str], cwd: &Path) -> Result<(), String> {
+    command_in_with_environment(program, arguments, cwd, &[])
+}
+
+fn command_in_with_environment(
+    program: impl AsRef<OsStr>,
+    arguments: &[&str],
+    cwd: &Path,
+    environment: &[(&str, &str)],
+) -> Result<(), String> {
     let program = program.as_ref();
+    let pinned_path = pinned_toolchain_path(cwd, environment)?;
     let status = Command::new(program)
         .args(arguments)
         .current_dir(cwd)
+        .envs(environment.iter().copied())
+        .env("PATH", pinned_path)
         .status()
         .map_err(|error| {
             format!(
@@ -1451,6 +1539,53 @@ fn require_success(program: &OsStr, status: ExitStatus, arguments: &[&str]) -> R
     }
 }
 
+// `rustup run` selects Cargo but leaves child compiler lookup to PATH.
+fn pinned_toolchain_path(cwd: &Path, environment: &[(&str, &str)]) -> Result<OsString, String> {
+    let toolchain_bin = pinned_toolchain_bin(cwd)?;
+    let inherited_path = environment
+        .iter()
+        .find_map(|(name, value)| (*name == "PATH").then(|| OsString::from(*value)))
+        .or_else(|| env::var_os("PATH"))
+        .ok_or_else(|| "pinned Rust commands require PATH".to_owned())?;
+    env::join_paths(std::iter::once(toolchain_bin).chain(env::split_paths(&inherited_path)))
+        .map_err(|error| format!("cannot prepend pinned Rust toolchain to PATH: {error}"))
+}
+
+fn pinned_toolchain_bin(cwd: &Path) -> Result<PathBuf, String> {
+    let arguments = ["which", "--toolchain", MSRV_TOOLCHAIN, "rustc"];
+    let captured = capture_process(
+        Path::new("rustup"),
+        &arguments,
+        cwd,
+        MAX_TOOL_VERSION_OUTPUT_BYTES,
+    )?;
+    if !captured.status.success() {
+        return Err(format!(
+            "rustup {arguments:?} exited with status {}",
+            captured.status
+        ));
+    }
+    let rustc = String::from_utf8(captured.stdout)
+        .map_err(|error| format!("rustup returned a non-UTF-8 rustc path: {error}"))?;
+    let rustc = PathBuf::from(rustc.trim());
+    if !rustc.is_absolute() || rustc.file_name() != Some(OsStr::new("rustc")) {
+        return Err(format!(
+            "rustup returned an invalid pinned rustc path {}",
+            rustc.display()
+        ));
+    }
+    if !rustc.is_file() {
+        return Err(format!(
+            "pinned rustc path does not exist: {}",
+            rustc.display()
+        ));
+    }
+    rustc
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| format!("pinned rustc path has no parent: {}", rustc.display()))
+}
+
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).parent().map_or_else(
         || PathBuf::from(env!("CARGO_MANIFEST_DIR")),
@@ -1462,7 +1597,8 @@ fn workspace_root() -> PathBuf {
 mod tests {
     use std::fs;
     use std::io::{self, Cursor, Read};
-    use std::path::Path;
+    use std::os::unix::fs::symlink;
+    use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1471,12 +1607,16 @@ mod tests {
     use super::{
         BoundedReadError, MAX_DOCTOR_OUTPUT_BYTES, capture_process, capture_process_until,
         is_lowercase_sha256, is_safe_relative_path, pinned_cargo_arguments, read_bounded,
-        read_capped, toml_at, validate_harness_manifest_fields,
+        read_capped, toml_at, validate_harness_manifest_fields, verification_temp_config,
         verify_forge_local_asset_not_shared_manifested, verify_forge_persistence_manifests,
         workspace_member_manifest_paths,
     };
     use serde_json::json;
     use toml::Value as TomlValue;
+
+    fn native_process_tests_are_unavailable() -> bool {
+        super::outer_rust_ci_test_profile_enabled()
+    }
 
     struct CountingReader {
         remaining: usize,
@@ -1499,6 +1639,194 @@ mod tests {
             pinned_cargo_arguments(["check", "--locked"]),
             vec!["run", super::MSRV_TOOLCHAIN, "cargo", "check", "--locked"]
         );
+    }
+
+    #[test]
+    fn verification_temp_config_preserves_absence_and_escapes_explicit_directory()
+    -> Result<(), String> {
+        assert_eq!(verification_temp_config(None)?, None);
+        let base = if cfg!(target_os = "macos") {
+            PathBuf::from("/private/tmp")
+        } else {
+            PathBuf::from("/tmp")
+        };
+        let base = super::test_runner::validate_internal_directory(&base)?;
+        let sandbox_root = base.join(format!(
+            "heterarchy-forge-xtask-temp-config-{}-{}",
+            std::process::id(),
+            super::unique_suffix()
+        ));
+        fs::create_dir(&sandbox_root).map_err(|error| error.to_string())?;
+        let directory = sandbox_root.join("tmp space 한글");
+        fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+        let config = verification_temp_config(Some(directory.as_os_str()))?
+            .ok_or_else(|| "explicit temp configuration missing".to_owned())?;
+        let parsed: TomlValue = toml::from_str(&format!("{config}\nenv.TMPDIR.force=true"))
+            .map_err(|error| error.to_string())?;
+        let canonical = fs::canonicalize(&directory).map_err(|error| error.to_string())?;
+        assert_eq!(
+            parsed["env"]["TMPDIR"]["value"].as_str(),
+            canonical.to_str()
+        );
+        assert_eq!(parsed["env"]["TMPDIR"]["force"].as_bool(), Some(true));
+        fs::remove_dir_all(&sandbox_root).map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    #[test]
+    fn verification_temp_config_rejects_relative_missing_file_and_symlink() -> Result<(), String> {
+        assert!(verification_temp_config(Some(Path::new("relative").as_os_str())).is_err());
+        let sandbox = super::DoctorSandbox::create()?;
+        let missing = sandbox.root.join("missing");
+        assert!(verification_temp_config(Some(missing.as_os_str())).is_err());
+        let file = sandbox.root.join("file");
+        fs::write(&file, b"temporary fixture").map_err(|error| error.to_string())?;
+        assert!(verification_temp_config(Some(file.as_os_str())).is_err());
+        let link = sandbox.root.join("link");
+        symlink(&sandbox.root, &link).map_err(|error| error.to_string())?;
+        assert!(verification_temp_config(Some(link.as_os_str())).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn pinned_cargo_uses_pinned_rustc_and_clippy_when_host_path_precedes_toolchain()
+    -> Result<(), String> {
+        if native_process_tests_are_unavailable() {
+            return Ok(());
+        }
+        let sandbox = super::DoctorSandbox::create()?;
+        let probe_root = sandbox.root.join("toolchain-probe");
+        let source_root = probe_root.join("src");
+        fs::create_dir_all(&source_root)
+            .map_err(|error| format!("cannot create toolchain probe source: {error}"))?;
+        fs::write(
+            probe_root.join("Cargo.toml"),
+            "[package]\nname = \"forge-toolchain-probe\"\nversion = \"0.0.0\"\nedition = \"2024\"\n",
+        )
+        .map_err(|error| format!("cannot write toolchain probe manifest: {error}"))?;
+        fs::write(
+            source_root.join("lib.rs"),
+            "pub fn toolchain_probe() -> u32 { 92 }\n",
+        )
+        .map_err(|error| format!("cannot write toolchain probe source: {error}"))?;
+
+        let hostile_bin = probe_root.join("host-bin");
+        fs::create_dir_all(&hostile_bin)
+            .map_err(|error| format!("cannot create hostile host bin: {error}"))?;
+        symlink("/usr/bin/false", hostile_bin.join("rustc"))
+            .map_err(|error| format!("cannot create hostile rustc: {error}"))?;
+        symlink("/usr/bin/false", hostile_bin.join("clippy-driver"))
+            .map_err(|error| format!("cannot create hostile clippy-driver: {error}"))?;
+
+        let original_path =
+            std::env::var_os("PATH").ok_or_else(|| "toolchain probe requires PATH".to_owned())?;
+        let hostile_path = std::env::join_paths(
+            std::iter::once(hostile_bin.clone()).chain(std::env::split_paths(&original_path)),
+        )
+        .map_err(|error| format!("cannot construct hostile PATH: {error}"))?;
+        let hostile_path = hostile_path
+            .to_str()
+            .ok_or_else(|| "hostile PATH is not valid UTF-8".to_owned())?;
+        let manifest = probe_root
+            .join("Cargo.toml")
+            .to_str()
+            .ok_or_else(|| "toolchain probe manifest is not valid UTF-8".to_owned())?
+            .to_owned();
+        let target = probe_root
+            .join("target")
+            .to_str()
+            .ok_or_else(|| "toolchain probe target is not valid UTF-8".to_owned())?
+            .to_owned();
+        let environment = [("PATH", hostile_path)];
+
+        let check_arguments = pinned_cargo_arguments([
+            "check",
+            "--manifest-path",
+            manifest.as_str(),
+            "--target-dir",
+            target.as_str(),
+        ]);
+        super::command_in_with_environment("rustup", &check_arguments, &probe_root, &environment)?;
+
+        let clippy_arguments = pinned_cargo_arguments([
+            "clippy",
+            "--manifest-path",
+            manifest.as_str(),
+            "--target-dir",
+            target.as_str(),
+            "--",
+            "-D",
+            "warnings",
+        ]);
+        super::command_in_with_environment("rustup", &clippy_arguments, &probe_root, &environment)?;
+        Ok(())
+    }
+
+    #[test]
+    fn marker_only_production_selector_keeps_host_private_copy_runner()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const PROBE_ENV: &str = "FORGE_RUST_CI_SELECTOR_CHILD_PROBE";
+        if std::env::var_os(PROBE_ENV).is_some() {
+            assert!(
+                !super::outer_rust_ci_test_profile_enabled(),
+                "marker-only environment selected the outer Rust-CI profile"
+            );
+            return Ok(());
+        }
+
+        let output = Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "tests::marker_only_production_selector_keeps_host_private_copy_runner",
+                "--nocapture",
+            ])
+            .env(PROBE_ENV, "1")
+            .env(
+                super::RUST_CI_SANDBOX_MARKER_ENV,
+                super::RUST_CI_SANDBOX_MARKER_VALUE,
+            )
+            .env_remove(super::RUST_CI_TEST_POLICY_ENV)
+            .output()?;
+        assert!(
+            output.status.success(),
+            "marker-only environment selected the outer Rust-CI profile: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn outer_rust_ci_test_profile_requires_both_exact_values() {
+        assert!(!super::outer_rust_ci_test_profile_enabled_for(None, None));
+        assert!(!super::outer_rust_ci_test_profile_enabled_for(
+            Some(super::RUST_CI_SANDBOX_MARKER_VALUE),
+            None,
+        ));
+        assert!(!super::outer_rust_ci_test_profile_enabled_for(
+            None,
+            Some(super::RUST_CI_TEST_POLICY_VALUE),
+        ));
+        assert!(!super::outer_rust_ci_test_profile_enabled_for(
+            Some(super::RUST_CI_SANDBOX_MARKER_VALUE),
+            Some("unexpected"),
+        ));
+        assert!(!super::outer_rust_ci_test_profile_enabled_for(
+            Some("unexpected"),
+            Some(super::RUST_CI_TEST_POLICY_VALUE),
+        ));
+        assert!(super::outer_rust_ci_test_profile_enabled_for(
+            Some(super::RUST_CI_SANDBOX_MARKER_VALUE),
+            Some(super::RUST_CI_TEST_POLICY_VALUE),
+        ));
+    }
+
+    #[test]
+    fn outer_rust_ci_notice_identifies_partial_coverage() {
+        assert!(super::OUTER_RUST_CI_PROFILE_NOTICE.contains("PARTIAL"));
+        assert!(super::OUTER_RUST_CI_PROFILE_NOTICE.contains("outer Rust CI sandbox"));
+        assert!(super::OUTER_RUST_CI_PROFILE_NOTICE.contains("sandbox/process/loopback"));
+        assert!(super::OUTER_RUST_CI_PROFILE_NOTICE.contains("Canonical host CI remains required"));
     }
 
     #[test]
@@ -1641,6 +1969,9 @@ database = { package = "sea-orm", version = "2" }
 
     #[test]
     fn captured_process_rejects_large_output_at_the_per_stream_cap() {
+        if native_process_tests_are_unavailable() {
+            return;
+        }
         let large = "x".repeat(MAX_DOCTOR_OUTPUT_BYTES + 1);
         let result = capture_process(
             Path::new("/usr/bin/printf"),
@@ -1653,6 +1984,9 @@ database = { package = "sea-orm", version = "2" }
 
     #[test]
     fn captured_process_kills_and_reaps_an_endless_oversized_producer() -> Result<(), String> {
+        if native_process_tests_are_unavailable() {
+            return Ok(());
+        }
         let pid_path = std::env::temp_dir().join(format!(
             "heterarchy-forge-xtask-capture-{}-{}.pid",
             std::process::id(),
@@ -1694,6 +2028,9 @@ database = { package = "sea-orm", version = "2" }
 
     #[test]
     fn captured_process_times_out_and_kills_pipe_holding_descendants() -> Result<(), String> {
+        if native_process_tests_are_unavailable() {
+            return Ok(());
+        }
         let pid_path = std::env::temp_dir().join(format!(
             "heterarchy-forge-xtask-descendant-{}-{}.pid",
             std::process::id(),
