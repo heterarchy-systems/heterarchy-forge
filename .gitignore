@@ -23,11 +23,6 @@ docs/**
 PRODUCT.md
 .codex/
 .impeccable/
-# Repository-local public development harness
-.agents/*
-!.agents/rust_dev_harness/
-!.agents/rust_dev_harness/**
-.agents/rust_dev_harness/ALEXANDRIA_MANIFEST.tsv
 .omx/
 opencode.json
 .opencode
