@@ -863,6 +863,16 @@ impl ControlError {
         }
     }
 
+    pub(crate) fn committed_with_source<E>(source: E) -> Self
+    where
+        E: Error + Send + Sync + 'static,
+    {
+        Self {
+            source: Some(Box::new(source)),
+            ..Self::committed()
+        }
+    }
+
     pub(crate) const fn with_details(mut self, details: ControlErrorDetails) -> Self {
         self.details = details;
         self

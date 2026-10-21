@@ -12,6 +12,157 @@ use uuid::Uuid;
 
 use super::*;
 
+struct PublicationTestRoot(PathBuf);
+
+impl Drop for PublicationTestRoot {
+    fn drop(&mut self) {
+        let _restored = restore_permissions(&self.0);
+        let _removed = fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+fn publication_uncertainty_requires_readback_and_survives_repeated_publish()
+-> Result<(), Box<dyn Error>> {
+    let (root, workspace) = temp_workspace("publish-uncertain")?;
+    let _cleanup = PublicationTestRoot(root.clone());
+    write_relative(&root, "Makefile", b"ci:\n\ttrue\n")?;
+    let id = VerificationInputId::from_uuid(Uuid::now_v7());
+    let mut staged = workspace.stage_verification_input(id, &AtomicBool::new(false))?;
+    let fingerprint = staged.manifest().fingerprint();
+    staged.publish_fault = Some(VerificationInputPublishFault::AfterRenameSync);
+    for result in [staged.publish(), staged.publish()] {
+        assert!(matches!(
+            result,
+            Err(VerificationInputError::PublicationUnconfirmed {
+                id: observed, fingerprint: frozen, ..
+            }) if observed == id && frozen == fingerprint
+        ));
+    }
+    let reopened = workspace.open_verification_input(id, fingerprint)?;
+    reopened.validate()?;
+    assert_eq!(
+        reopened.read_file(
+            &WorkspaceRelativePath::new(PathBuf::from("Makefile"))?,
+            1024,
+            &AtomicBool::new(false)
+        )?,
+        b"ci:\n\ttrue\n"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn publication_reseal_failure_never_admits_the_writable_container() -> Result<(), Box<dyn Error>> {
+    let (root, workspace) = temp_workspace("publish-reseal")?;
+    let _cleanup = PublicationTestRoot(root.clone());
+    write_relative(&root, "Makefile", b"frozen\n")?;
+    let id = VerificationInputId::from_uuid(Uuid::now_v7());
+    let mut staged = workspace.stage_verification_input(id, &AtomicBool::new(false))?;
+    let fingerprint = staged.manifest().fingerprint();
+    staged.publish_fault = Some(VerificationInputPublishFault::Reseal);
+    for result in [staged.publish(), staged.publish()] {
+        assert!(matches!(
+            result,
+            Err(VerificationInputError::PublicationUnconfirmed { .. })
+        ));
+    }
+    assert!(matches!(
+        workspace.open_verification_input(id, fingerprint),
+        Err(VerificationInputError::SnapshotInvalid)
+    ));
+    let final_root = root
+        .join(".heterarchy-forge/artifacts/verification")
+        .join(id.to_string());
+    assert_eq!(
+        fs::metadata(&final_root)?.permissions().mode() & 0o777,
+        0o755
+    );
+    assert_eq!(
+        fs::metadata(final_root.join("manifest"))?
+            .permissions()
+            .mode()
+            & 0o777,
+        0o444
+    );
+    // Simulate explicit recovery of this owned fixture, never a publish retry.
+    fs::set_permissions(&final_root, Permissions::from_mode(0o555))?;
+    workspace
+        .open_verification_input(id, fingerprint)?
+        .validate()?;
+    assert!(matches!(
+        staged.publish(),
+        Err(VerificationInputError::PublicationUnconfirmed { .. })
+    ));
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn publication_atomic_collision_reseals_pending_and_preserves_the_original()
+-> Result<(), Box<dyn Error>> {
+    let (root, workspace) = temp_workspace("publish-collision")?;
+    let _cleanup = PublicationTestRoot(root.clone());
+    write_relative(&root, "Makefile", b"original\n")?;
+    let id = VerificationInputId::from_uuid(Uuid::now_v7());
+    let first = workspace.stage_verification_input(id, &AtomicBool::new(false))?;
+    let published = first.publish()?;
+    write_relative(&root, "Makefile", b"replacement\n")?;
+    let second = workspace.stage_verification_input(id, &AtomicBool::new(false))?;
+    // Exercise the actual NOREPLACE race path after the final-name precheck.
+    assert!(matches!(
+        second.rename_pending_entry(),
+        Err(VerificationInputError::Collision)
+    ));
+    assert_eq!(
+        fs::metadata(pending_root(&root, id))?.permissions().mode() & 0o777,
+        0o555
+    );
+    published.validate()?;
+    assert_eq!(
+        published.read_file(
+            &WorkspaceRelativePath::new(PathBuf::from("Makefile"))?,
+            1024,
+            &AtomicBool::new(false)
+        )?,
+        b"original\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn publication_concurrent_calls_cannot_reopen_the_published_container() -> Result<(), Box<dyn Error>>
+{
+    let (root, workspace) = temp_workspace("publish-concurrent")?;
+    let _cleanup = PublicationTestRoot(root.clone());
+    write_relative(&root, "Makefile", b"frozen\n")?;
+    let id = VerificationInputId::from_uuid(Uuid::now_v7());
+    let staged = workspace.stage_verification_input(id, &AtomicBool::new(false))?;
+    let results = std::thread::scope(|scope| {
+        let first = scope.spawn(|| staged.publish());
+        let second = scope.spawn(|| staged.publish());
+        [first.join(), second.join()]
+    });
+    let mut published = None;
+    let mut rejected = 0;
+    for result in results {
+        match result.map_err(|_| "publication thread panicked")? {
+            Ok(value) => assert!(published.replace(value).is_none()),
+            Err(VerificationInputError::SnapshotStale) => rejected += 1,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    assert_eq!(rejected, 1);
+    published
+        .ok_or("publication did not complete")?
+        .validate()?;
+    workspace
+        .open_verification_input(id, staged.manifest().fingerprint())?
+        .validate()?;
+    Ok(())
+}
+
 fn temp_workspace(label: &str) -> Result<(PathBuf, ConfinedWorkspace), Box<dyn Error>> {
     let root = std::env::temp_dir().join(format!(
         "heterarchy-forge-verification-{label}-{}",
