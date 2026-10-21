@@ -792,6 +792,34 @@ async fn wait_terminal(
     }
 }
 
+fn execution_diagnostics(
+    record: &forge_domain::RegisteredExecution,
+    output: &forge_domain::ExecutionOutputRead,
+) -> String {
+    let bytes: Vec<_> = output
+        .events()
+        .iter()
+        .filter_map(|event| match event {
+            ExecutionOutputEvent::Chunk(chunk) => Some(chunk.bytes()),
+            ExecutionOutputEvent::Gap(_) => None,
+        })
+        .flatten()
+        .copied()
+        .take(4096)
+        .collect();
+    format!(
+        "state={:?}, failure_code={:?}, outcome={:?}, output_has_gaps={}, output_prefix={:?}",
+        record.state(),
+        record.failure_code(),
+        record.outcome(),
+        output
+            .events()
+            .iter()
+            .any(|event| matches!(event, ExecutionOutputEvent::Gap(_))),
+        String::from_utf8_lossy(&bytes)
+    )
+}
+
 async fn wait_for_execution_state(
     client: &ForgeControlClient,
     scope: &ResolvedWorkspaceScope,
@@ -807,10 +835,23 @@ async fn wait_for_execution_state(
             return Ok(record);
         }
         if record.state().is_terminal() {
+            let diagnostic = client
+                .execution_output_read(
+                    scope.clone(),
+                    ExecutionOutputCursor::initial(execution_id),
+                    forge_domain::MIN_EXECUTION_OUTPUT_READ_BYTES,
+                    forge_domain::MAX_EXECUTION_OUTPUT_READ_EVENTS,
+                )
+                .map_or_else(
+                    |error| format!("durable output read failed: {error}"),
+                    |output| execution_diagnostics(&record, &output),
+                );
             return Err(format!(
-                "execution reached {:?} before {:?}",
+                "execution reached {:?} before {:?}; failure_code={:?}; outcome={:?}; {diagnostic}",
                 record.state(),
-                expected
+                expected,
+                record.failure_code(),
+                record.outcome()
             )
             .into());
         }

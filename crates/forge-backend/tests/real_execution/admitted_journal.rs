@@ -183,7 +183,9 @@ async fn real_http_admitted_child_is_cancelled_and_journaled_despite_disabled_ap
             .record
             .outcome()
             .map(forge_domain::ExecutionOutcome::status),
-        Some(forge_domain::ExecutionCompletionStatus::Cancelled)
+        Some(forge_domain::ExecutionCompletionStatus::Cancelled),
+        "{}",
+        super::execution_diagnostics(&proof.record, &proof.output)
     );
     let bytes: Vec<_> = proof
         .output
@@ -341,7 +343,9 @@ async fn disabled_stop_authority_flow(fixture: &Fixture) -> Result<(), Box<dyn s
     assert!(proof.stopped > 0);
     assert_eq!(
         proof.record.state(),
-        forge_domain::ExecutionState::Cancelled
+        forge_domain::ExecutionState::Cancelled,
+        "{}",
+        super::execution_diagnostics(&proof.record, &proof.output)
     );
     assert_durable_authority_cleanup(fixture, &pending, &unused.grant, &auto_scope)
 }
