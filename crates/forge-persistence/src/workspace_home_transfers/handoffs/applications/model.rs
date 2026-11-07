@@ -32,6 +32,13 @@ impl HomeHandoffAcceptanceOutcomeKind {
             Self::Aborted => 2,
         }
     }
+
+    pub(super) const fn encode_tag(self) -> u8 {
+        match self {
+            Self::Applied => 1,
+            Self::Aborted => 2,
+        }
+    }
 }
 
 /// Checked parts supplied by the Source take/abort owner inside its write
@@ -50,6 +57,11 @@ pub(crate) struct HomeHandoffAcceptanceOutcomeRecordParts {
 
 #[must_use]
 #[derive(Debug)]
+#[allow(
+    dead_code,
+    clippy::large_enum_variant,
+    reason = "Applied variant is constructed by the take slice"
+)]
 pub(crate) enum HomeHandoffAcceptanceTerminal {
     Applied {
         predecessor_before: forge_domain::RegisteredAgentAssignment,
@@ -76,6 +88,10 @@ pub struct HomeHandoffAcceptanceOutcomeRecord {
 
 #[must_use]
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "Applied outcome carries fixed-size initial successor and grant snapshots"
+)]
 pub enum HomeHandoffAcceptanceOutcome {
     Applied(HomeHandoffAppliedAcceptance),
     Aborted,
@@ -219,22 +235,20 @@ impl HomeHandoffInitialSuccessorSnapshot {
         pins: &crate::workspace_agent_assignments::home_origin::HomeOriginAssignmentPins,
         acceptance_id: Uuid,
     ) -> bool {
-        let lifecycle_reachable = match (pins.state, pins.cancellation_requested) {
-            (AgentAssignmentState::Running, _) => true,
-            (
-                AgentAssignmentState::Submitted
-                | AgentAssignmentState::Accepted
-                | AgentAssignmentState::Rejected,
-                false,
-            ) => true,
-            (AgentAssignmentState::Cancelled | AgentAssignmentState::Interrupted, true) => true,
-            (AgentAssignmentState::Offered, _)
-            | (AgentAssignmentState::Submitted, true)
-            | (AgentAssignmentState::Accepted, true)
-            | (AgentAssignmentState::Rejected, true)
-            | (AgentAssignmentState::Cancelled, false)
-            | (AgentAssignmentState::Interrupted, false) => false,
-        };
+        let lifecycle_reachable = matches!(
+            (pins.state, pins.cancellation_requested),
+            (AgentAssignmentState::Running, _)
+                | (
+                    AgentAssignmentState::Submitted
+                        | AgentAssignmentState::Accepted
+                        | AgentAssignmentState::Rejected,
+                    false,
+                )
+                | (
+                    AgentAssignmentState::Cancelled | AgentAssignmentState::Interrupted,
+                    true,
+                )
+        );
         pins.origin_kind == 1
             && pins.home_receipt_id == Some(acceptance_id)
             && pins.assignment_id == self.assignment_id
@@ -476,6 +490,10 @@ impl HomeHandoffAppliedAcceptance {
     }
 }
 
+#[allow(
+    clippy::large_types_passed_by_value,
+    reason = "HomeHandoffSourceAssignmentPin is a Copy value object"
+)]
 fn validate_source_pin(
     pin: HomeHandoffSourceAssignmentPin,
     source: &forge_domain::RegisteredAgentAssignment,
@@ -522,6 +540,10 @@ fn validate_source_pin(
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "transition validation checks all exact request, lineage, and assignment pins together"
+)]
 fn validate_transition(
     request: &HomeHandoffTakeRequest,
     source_at: TimestampMillis,

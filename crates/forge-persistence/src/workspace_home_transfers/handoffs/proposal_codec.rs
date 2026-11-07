@@ -112,6 +112,10 @@ pub(super) fn decode_request(
     Ok(request)
 }
 
+#[allow(
+    clippy::large_types_passed_by_value,
+    reason = "HomeHandoffSourceAssignmentPin is a Copy value object"
+)]
 pub(super) fn encode_source(
     source: HomeHandoffSourceAssignmentPin,
 ) -> Result<Vec<u8>, HomeHandoffProposalStoreError> {
@@ -375,6 +379,10 @@ pub(super) fn persisted_evidence(
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one row decoder validates all persisted proposal columns together"
+)]
 pub(super) fn decode_record(
     request_snapshot: &[u8],
     request_digest: &[u8],

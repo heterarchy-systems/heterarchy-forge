@@ -134,6 +134,10 @@ fn validate_columns(connection: &Connection) -> Result<(), Error> {
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "foreign key validation checks every composite Home acceptance reference"
+)]
 fn validate_foreign_keys(connection: &Connection) -> Result<(), Error> {
     let mut statement =
         connection.prepare("PRAGMA foreign_key_list(home_handoff_acceptance_outcomes)")?;

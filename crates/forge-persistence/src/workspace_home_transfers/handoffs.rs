@@ -30,6 +30,10 @@ pub use proposal_model::{
     HomeHandoffProposalOutcome, HomeHandoffProposalRecord, HomeHandoffSourceAssignmentPin,
 };
 pub(crate) use proposal_schema::{create_schema, schema_objects, validate_schema};
+#[allow(
+    unused_imports,
+    reason = "Home handoff take transaction seam is wired by the take slice"
+)]
 pub(crate) use proposals::{
     HomeHandoffProposalHooks, get, get_current, get_current_in_transaction, get_in_transaction,
     propose,

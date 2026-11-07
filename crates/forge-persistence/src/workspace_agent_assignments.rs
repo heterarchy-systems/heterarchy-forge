@@ -261,10 +261,10 @@ fn create_assignment_indexes(connection: &Connection) -> Result<(), AgentAssignm
 pub(crate) fn rebuild_home_origin_table_in_transaction(
     transaction: &Transaction<'_>,
 ) -> Result<(), AgentAssignmentStoreError> {
-    validate_schema_pre_home_handoff(transaction)?;
     const STAGING_TABLE: &str = "agent_assignments_v74_migration";
     const CREATE_TABLE_PREFIX: &str = "CREATE TABLE agent_assignments (";
     const STAGING_TABLE_PREFIX: &str = "CREATE TABLE agent_assignments_v74_migration (";
+    validate_schema_pre_home_handoff(transaction)?;
     let create_sql =
         AGENT_ASSIGNMENTS_TABLE_SQL.replacen(CREATE_TABLE_PREFIX, STAGING_TABLE_PREFIX, 1);
     if create_sql == AGENT_ASSIGNMENTS_TABLE_SQL {
@@ -2417,6 +2417,10 @@ fn insert_assignment(
     insert_assignment_row(transaction, assignment, None)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one row insert binds all durable assignment columns"
+)]
 fn insert_assignment_row(
     transaction: &Transaction<'_>,
     assignment: &RegisteredAgentAssignment,
@@ -2629,6 +2633,10 @@ fn update_assignment(
 /// caller's write transaction. The owning take operation must complete its
 /// live actor, closure, Node/focus, evidence, terminal-ledger and commit checks
 /// in that same transaction. This seam never appends an ordinary offer fact.
+#[allow(
+    dead_code,
+    reason = "Home handoff take transaction seam is wired by the take slice"
+)]
 pub(crate) fn persist_home_handoff_transition_in_transaction(
     transaction: &Transaction<'_>,
     before: &RegisteredAgentAssignment,
@@ -2650,6 +2658,10 @@ pub(crate) fn persist_home_handoff_transition_in_transaction(
     insert_assignment_row(transaction, transition.successor(), Some(acceptance_id))
 }
 
+#[allow(
+    dead_code,
+    reason = "Home handoff take transaction seam is wired by the take slice"
+)]
 fn validate_home_handoff_assignment_transition(
     before: &RegisteredAgentAssignment,
     transition: &forge_domain::AgentAssignmentHomeHandoffTransition,

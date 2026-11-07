@@ -12,6 +12,10 @@ fn downgrade_current_store_to_v73(
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "end-to-end migration test verifies downgrade, upgrade, foreign keys, and reopen"
+)]
 fn schema_v73_migration_preserves_ordinary_assignment_and_reopens()
 -> Result<(), Box<dyn std::error::Error>> {
     let (root, _layout, mut store, activity_id) = store_with_live_activity("home-handoff-v73")?;

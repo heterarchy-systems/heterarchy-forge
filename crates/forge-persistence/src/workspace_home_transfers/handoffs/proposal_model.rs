@@ -110,6 +110,10 @@ impl HomeHandoffSourceAssignmentPin {
         })
     }
 
+    #[allow(
+        clippy::large_types_passed_by_value,
+        reason = "SourceAssignmentPinParts is a Copy value builder"
+    )]
     pub(super) fn from_parts(
         parts: SourceAssignmentPinParts,
     ) -> Result<Self, HomeHandoffProposalStoreError> {
@@ -263,6 +267,10 @@ pub struct HomeHandoffProposalRecord {
 }
 
 impl HomeHandoffProposalRecord {
+    #[allow(
+        clippy::large_types_passed_by_value,
+        reason = "HomeHandoffProposalRequest and HomeHandoffSourceAssignmentPin are Copy value objects"
+    )]
     pub(super) fn new(
         request: HomeHandoffProposalRequest,
         case_revision: i64,
@@ -370,6 +378,10 @@ pub struct HomeHandoffCaseSnapshot {
 }
 
 impl HomeHandoffCaseSnapshot {
+    #[allow(
+        clippy::large_types_passed_by_value,
+        reason = "HomeHandoffProposalRecord is a Copy value object"
+    )]
     pub(super) fn new(
         handoff_id: Uuid,
         preparation_id: Uuid,

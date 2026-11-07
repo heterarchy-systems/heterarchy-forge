@@ -1,4 +1,4 @@
-//! Canonical assignment table SQL shared with schema migration fixtures.
+// Canonical assignment table SQL shared with schema migration fixtures.
 
 pub(crate) const CREDIT_BUDGET_COLUMN_SQL: &str =
     "credit_budget INTEGER CHECK(credit_budget IS NULL OR credit_budget IN (1,3,5))";

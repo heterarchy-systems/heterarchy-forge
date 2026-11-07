@@ -126,7 +126,7 @@ pub(crate) fn read(
             },
         )
         .optional()?;
-    raw.map(decode).transpose()
+    raw.as_ref().map(decode).transpose()
 }
 
 pub(crate) fn decode_origin(
@@ -155,7 +155,7 @@ pub(crate) fn decode_origin(
 }
 
 fn decode(
-    raw: RawHomeOriginAssignmentPins,
+    raw: &RawHomeOriginAssignmentPins,
 ) -> Result<HomeOriginAssignmentPins, AgentAssignmentStoreError> {
     let assignment_id =
         AgentAssignmentId::from_uuid(decode_uuid("assignment.assignment_id", &raw.assignment_id)?);

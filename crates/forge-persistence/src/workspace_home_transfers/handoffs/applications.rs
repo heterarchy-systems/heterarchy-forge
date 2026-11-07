@@ -141,6 +141,7 @@ pub(crate) fn get_outcome(
         return Err(Error::Conflict("acceptance identity"));
     }
     read_raw_outcome(connection, acceptance_id)?
+        .as_ref()
         .map(|raw| decode_outcome(connection, acceptance_id, raw))
         .transpose()
 }
@@ -348,7 +349,7 @@ pub(crate) fn home_origin_matches_applied_receipt(
 }
 
 /// Low-level assignment decoder hook. The Application record was checked via
-/// raw assignment pins in get_outcome; this path never calls the full decoder.
+/// raw assignment pins in `get_outcome`; this path never calls the full decoder.
 pub(crate) fn get_applied_origin_for_assignment(
     connection: &Connection,
     successor_assignment_id: AgentAssignmentId,
@@ -392,9 +393,9 @@ pub(crate) fn get_applied_origin_for_assignment(
 fn decode_outcome(
     connection: &Connection,
     acceptance_id: Uuid,
-    raw: RawOutcome,
+    raw: &RawOutcome,
 ) -> Result<HomeHandoffAcceptanceOutcomeRecord, Error> {
-    let record = decode_stored_outcome(acceptance_id, &raw)?;
+    let record = decode_stored_outcome(acceptance_id, raw)?;
     validate_record_references(connection, &record)?;
     Ok(record)
 }
@@ -511,6 +512,10 @@ fn validate_record_references(
     Ok(())
 }
 
+#[allow(
+    clippy::type_complexity,
+    reason = "four fixed 17-byte substr columns read the case identity row"
+)]
 fn validate_case_reference(
     connection: &Connection,
     record: &HomeHandoffAcceptanceOutcomeRecord,
@@ -697,6 +702,10 @@ fn validate_immediate_ancestor_record(
     Ok(())
 }
 
+#[allow(
+    clippy::large_types_passed_by_value,
+    reason = "HomeHandoffSourceAssignmentPin is a Copy value object"
+)]
 fn validate_root_assignment_reference(
     connection: &Connection,
     root_id: AgentAssignmentId,
@@ -721,6 +730,10 @@ fn validate_root_assignment_reference(
     Ok(())
 }
 
+#[allow(
+    clippy::large_types_passed_by_value,
+    reason = "HomeHandoffSourceAssignmentPin is a Copy value object"
+)]
 fn validate_applied_assignments(
     connection: &Connection,
     record: &HomeHandoffAcceptanceOutcomeRecord,
@@ -879,6 +892,10 @@ mod tests {
         [byte; DIGEST_BYTES]
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "test fixture constructs complete valid predecessor, transition, grant, and outcome pins"
+    )]
     fn fixture() -> Result<
         (
             HomeHandoffAcceptanceOutcomeRecord,

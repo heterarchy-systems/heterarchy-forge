@@ -169,7 +169,7 @@ where
         HomeHandoffSourceAssignmentPin::from_assignment(&assignment, root_assignment_id, lineage)?;
     validate_prepared_assignment_pin(&prepared, &prepared_inventory, source)?;
     let case = load_case(&transaction, request.handoff_id())?;
-    let head = validate_case_for_request(&transaction, request, &source, &case)?;
+    let head = validate_case_for_request(&transaction, request, &source, case.as_ref())?;
     if let Some(head) = head {
         if hooks.handoff_is_applied(&transaction, request.handoff_id())? {
             return Err(Error::Conflict(
@@ -317,7 +317,7 @@ where
 
     let readback = match get(connection, request.handoff_id(), request.proposal_id()) {
         Ok(Some(readback)) if readback == record => readback,
-        Ok(Some(_)) | Ok(None) | Err(_) => {
+        Ok(Some(_) | None) | Err(_) => {
             return Err(Error::ReadbackRequired {
                 handoff_id: request.handoff_id(),
                 proposal_id: request.proposal_id(),
@@ -433,6 +433,10 @@ pub(crate) fn get_current_in_transaction(
     .map(Some)
 }
 
+#[allow(
+    clippy::large_types_passed_by_value,
+    reason = "HomeHandoffProposalRecord is a Copy value object"
+)]
 fn replay_or_conflict(
     request: &HomeHandoffProposalRequest,
     existing: HomeHandoffProposalRecord,
@@ -504,6 +508,11 @@ fn read_prepared_parent_and_inventory_in_transaction(
 
 /// Reuse the exact Prepared assignment check from other handoff owners without
 /// opening a nested transaction or rechecking current Coordinator eligibility.
+#[allow(
+    clippy::large_types_passed_by_value,
+    clippy::too_many_lines,
+    reason = "HomeHandoffSourceAssignmentPin is a Copy value object and Prepared inventory checks all assignment pins together"
+)]
 pub(super) fn validate_prepared_assignment_pin(
     parent: &HomeTransferSourceRecord,
     inventory: &HomeTransferSourceInventory,
@@ -938,7 +947,7 @@ fn validate_case_for_request(
     transaction: &Transaction<'_>,
     request: &HomeHandoffProposalRequest,
     source: &HomeHandoffSourceAssignmentPin,
-    case: &Option<CaseIdentity>,
+    case: Option<&CaseIdentity>,
 ) -> Result<Option<HeadPointer>, Error> {
     match case {
         None => {
@@ -1377,7 +1386,7 @@ fn load_case(connection: &Connection, handoff_id: Uuid) -> Result<Option<CaseIde
             },
         )
         .optional()?;
-    raw.map(decode_case).transpose()
+    raw.as_ref().map(decode_case).transpose()
 }
 
 #[derive(Debug)]
@@ -1395,7 +1404,7 @@ struct RawCase {
     opened_at_ms: i64,
 }
 
-fn decode_case(raw: RawCase) -> Result<CaseIdentity, Error> {
+fn decode_case(raw: &RawCase) -> Result<CaseIdentity, Error> {
     if raw.handoff_id_len != 16
         || raw.preparation_id_len != 16
         || raw.workspace_id_len != 16
@@ -1491,10 +1500,10 @@ fn load_proposal_by_id(
             },
         )
         .optional()?;
-    raw.map(decode_proposal).transpose()
+    raw.as_ref().map(decode_proposal).transpose()
 }
 
-fn decode_proposal(raw: RawProposal) -> Result<HomeHandoffProposalRecord, Error> {
+fn decode_proposal(raw: &RawProposal) -> Result<HomeHandoffProposalRecord, Error> {
     if raw.proposal_id_len != 16
         || raw.handoff_id_len != 16
         || raw.preparation_id_len != 16

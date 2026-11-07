@@ -44,6 +44,10 @@ pub(super) fn decode_take_request(
     Ok(request)
 }
 
+#[allow(
+    clippy::large_types_passed_by_value,
+    reason = "HomeHandoffAcceptanceGrant is a Copy value object"
+)]
 pub(super) fn encode_grant_snapshot(grant: HomeHandoffAcceptanceGrant) -> Result<Vec<u8>, Error> {
     let mut bytes = Vec::with_capacity(MAX_GRANT_SNAPSHOT_BYTES);
     bytes.extend_from_slice(GRANT_MAGIC);
@@ -154,6 +158,10 @@ pub(super) fn decode_grant_snapshot(snapshot: &[u8]) -> Result<HomeHandoffAccept
     Ok(grant)
 }
 
+#[allow(
+    clippy::large_types_passed_by_value,
+    reason = "HomeHandoffInitialSuccessorSnapshot is a Copy value object"
+)]
 pub(super) fn encode_successor_snapshot(successor: HomeHandoffInitialSuccessorSnapshot) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(MAX_SUCCESSOR_SNAPSHOT_BYTES);
     bytes.extend_from_slice(SUCCESSOR_MAGIC);
@@ -305,7 +313,7 @@ pub(super) fn payload_digest(
     append_uuid(&mut bytes, record.predecessor_id().into_uuid());
     append_uuid(&mut bytes, record.root_assignment_id().into_uuid());
     append_i64(&mut bytes, record.source_at().get());
-    bytes.push(record.outcome_kind().encode() as u8);
+    bytes.push(record.outcome_kind().encode_tag());
     if let Some(applied) = record.applied() {
         append_i64(&mut bytes, applied.predecessor_revision_before().get());
         append_i64(&mut bytes, applied.predecessor_revision_after().get());
@@ -321,6 +329,10 @@ pub(super) fn payload_digest(
     Ok(digest.finalize().into())
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one row decoder validates all persisted acceptance columns together"
+)]
 pub(super) fn decode_stored_record(
     request_snapshot: &[u8],
     request_digest: &[u8],

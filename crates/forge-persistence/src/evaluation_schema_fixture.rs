@@ -3,8 +3,9 @@
 
 use rusqlite::{Connection, OptionalExtension};
 
-#[path = "workspace_agent_assignments/table_sql.rs"]
-mod assignment_table_sql;
+mod assignment_table_sql {
+    include!("workspace_agent_assignments/table_sql.rs");
+}
 
 use assignment_table_sql::{
     AGENT_ASSIGNMENTS_TABLE_SQL, AGENT_ASSIGNMENTS_TABLE_SQL_V73,
@@ -68,6 +69,10 @@ const PREVIOUS_HOME_ORIGIN_SCHEMA_VERSION: i64 = 73;
 /// Remove only empty v74 Home-handoff state and restore the exact legacy v73
 /// Assignment shape. Ordinary Assignment rows and their child rows survive.
 /// The shared source file is also included by downstream integration tests.
+#[allow(
+    clippy::too_many_lines,
+    reason = "fixture downgrade verifies and restores the complete v73 assignment shape atomically"
+)]
 pub(crate) fn downgrade_home_assignment_origin_to_v73(
     connection: &Connection,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -156,6 +161,7 @@ pub(crate) fn downgrade_home_assignment_origin_to_v73(
         connection.pragma_query_value(None, "legacy_alter_table", |row| row.get(0))?;
 
     let downgrade = (|| {
+        const STAGING_TABLE: &str = "agent_assignments_home_handoff_fixture";
         connection.pragma_update(None, "foreign_keys", false)?;
         connection.pragma_update(None, "legacy_alter_table", true)?;
         let transaction = connection.unchecked_transaction()?;
@@ -163,7 +169,6 @@ pub(crate) fn downgrade_home_assignment_origin_to_v73(
             transaction.execute_batch(&format!("DROP TABLE IF EXISTS {table}"))?;
         }
 
-        const STAGING_TABLE: &str = "agent_assignments_home_handoff_fixture";
         let old_ddl = AGENT_ASSIGNMENTS_TABLE_SQL_V73.replacen(
             "CREATE TABLE agent_assignments (",
             "CREATE TABLE agent_assignments_home_handoff_fixture (",
@@ -199,7 +204,7 @@ pub(crate) fn downgrade_home_assignment_origin_to_v73(
     let migrated_sql = schema_sql(connection, "table", "agent_assignments")?
         .ok_or("Assignment table disappeared during fixture downgrade")?;
     if !assignment_schema_matches(&migrated_sql, AGENT_ASSIGNMENTS_TABLE_SQL_V73)
-        || schema_objects_with_prefix(connection, "home_handoff_")?.len() != 0
+        || !schema_objects_with_prefix(connection, "home_handoff_")?.is_empty()
         || table_row_count(connection, "agent_assignments")? != assignment_count
         || table_row_count(connection, "agent_assignment_sources")? != source_count
         || assignment_indexes(connection)? != indexes
