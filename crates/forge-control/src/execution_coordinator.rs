@@ -3528,7 +3528,6 @@ fn derive_approved_agent_action(
         (ExecutionKind::Structured { .. }, Some(ProjectCommandClass::GeneratedPackage)) => {
             Ok(ExecutionActionClass::GeneratedProjectCommand)
         }
-        (ExecutionKind::Shell { .. }, None) => Ok(ExecutionActionClass::AnalyzedShell),
         _ => Err(ForgeExecutionCoordinatorError::AttributionMismatch),
     }
 }
@@ -3546,17 +3545,15 @@ fn validate_start_request(
             ExecutionActionClass::DiscoveredProjectCommand,
             true,
             Some(ProjectCommandClass::Verify)
-        ) | (ExecutionActionClass::AnalyzedShell, true, None)
-            | (
-                ExecutionActionClass::GeneratedProjectCommand,
-                true,
-                Some(ProjectCommandClass::GeneratedPackage)
-            )
-            | (
-                ExecutionActionClass::DirectStructured | ExecutionActionClass::ShellEscape,
-                false,
-                None
-            )
+        ) | (
+            ExecutionActionClass::GeneratedProjectCommand,
+            true,
+            Some(ProjectCommandClass::GeneratedPackage)
+        ) | (
+            ExecutionActionClass::DirectStructured | ExecutionActionClass::ShellEscape,
+            false,
+            None
+        )
     );
     if start.request.workspace_id() != start.scope.workspace_id()
         || start.request.activity_id() != start.activity_id
@@ -3603,24 +3600,7 @@ fn derive_launch_kind_parts(
             Ok(ExecutionLaunchKind::RustCi)
         }
         ExecutionActionClass::AnalyzedShell => {
-            let authority =
-                agent_authority.ok_or(ForgeExecutionCoordinatorError::AttributionMismatch)?;
-            let ExecutionKind::Shell { script } = request.kind() else {
-                return Err(ForgeExecutionCoordinatorError::AttributionMismatch);
-            };
-            let analyzed = crate::shell::analyze_shell_script(script.as_str().to_owned())
-                .map_err(|_| ForgeExecutionCoordinatorError::AttributionMismatch)?;
-            if analyzed.intent_id() != &authority.command_id
-                || analyzed.permissions() != request.permissions()
-            {
-                return Err(ForgeExecutionCoordinatorError::AttributionMismatch);
-            }
-            if analyzed.requires_rust_tooling() {
-                revalidate_rust_tooling(capability)?;
-                Ok(ExecutionLaunchKind::RustCi)
-            } else {
-                Ok(ExecutionLaunchKind::Baseline)
-            }
+            Err(ForgeExecutionCoordinatorError::AttributionMismatch)
         }
         ExecutionActionClass::GeneratedProjectCommand => {
             let evidence =

@@ -2,8 +2,8 @@
 //!
 //! Execution commands carry the complete Agent/Workspace/Goal/DAG/node
 //! authority tuple.  The transport never accepts a caller-selected program,
-//! argv, timeout, output root, or permission set.  Shell text is analyzed by
-//! forge-control and project commands are resolved from a fenced catalog.
+//! argv, timeout, output root, or permission set.  Project commands are
+//! resolved from a fenced catalog.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
@@ -18,9 +18,8 @@ use forge_control::{
 };
 use forge_domain::{
     AgentInstanceId, AgentInstanceRevision, AgentSessionId, DagNodeId, ExecutionAdmissionActor,
-    ExecutionAdmissionRequest, ExecutionAdmissionScope, ExecutionAttribution, ExecutionCommandId,
-    ExecutionId, ExecutionKind, ExecutionLimits, ExecutionOutputCursor, ExecutionOutputLimit,
-    ExecutionRequest, ExecutionRequestDigest, ExecutionTimeoutMillis, ForgeBackendId, GoalId,
+    ExecutionAdmissionRequest, ExecutionAdmissionScope, ExecutionCommandId, ExecutionId,
+    ExecutionOutputCursor, ExecutionRequest, ExecutionRequestDigest, ForgeBackendId, GoalId,
     GoalNodeAttribution, OrchestrationIssuerId, ProjectCommandCatalogFingerprint,
     ProjectCommandEvidence, RuntimeInstanceId, TimestampMillis, WorkspaceId,
 };
@@ -33,7 +32,6 @@ use crate::ops::{
 
 const DEFAULT_MAX_BYTES: u64 = 64 * 1024;
 const DEFAULT_MAX_EVENTS: usize = 128;
-const SHELL_TIMEOUT_MILLIS: u64 = 10 * 60 * 1_000;
 
 /// Shared strict authority fields for all Agent execution commands.
 #[derive(Debug, Clone, Deserialize)]
@@ -75,9 +73,6 @@ pub(crate) struct ExecutionAdmissionDto {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum ExecutionModeDto {
-    AnalyzedShell {
-        script: String,
-    },
     SealedProjectCommand {
         command_id: String,
         expected_catalog_fingerprint: String,
@@ -130,7 +125,6 @@ pub(crate) struct ExecutionAuthoritySpec {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ExecutionModeSpec {
-    Shell(String),
     Project {
         command_id: forge_control::ProjectCommandId,
         fingerprint: ProjectCommandCatalogFingerprint,
@@ -236,7 +230,6 @@ pub(crate) fn parse_begin(
     let dto: ExecutionBeginDto = super::parse_body(payload, "execution.begin payload is invalid")?;
     let authority = parse_authority(dto.authority)?;
     let mode = match dto.mode {
-        ExecutionModeDto::AnalyzedShell { script } => ExecutionModeSpec::Shell(script),
         ExecutionModeDto::SealedProjectCommand {
             command_id,
             expected_catalog_fingerprint,
@@ -320,40 +313,6 @@ pub(super) fn parse_read_fields(dto: ExecutionReadDto) -> Result<ExecutionReadCo
         max_bytes: dto.max_bytes,
         max_events: dto.max_events,
     })
-}
-
-fn build_shell_request(
-    authority: &ExecutionAuthoritySpec,
-    script: String,
-) -> Result<ExecutionRequest, ForgeError> {
-    let analyzed = forge_control::analyze_shell_script(script)
-        .map_err(|_| ForgeError::invalid_input("execution shell script is not allowed"))?;
-    if analyzed.intent_id() != &authority.agent_authority.command_id {
-        return Err(ForgeError::invalid_input(
-            "execution shell command identity does not match analysis",
-        ));
-    }
-    if analyzed.permissions().workspace_write() {
-        return Err(ForgeError::invalid_input(
-            "execution shell command requires the controlled project lane",
-        ));
-    }
-    let timeout = ExecutionTimeoutMillis::new(SHELL_TIMEOUT_MILLIS)
-        .map_err(|_| ForgeError::invalid_input("execution timeout is invalid"))?;
-    ExecutionRequest::new(
-        ExecutionAttribution::new(
-            authority.execution_id,
-            authority.scope.workspace_id(),
-            authority.activity.activity_id,
-        ),
-        ExecutionKind::Shell {
-            script: analyzed.script().clone(),
-        },
-        None,
-        ExecutionLimits::new(timeout, ExecutionOutputLimit::DEFAULT),
-        analyzed.permissions(),
-    )
-    .map_err(|_| ForgeError::invalid_input("execution request is invalid"))
 }
 
 fn build_admission(
@@ -442,10 +401,6 @@ pub(crate) fn execute_begin(
         return Err(ForgeError::auth_failed());
     }
     let (request, project_command) = match &command.mode {
-        ExecutionModeSpec::Shell(script) => (
-            build_shell_request(&command.authority, script.clone())?,
-            None,
-        ),
         ExecutionModeSpec::Project {
             command_id,
             fingerprint,
@@ -851,8 +806,7 @@ mod tests {
     }
 }
 
-/// One approval-submission command. The shell variant carries the analyzed
-/// script text; the command variant carries the sealed catalog fingerprint.
+/// One approval-submission command carrying the sealed catalog fingerprint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionSubmissionCommand {
     pub(crate) authority: ExecutionAuthoritySpec,
@@ -861,9 +815,6 @@ pub struct ExecutionSubmissionCommand {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecutionSubmissionMode {
-    Shell {
-        script: String,
-    },
     SealedProjectCommand {
         fingerprint: ProjectCommandCatalogFingerprint,
         command_id: ProjectCommandId,
@@ -872,13 +823,10 @@ pub enum ExecutionSubmissionMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubmissionKind {
-    Shell,
     SealedProjectCommand,
 }
 
-/// Parse one approval-submission command (shell.submit / command.submit).
-/// Both ingress paths share the execution authority DTO; each op admits
-/// exactly its own variant.
+/// Parse one approval-submission command (`command.submit`).
 pub fn parse_submission(
     payload: &serde_json::Value,
     kind: SubmissionKind,
@@ -888,24 +836,11 @@ pub fn parse_submission(
     struct Body {
         authority: ExecutionAuthorityDto,
         #[serde(default)]
-        script: Option<String>,
-        #[serde(default)]
         expected_catalog_fingerprint: Option<String>,
     }
     let body: Body = super::parse_body(payload, "execution submission payload is invalid")?;
     let authority = parse_authority(body.authority)?;
     match kind {
-        SubmissionKind::Shell => {
-            let Some(script) = body.script else {
-                return Err(ForgeError::invalid_input(
-                    "shell.submit requires the script field",
-                ));
-            };
-            Ok(ExecutionSubmissionCommand {
-                authority,
-                mode: ExecutionSubmissionMode::Shell { script },
-            })
-        }
         SubmissionKind::SealedProjectCommand => {
             let Some(fingerprint) = body.expected_catalog_fingerprint else {
                 return Err(ForgeError::invalid_input(
@@ -933,10 +868,6 @@ fn server_now_millis() -> Result<TimestampMillis, ForgeError> {
     decode_timestamp(i64::try_from(millis).unwrap_or(0))
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "The two sealed-ingress flows stay side by side for review."
-)]
 pub(crate) fn execute_submission(
     client: &ForgeControlClient,
     execution: &ForgeExecutionCoordinatorClient,
@@ -949,48 +880,6 @@ pub(crate) fn execute_submission(
         .verify_agent_execution_authority(authority.agent_authority.clone())
         .map_err(|error| ForgeError::from_control_view(&error.view()))?;
     let submit = match &command.mode {
-        ExecutionSubmissionMode::Shell { script } => {
-            let analyzed = forge_control::analyze_shell_script(script.clone())
-                .map_err(|_| ForgeError::invalid_input("execution shell script is not allowed"))?;
-            if analyzed.intent_id() != &authority.agent_authority.command_id {
-                return Err(ForgeError::invalid_input(
-                    "execution shell command identity does not match analysis",
-                ));
-            }
-            if analyzed.permissions().workspace_write() {
-                return Err(ForgeError::invalid_input(
-                    "execution shell command requires the controlled project lane",
-                ));
-            }
-            if analyzed.requires_rust_tooling() && !execution.rust_ci_available() {
-                return Err(ForgeError::capacity_exceeded(
-                    "the Rust CI toolchain is unavailable",
-                ));
-            }
-            let timeout = ExecutionTimeoutMillis::new(SHELL_TIMEOUT_MILLIS)
-                .map_err(|_| ForgeError::invalid_input("execution timeout is invalid"))?;
-            let request = ExecutionRequest::new(
-                ExecutionAttribution::new(
-                    authority.execution_id,
-                    authority.scope.workspace_id(),
-                    authority.activity.activity_id,
-                ),
-                ExecutionKind::Shell {
-                    script: analyzed.script().clone(),
-                },
-                None,
-                ExecutionLimits::new(timeout, ExecutionOutputLimit::DEFAULT),
-                analyzed.permissions(),
-            )
-            .map_err(|_| ForgeError::invalid_input("execution request is invalid"))?;
-            forge_control::SubmitExecutionForApproval::analyzed_shell(
-                authority.scope.clone(),
-                authority.activity.activity_id,
-                runtime_instance_id,
-                request,
-            )
-            .map_err(|_| ForgeError::internal())?
-        }
         ExecutionSubmissionMode::SealedProjectCommand {
             fingerprint,
             command_id,

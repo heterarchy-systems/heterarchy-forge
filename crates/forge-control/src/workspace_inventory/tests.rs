@@ -114,7 +114,7 @@ fn inventory_returns_registered_child_and_skips_uninitialized_sibling()
 }
 
 #[test]
-fn inventory_resolves_v68_workspace_read_only_before_normal_open_migrates_to_v69()
+fn inventory_resolves_v68_workspace_read_only_before_normal_open_migrates_to_current()
 -> Result<(), Box<dyn std::error::Error>> {
     let fixture = fixture("v68-before-supervised-host-open")?;
     let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(0x10_6801));
@@ -126,6 +126,7 @@ fn inventory_resolves_v68_workspace_read_only_before_normal_open_migrates_to_v69
     let old = Connection::open(&database_path)?;
     old.pragma_update(None, "journal_mode", "DELETE")?;
     old.execute_batch("DROP TABLE quiescent_activity_lease_resume_receipts")?;
+    crate::legacy_agent_fixture::remove_empty_evaluation_schema(&old)?;
     old.pragma_update(None, "user_version", 68_i64)?;
     drop(old);
 
@@ -170,7 +171,10 @@ fn inventory_resolves_v68_workspace_read_only_before_normal_open_migrates_to_v69
         resolved.locator(),
     )?;
     assert_eq!(opened_scope, resolved);
-    assert_eq!(migrated.health()?.schema_version(), 69);
+    assert_eq!(
+        migrated.health()?.schema_version(),
+        forge_persistence::CURRENT_WORKSPACE_SCHEMA_VERSION
+    );
     drop(migrated);
 
     let current = Connection::open(&database_path)?;
@@ -181,10 +185,13 @@ fn inventory_resolves_v68_workspace_read_only_before_normal_open_migrates_to_v69
         [],
         |row| row.get(0),
     )?;
-    assert_eq!(version_after_open, 69);
+    assert_eq!(
+        version_after_open,
+        forge_persistence::CURRENT_WORKSPACE_SCHEMA_VERSION
+    );
     assert!(
         q_table_after_open,
-        "normal open owns the v68 to v69 migration"
+        "normal open owns the v68 to current schema migration"
     );
     drop(current);
     fixture.cleanup()

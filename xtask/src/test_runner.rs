@@ -12,8 +12,8 @@ use sha2::{Digest, Sha256};
 
 pub(super) const COMMAND: &str = "test-runner";
 
+const TMPDIR: &str = "TMPDIR";
 const FORGE_VERIFY_TMPDIR: &str = "FORGE_VERIFY_TMPDIR";
-const FORGE_PACKAGE_V_WORKSPACE_ROOT: &str = "FORGE_PACKAGE_V_WORKSPACE_ROOT";
 const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 const COPY_BUFFER_SIZE: usize = 16 * 1024;
 #[cfg(target_os = "macos")]
@@ -76,56 +76,72 @@ fn cargo_runner_config_for(host: &str, executable: &Path) -> Result<String, Stri
     ))
 }
 
-pub(super) fn validate_internal_directory(directory: &Path) -> Result<PathBuf, String> {
-    if !directory.is_absolute() {
-        return Err(format!(
-            "{FORGE_VERIFY_TMPDIR} must be an absolute existing internal directory"
-        ));
-    }
-    if is_external_volume_path(directory) {
-        return Err(format!(
-            "{FORGE_VERIFY_TMPDIR} must be on an internal filesystem outside /Volumes"
-        ));
-    }
-    let metadata = fs::symlink_metadata(directory)
-        .map_err(|error| format!("cannot inspect {FORGE_VERIFY_TMPDIR}: {error}"))?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(format!(
-            "{FORGE_VERIFY_TMPDIR} must be a real directory, not a file or symlink"
-        ));
-    }
-    let canonical = fs::canonicalize(directory)
-        .map_err(|error| format!("cannot resolve {FORGE_VERIFY_TMPDIR}: {error}"))?;
-    if is_external_volume_path(&canonical) {
-        return Err(format!(
-            "{FORGE_VERIFY_TMPDIR} must be on an internal filesystem outside /Volumes"
-        ));
-    }
-    Ok(canonical)
+pub(super) fn validate_temporary_directory(directory: &Path) -> Result<PathBuf, String> {
+    validate_existing_directory(directory, TMPDIR)
 }
 
-fn is_external_volume_path(path: &Path) -> bool {
-    path.starts_with(Path::new("/Volumes"))
+pub(super) fn validate_verification_directory(directory: &Path) -> Result<PathBuf, String> {
+    let temporary_base = configured_temporary_base()?;
+    validate_verification_directory_under(&temporary_base, directory)
+}
+
+fn validate_existing_directory(directory: &Path, setting: &str) -> Result<PathBuf, String> {
+    if !directory.is_absolute() {
+        return Err(format!("{setting} must be an absolute existing directory"));
+    }
+    let metadata = fs::symlink_metadata(directory)
+        .map_err(|error| format!("cannot inspect {setting}: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!(
+            "{setting} must be a real directory, not a file or symlink"
+        ));
+    }
+    fs::canonicalize(directory).map_err(|error| format!("cannot resolve {setting}: {error}"))
+}
+
+pub(super) fn validate_verification_directory_under(
+    base: &Path,
+    directory: &Path,
+) -> Result<PathBuf, String> {
+    let base = validate_temporary_directory(base)?;
+    let directory = validate_existing_directory(directory, FORGE_VERIFY_TMPDIR)?;
+    if !directory.starts_with(&base) {
+        return Err(format!(
+            "{FORGE_VERIFY_TMPDIR} must be inside the configured {TMPDIR} directory"
+        ));
+    }
+    Ok(directory)
 }
 
 fn runner_temporary_base() -> Result<PathBuf, String> {
-    let directory =
-        env::var_os(FORGE_VERIFY_TMPDIR).map_or_else(default_temporary_directory, PathBuf::from);
-    validate_internal_directory(&directory)
+    let temporary_base = env::var_os(TMPDIR).map(PathBuf::from);
+    let verification_directory = env::var_os(FORGE_VERIFY_TMPDIR).map(PathBuf::from);
+    runner_temporary_base_from_configured(
+        temporary_base.as_deref(),
+        verification_directory.as_deref(),
+    )
 }
 
-fn default_temporary_directory() -> PathBuf {
-    #[cfg(target_os = "macos")]
-    {
-        PathBuf::from("/private/tmp")
-    }
-    #[cfg(target_os = "linux")]
-    {
-        PathBuf::from("/tmp")
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        env::temp_dir()
+pub(super) fn configured_temporary_base() -> Result<PathBuf, String> {
+    let temporary_base = env::var_os(TMPDIR).map(PathBuf::from);
+    configured_temporary_base_from(temporary_base.as_deref())
+}
+
+fn configured_temporary_base_from(directory: Option<&Path>) -> Result<PathBuf, String> {
+    let directory = directory.ok_or_else(|| {
+        format!("{TMPDIR} must be explicitly configured as an absolute existing directory")
+    })?;
+    validate_temporary_directory(directory)
+}
+
+fn runner_temporary_base_from_configured(
+    temporary_base: Option<&Path>,
+    verification_directory: Option<&Path>,
+) -> Result<PathBuf, String> {
+    let temporary_base = configured_temporary_base_from(temporary_base)?;
+    match verification_directory {
+        Some(directory) => validate_verification_directory_under(&temporary_base, directory),
+        None => Ok(temporary_base),
     }
 }
 
@@ -184,16 +200,13 @@ fn propagate_status(status: ExitStatus) -> ! {
 struct TestRunnerSandbox {
     root: PrivateDirectory,
     executable: PathBuf,
-    workspace_root: PathBuf,
     temporary_directory: PathBuf,
 }
 
 impl TestRunnerSandbox {
     fn create(executable: &Path, base: &Path) -> Result<Self, String> {
-        let base = validate_internal_directory(base)?;
+        let base = validate_temporary_directory(base)?;
         let root = PrivateDirectory::create(&base, "heterarchy-forge-test-runner")?;
-        let workspace_root = root.path.join("workspace");
-        create_private_child_directory(&workspace_root)?;
         let temporary_directory = root.path.join("tmp");
         create_private_child_directory(&temporary_directory)?;
         let copied_executable = root.path.join("test-executable");
@@ -201,18 +214,22 @@ impl TestRunnerSandbox {
         Ok(Self {
             root,
             executable: copied_executable,
-            workspace_root,
             temporary_directory,
         })
     }
 
     fn command(&self, arguments: &[OsString]) -> Command {
         let mut command = Command::new(&self.executable);
+        self.configure_command(&mut command, arguments);
+        command
+    }
+
+    fn configure_command(&self, command: &mut Command, arguments: &[OsString]) {
         command
             .args(arguments)
-            .env(FORGE_PACKAGE_V_WORKSPACE_ROOT, &self.workspace_root)
-            .env("TMPDIR", &self.temporary_directory);
-        command
+            .env(TMPDIR, &self.temporary_directory)
+            .env_remove("FORGE_PACKAGE_V_WORKSPACE_ROOT")
+            .env_remove(FORGE_VERIFY_TMPDIR);
     }
 
     fn cleanup(&mut self) -> Result<(), String> {
@@ -433,14 +450,15 @@ mod tests {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt, symlink};
     use std::os::unix::process::ExitStatusExt;
     use std::path::Path;
+    use std::process::Command;
 
     use super::{
-        COMMAND, PrivateDirectory, TestRunnerSandbox, cargo_runner_config_for,
-        is_external_volume_path, run_child,
+        COMMAND, FORGE_VERIFY_TMPDIR, PrivateDirectory, TestRunnerSandbox, cargo_runner_config_for,
+        run_child, validate_temporary_directory,
     };
 
     fn scratch_directory() -> Result<PrivateDirectory, String> {
-        let base = super::validate_internal_directory(&super::default_temporary_directory())?;
+        let base = super::runner_temporary_base()?;
         PrivateDirectory::create(&base, "heterarchy-forge-test-runner-test")
     }
 
@@ -475,12 +493,42 @@ mod tests {
     }
 
     #[test]
-    fn external_temp_paths_are_refused_before_filesystem_access() {
-        assert!(is_external_volume_path(Path::new("/Volumes/forge-tests")));
-        assert!(!is_external_volume_path(Path::new(
-            "/private/tmp/forge-tests"
-        )));
-        assert!(super::validate_internal_directory(Path::new("/Volumes/forge-tests")).is_err());
+    fn configured_temporary_storage_is_required_and_verification_overrides_stay_within_it()
+    -> Result<(), String> {
+        assert!(super::runner_temporary_base_from_configured(None, None).is_err());
+
+        let scratch = scratch_directory()?;
+        let base = scratch.path.join("approved");
+        super::create_private_child_directory(&base)?;
+        let nested = base.join("verification");
+        super::create_private_child_directory(&nested)?;
+        let outside = scratch.path.join("outside");
+        super::create_private_child_directory(&outside)?;
+        let symlinked = scratch.path.join("verification-symlink");
+        symlink(&nested, &symlinked).map_err(|error| error.to_string())?;
+
+        assert_eq!(
+            super::runner_temporary_base_from_configured(Some(&base), None)?,
+            fs::canonicalize(&base).map_err(|error| error.to_string())?
+        );
+        assert_eq!(
+            super::runner_temporary_base_from_configured(Some(&base), Some(&nested))?,
+            fs::canonicalize(&nested).map_err(|error| error.to_string())?
+        );
+        assert_eq!(
+            super::runner_temporary_base_from_configured(Some(&base), Some(&base))?,
+            fs::canonicalize(&base).map_err(|error| error.to_string())?
+        );
+        assert!(super::runner_temporary_base_from_configured(Some(&base), Some(&outside)).is_err());
+        assert!(
+            super::runner_temporary_base_from_configured(Some(&base), Some(&symlinked)).is_err()
+        );
+        assert!(validate_temporary_directory(Path::new("relative")).is_err());
+        assert_eq!(
+            validate_temporary_directory(&scratch.path)?,
+            fs::canonicalize(&scratch.path).map_err(|error| error.to_string())?
+        );
+        Ok(())
     }
 
     #[test]
@@ -516,18 +564,20 @@ mod tests {
     }
 
     #[test]
-    fn runner_preserves_raw_arguments_sets_local_roots_and_cleans_after_exit() -> Result<(), String>
-    {
+    fn runner_preserves_arguments_strips_obsolete_root_and_keeps_fixtures_in_private_tmpdir()
+    -> Result<(), String> {
         let scratch = scratch_directory()?;
         let source = scratch.path.join("test-executable-source");
         write_executable(
             &source,
-            b"#!/bin/sh\nprintf '%s\\000' \"$@\" > \"$FORGE_TEST_ARGS_FILE\"\nprintf '%s' \"$FORGE_PACKAGE_V_WORKSPACE_ROOT\" > \"$FORGE_TEST_WORKSPACE_FILE\"\nprintf '%s' \"$TMPDIR\" > \"$FORGE_TEST_TMP_FILE\"\npwd > \"$FORGE_TEST_CWD_FILE\"\nexit 37\n",
+            b"#!/bin/sh\nprintf '%s\\000' \"$@\" > \"$FORGE_TEST_ARGS_FILE\"\nprintf '%s' \"${FORGE_PACKAGE_V_WORKSPACE_ROOT-unset}\" > \"$FORGE_TEST_OVERRIDE_FILE\"\nprintf '%s' \"$TMPDIR\" > \"$FORGE_TEST_TMP_FILE\"\nprintf '%s' \"${FORGE_VERIFY_TMPDIR-unset}\" > \"$FORGE_TEST_VERIFY_FILE\"\nmkdir \"$TMPDIR/fixture\"\nprintf '%s' \"$TMPDIR/fixture\" > \"$FORGE_TEST_FIXTURE_FILE\"\npwd > \"$FORGE_TEST_CWD_FILE\"\nexit 37\n",
         )?;
 
         let args_file = scratch.path.join("args");
-        let workspace_file = scratch.path.join("workspace");
+        let override_file = scratch.path.join("override");
         let tmp_file = scratch.path.join("tmp");
+        let verify_file = scratch.path.join("verify");
+        let fixture_file = scratch.path.join("fixture");
         let cwd_file = scratch.path.join("cwd");
         let arguments = [
             OsString::from("argument with spaces"),
@@ -538,14 +588,21 @@ mod tests {
         let base = scratch.path.clone();
         let mut sandbox = TestRunnerSandbox::create(&source, &base)?;
         let root = sandbox.root.path.clone();
-        let workspace_root = sandbox.workspace_root.clone();
         let temporary_directory = sandbox.temporary_directory.clone();
         let original_cwd = std::env::current_dir().map_err(|error| error.to_string())?;
-        let mut command = sandbox.command(&arguments);
+        let mut command = Command::new(&sandbox.executable);
+        command.env(FORGE_VERIFY_TMPDIR, &scratch.path);
+        command.env(
+            "FORGE_PACKAGE_V_WORKSPACE_ROOT",
+            scratch.path.join("stale-package-workspace"),
+        );
+        sandbox.configure_command(&mut command, &arguments);
         command
             .env("FORGE_TEST_ARGS_FILE", &args_file)
-            .env("FORGE_TEST_WORKSPACE_FILE", &workspace_file)
+            .env("FORGE_TEST_OVERRIDE_FILE", &override_file)
             .env("FORGE_TEST_TMP_FILE", &tmp_file)
+            .env("FORGE_TEST_VERIFY_FILE", &verify_file)
+            .env("FORGE_TEST_FIXTURE_FILE", &fixture_file)
             .env("FORGE_TEST_CWD_FILE", &cwd_file);
         let status = command.status().map_err(|error| error.to_string())?;
         assert_eq!(status.code(), Some(37));
@@ -558,12 +615,21 @@ mod tests {
             expected
         });
         assert_eq!(
-            fs::read_to_string(&workspace_file).map_err(|error| error.to_string())?,
-            workspace_root.to_string_lossy()
+            fs::read_to_string(&override_file).map_err(|error| error.to_string())?,
+            "unset"
         );
         assert_eq!(
             fs::read_to_string(&tmp_file).map_err(|error| error.to_string())?,
             temporary_directory.to_string_lossy()
+        );
+        let fixture_path =
+            Path::new(&fs::read_to_string(&fixture_file).map_err(|error| error.to_string())?)
+                .to_path_buf();
+        assert!(fixture_path.starts_with(&temporary_directory));
+        assert!(fixture_path.is_dir());
+        assert_eq!(
+            fs::read_to_string(&verify_file).map_err(|error| error.to_string())?,
+            "unset"
         );
         assert_eq!(
             fs::read_to_string(&cwd_file)
@@ -571,15 +637,7 @@ mod tests {
                 .trim(),
             original_cwd.to_string_lossy()
         );
-        assert!(workspace_root.starts_with(&root));
         assert!(temporary_directory.starts_with(&root));
-        assert_eq!(
-            fs::metadata(&workspace_root)
-                .map_err(|error| error.to_string())?
-                .mode()
-                & 0o777,
-            0o700
-        );
         assert_eq!(
             fs::metadata(&temporary_directory)
                 .map_err(|error| error.to_string())?

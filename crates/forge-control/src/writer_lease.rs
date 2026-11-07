@@ -311,6 +311,19 @@ pub(crate) fn map_writer_lease_store_error(error: WorkspaceStoreError) -> Contro
         return ControlError::committed();
     }
     let code = match &error {
+        WorkspaceStoreError::WriterLease(WriterLeaseStoreError::HomeTransfer(source))
+            if matches!(
+                source.as_ref(),
+                forge_persistence::HomeTransferStoreError::Fenced { .. }
+            ) =>
+        {
+            ControlErrorCode::HomeTransferFenced
+        }
+        WorkspaceStoreError::WriterLease(WriterLeaseStoreError::WorkCut(source))
+            if crate::error::is_home_transfer_cut_fence(source.as_ref()) =>
+        {
+            ControlErrorCode::HomeTransferFenced
+        }
         WorkspaceStoreError::WriterLease(WriterLeaseStoreError::LeaseMissing) => {
             ControlErrorCode::WriterLeaseNotFound
         }
@@ -390,5 +403,32 @@ mod tests {
             });
         assert_eq!(committed.code(), ControlErrorCode::CommittedButUnconfirmed);
         assert!(committed.is_committed());
+    }
+
+    #[test]
+    fn home_lease_fences_are_writer_conflicts_and_corruption_stays_persistence() {
+        let preparation_id = uuid::Uuid::from_u128(0xA14);
+        let direct = map_writer_lease_store_error(WorkspaceStoreError::WriterLease(
+            WriterLeaseStoreError::HomeTransfer(Box::new(
+                forge_persistence::HomeTransferStoreError::Fenced { preparation_id },
+            )),
+        ));
+        assert_eq!(direct.code(), ControlErrorCode::HomeTransferFenced);
+
+        let nested = map_writer_lease_store_error(WorkspaceStoreError::WriterLease(
+            WriterLeaseStoreError::WorkCut(Box::new(
+                forge_persistence::WorkCutError::HomeTransfer(Box::new(
+                    forge_persistence::HomeTransferStoreError::Fenced { preparation_id },
+                )),
+            )),
+        ));
+        assert_eq!(nested.code(), ControlErrorCode::HomeTransferFenced);
+
+        let corrupt = map_writer_lease_store_error(WorkspaceStoreError::WriterLease(
+            WriterLeaseStoreError::HomeTransfer(Box::new(
+                forge_persistence::HomeTransferStoreError::Corrupt("test"),
+            )),
+        ));
+        assert_eq!(corrupt.code(), ControlErrorCode::PersistenceFailure);
     }
 }

@@ -334,6 +334,11 @@ pub(crate) fn map_agent_store_error(error: WorkspaceStoreError) -> ControlError 
         return crate::coordinator::map_coordinator_store_error(error);
     }
     let code = match &error {
+        WorkspaceStoreError::Agent(AgentStoreError::WorkCut(source))
+            if crate::error::is_home_transfer_cut_fence(source.as_ref()) =>
+        {
+            ControlErrorCode::HomeTransferFenced
+        }
         WorkspaceStoreError::Agent(AgentStoreError::AgentNotFound(_)) => {
             ControlErrorCode::AgentNotFound
         }
@@ -415,6 +420,24 @@ mod tests {
     use uuid::Uuid;
 
     static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn home_agent_fence_is_conflict_but_corrupt_home_state_is_persistence_failure() {
+        let preparation_id = Uuid::from_u128(0xA12);
+        let fenced = map_agent_store_error(WorkspaceStoreError::Agent(AgentStoreError::WorkCut(
+            Box::new(forge_persistence::WorkCutError::HomeTransfer(Box::new(
+                forge_persistence::HomeTransferStoreError::Fenced { preparation_id },
+            ))),
+        )));
+        assert_eq!(fenced.code(), ControlErrorCode::HomeTransferFenced);
+
+        let corrupt = map_agent_store_error(WorkspaceStoreError::Agent(AgentStoreError::WorkCut(
+            Box::new(forge_persistence::WorkCutError::HomeTransfer(Box::new(
+                forge_persistence::HomeTransferStoreError::Corrupt("test"),
+            ))),
+        )));
+        assert_eq!(corrupt.code(), ControlErrorCode::PersistenceFailure);
+    }
 
     fn open_session(
         control: &ForgeControl,

@@ -500,7 +500,15 @@ fn is_busy_error(error: &rusqlite::Error) -> bool {
 }
 
 fn initialize_or_validate(connection: &mut Connection) -> Result<(), AgentSessionCatalogError> {
-    let (application_id, user_version, object_count) = catalog_ownership(connection)?;
+    // A concurrent initializer commits the header and schema together. Read
+    // all ownership fields from one snapshot so no mixed pre/post-commit tuple
+    // is mistaken for a foreign catalog. Release it before the write phase.
+    let (application_id, user_version, object_count) = {
+        let observation = connection.transaction()?;
+        let ownership = catalog_ownership(&observation)?;
+        observation.commit()?;
+        ownership
+    };
     match (application_id, user_version, object_count) {
         (0, 0, 0) => create_schema(connection),
         (AGENT_SESSION_APPLICATION_ID, AGENT_SESSION_SCHEMA_VERSION, _) => {
@@ -1063,6 +1071,13 @@ mod tests {
 
     #[test]
     fn concurrent_same_request_creates_exactly_one_session() -> Result<(), Box<dyn Error>> {
+        for _ in 0..16 {
+            concurrent_first_open_round()?;
+        }
+        Ok(())
+    }
+
+    fn concurrent_first_open_round() -> Result<(), Box<dyn Error>> {
         let (root, path) = database("concurrent")?;
         let path = Arc::new(path);
         let barrier = Arc::new(Barrier::new(2));
@@ -1093,12 +1108,12 @@ mod tests {
                 )
                 .map_err(|error| format!("right session open: {error}"))
         });
-        let left = left
-            .join()
+        let left_result = left.join();
+        let right_result = right.join();
+        let left = left_result
             .map_err(|_| io::Error::other("left thread panicked"))?
             .map_err(io::Error::other)?;
-        let right = right
-            .join()
+        let right = right_result
             .map_err(|_| io::Error::other("right thread panicked"))?
             .map_err(io::Error::other)?;
         assert_ne!(left.created(), right.created());

@@ -87,11 +87,6 @@ pub(super) async fn assert_http_effect_fact_outbox(
     assert!(
         full_entries
             .iter()
-            .any(|entry| entry["fact"]["kind"] == "execution_terminal")
-    );
-    assert!(
-        full_entries
-            .iter()
             .any(|entry| entry["fact"]["kind"] == "change_set_terminal")
     );
 

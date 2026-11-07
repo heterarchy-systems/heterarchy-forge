@@ -8,13 +8,13 @@ use forge_domain::{
     ActivityCoordinatorActor, ActivityId, ActivityLeaseRevision, ActivityListLimit,
     ActivityProjection, ApprovalRequestId, AuthorizedExecutionRead, AutoApprovalScope,
     AutoApprovalScopeId, ClaimRecoveryLease, CloseActivity, CompleteExecution, DagRevisionNumber,
-    ExecutionGrant, ExecutionId, ExecutionListLimit, ExecutionOutputCursor, ExecutionOutputEvent,
-    ExecutionOutputRead, FailExecution, GoalId, GoalListLimit, GoalReview, LocationId,
-    LocationRevision, MarkExecutionRunning, RecoveryLeaseDurationMillis, RecoveryMaintenanceLease,
-    RegisteredActivity, RegisteredApprovalRequest, RegisteredDagNode, RegisteredExecution,
-    RegisteredGoal, RegisteredLocation, ReleaseActivityLease, ReleaseRecoveryLease,
-    RenewActivityLease, RenewRecoveryLease, RuntimeInstanceId, SetLocationState, TimestampMillis,
-    VerificationProjection, WorkspaceId, WorkspacePolicy,
+    EvaluationClockReading, ExecutionGrant, ExecutionId, ExecutionListLimit, ExecutionOutputCursor,
+    ExecutionOutputEvent, ExecutionOutputRead, FailExecution, GoalId, GoalListLimit, GoalReview,
+    LocationId, LocationRevision, MarkExecutionRunning, RecoveryLeaseDurationMillis,
+    RecoveryMaintenanceLease, RegisteredActivity, RegisteredApprovalRequest, RegisteredDagNode,
+    RegisteredExecution, RegisteredGoal, RegisteredLocation, ReleaseActivityLease,
+    ReleaseRecoveryLease, RenewActivityLease, RenewRecoveryLease, RuntimeInstanceId,
+    SetLocationState, TimestampMillis, VerificationProjection, WorkspaceId, WorkspacePolicy,
 };
 use forge_persistence::{
     ApprovalCleanupApplyOutcome, ApprovalCleanupAttemptId, DagNodeAssignmentSnapshot,
@@ -175,6 +175,10 @@ pub(crate) enum ForgeControlRequest {
         command: Box<crate::WorkCutCommand>,
         response: Response<crate::WorkCutResponse>,
     },
+    HomeTransferSource {
+        command: crate::HomeTransferSourceCommand,
+        response: Response<crate::HomeTransferSourceResponse>,
+    },
     GoalDeletePending {
         scope: ResolvedWorkspaceScope,
         limit: u32,
@@ -188,6 +192,16 @@ pub(crate) enum ForgeControlRequest {
     AgentAssignmentMutate {
         request: crate::AgentAssignmentMutationRequest,
         response: Response<forge_domain::RegisteredAgentAssignment>,
+    },
+    AgentAssignmentMutateWithSourceClock {
+        request: crate::AgentAssignmentMutationRequest,
+        service: crate::EvaluationEvidenceService,
+        response: Response<forge_domain::RegisteredAgentAssignment>,
+    },
+    EvaluationEvidence {
+        request: crate::EvaluationEvidenceRequest,
+        service: crate::EvaluationEvidenceService,
+        response: Response<crate::EvaluationEvidenceResponse>,
     },
     AgentAssignmentOfferSeal {
         request: crate::AgentAssignmentOfferSealRequest,
@@ -1342,6 +1356,14 @@ impl ForgeControlClient {
             response,
         })
     }
+
+    /// Run one service-scoped Home source Prepare, `AbortUnstarted`, or Get.
+    pub fn home_transfer_source(
+        &self,
+        command: crate::HomeTransferSourceCommand,
+    ) -> Result<crate::HomeTransferSourceResponse, ControlClientError> {
+        self.submit(|response| ForgeControlRequest::HomeTransferSource { command, response })
+    }
     #[cfg(test)]
     pub(crate) fn journal_test_channel(capacity: usize) -> (Self, Receiver<ForgeControlRequest>) {
         let (sender, receiver) = mpsc::sync_channel(capacity);
@@ -1387,6 +1409,37 @@ impl ForgeControlClient {
         request: crate::AgentAssignmentMutationRequest,
     ) -> Result<forge_domain::RegisteredAgentAssignment, ControlClientError> {
         self.submit(|response| ForgeControlRequest::AgentAssignmentMutate { request, response })
+    }
+
+    /// Mutate a submitted or reviewed assignment while passing the configured
+    /// source backend identity through the bounded worker to the source-clock
+    /// persistence method. Legacy native callers keep using
+    /// [`Self::agent_assignment_mutate`].
+    pub fn agent_assignment_mutate_with_source_clock(
+        &self,
+        request: crate::AgentAssignmentMutationRequest,
+        service: crate::EvaluationEvidenceService,
+    ) -> Result<forge_domain::RegisteredAgentAssignment, ControlClientError> {
+        self.submit(
+            |response| ForgeControlRequest::AgentAssignmentMutateWithSourceClock {
+                request,
+                service,
+                response,
+            },
+        )
+    }
+
+    /// Execute one closed source-evidence command through the single owner.
+    pub fn evaluation_evidence(
+        &self,
+        request: crate::EvaluationEvidenceRequest,
+        service: crate::EvaluationEvidenceService,
+    ) -> Result<crate::EvaluationEvidenceResponse, ControlClientError> {
+        self.submit(|response| ForgeControlRequest::EvaluationEvidence {
+            request,
+            service,
+            response,
+        })
     }
 
     pub fn agent_assignment_offer_seal(
@@ -4223,6 +4276,12 @@ fn queue_attribution_for_request(request: &ForgeControlRequest) -> QueueAttribut
         ForgeControlRequest::AgentAssignmentMutate { request, .. } => {
             QueueAttribution::Workspace(request.scope.workspace_id())
         }
+        ForgeControlRequest::AgentAssignmentMutateWithSourceClock { request, .. } => {
+            QueueAttribution::Workspace(request.scope.workspace_id())
+        }
+        ForgeControlRequest::EvaluationEvidence { request, .. } => {
+            QueueAttribution::Workspace(request.scope.workspace_id())
+        }
         ForgeControlRequest::AgentAssignmentOfferSeal { request, .. }
         | ForgeControlRequest::AgentAssignmentOfferSealGet { request, .. } => {
             QueueAttribution::Workspace(request.scope.workspace_id())
@@ -4454,6 +4513,9 @@ fn queue_attribution_for_request(request: &ForgeControlRequest) -> QueueAttribut
             QueueAttribution::Workspace(request.scope.workspace_id())
         }
         ForgeControlRequest::LeadershipWorkCut { command, .. } => {
+            QueueAttribution::Workspace(command.scope.workspace_id())
+        }
+        ForgeControlRequest::HomeTransferSource { command, .. } => {
             QueueAttribution::Workspace(command.scope.workspace_id())
         }
         ForgeControlRequest::RecoveryMaintenanceDurable { request, .. } => {
@@ -4780,6 +4842,8 @@ fn service_class_for_request(request: &ForgeControlRequest) -> ServiceClass {
         | ForgeControlRequest::AgentSessionProve { .. }
         | ForgeControlRequest::AgentSetFocus { .. }
         | ForgeControlRequest::AgentAssignmentMutate { .. }
+        | ForgeControlRequest::AgentAssignmentMutateWithSourceClock { .. }
+        | ForgeControlRequest::EvaluationEvidence { .. }
         | ForgeControlRequest::AgentAssignmentOfferSeal { .. }
         | ForgeControlRequest::AgentAssignmentOfferSealGet { .. }
         | ForgeControlRequest::AgentPublishWorkUpdate { .. }
@@ -4928,6 +4992,7 @@ fn service_class_for_request(request: &ForgeControlRequest) -> ServiceClass {
         | ForgeControlRequest::RecoveryLeaseRelease { .. }
         | ForgeControlRequest::RecoveryMaintenanceRun { .. }
         | ForgeControlRequest::LeadershipWorkCut { .. }
+        | ForgeControlRequest::HomeTransferSource { .. }
         | ForgeControlRequest::RecoveryMaintenanceDurable { .. }
         | ForgeControlRequest::RecoveryMaintenanceGet { .. }
         | ForgeControlRequest::ApprovalListPending { .. }
@@ -5623,6 +5688,8 @@ fn dispatch_agent_or_activity_request(control: &ForgeControl, request: ForgeCont
         | ForgeControlRequest::AgentSetFocus { .. }
         | ForgeControlRequest::AgentVerifyExecutionAuthority { .. }
         | ForgeControlRequest::AgentAssignmentMutate { .. }
+        | ForgeControlRequest::AgentAssignmentMutateWithSourceClock { .. }
+        | ForgeControlRequest::EvaluationEvidence { .. }
         | ForgeControlRequest::AgentAssignmentOfferSeal { .. }
         | ForgeControlRequest::AgentAssignmentOfferSealGet { .. }
         | ForgeControlRequest::AgentPublishWorkUpdate { .. }
@@ -5923,6 +5990,8 @@ fn dispatch_activity_request(control: &ForgeControl, request: ForgeControlReques
         | ForgeControlRequest::AgentSetFocus { .. }
         | ForgeControlRequest::AgentVerifyExecutionAuthority { .. }
         | ForgeControlRequest::AgentAssignmentMutate { .. }
+        | ForgeControlRequest::AgentAssignmentMutateWithSourceClock { .. }
+        | ForgeControlRequest::EvaluationEvidence { .. }
         | ForgeControlRequest::AgentAssignmentOfferSeal { .. }
         | ForgeControlRequest::AgentAssignmentOfferSealGet { .. }
         | ForgeControlRequest::AgentPublishWorkUpdate { .. }
@@ -6050,6 +6119,7 @@ fn dispatch_activity_request(control: &ForgeControl, request: ForgeControlReques
         | ForgeControlRequest::RecoveryLeaseRelease { .. }
         | ForgeControlRequest::RecoveryMaintenanceRun { .. }
         | ForgeControlRequest::LeadershipWorkCut { .. }
+        | ForgeControlRequest::HomeTransferSource { .. }
         | ForgeControlRequest::RecoveryMaintenanceDurable { .. }
         | ForgeControlRequest::RecoveryMaintenanceGet { .. }
         | ForgeControlRequest::CheckpointRestoreRun { .. }
@@ -6243,6 +6313,9 @@ fn dispatch_effect_request(control: &ForgeControl, request: ForgeControlRequest)
         request @ ForgeControlRequest::LeadershipWorkCut { .. } => {
             dispatch_recovery_request(control, request);
         }
+        request @ ForgeControlRequest::HomeTransferSource { .. } => {
+            dispatch_home_transfer_source_request(control, request);
+        }
         other => dispatch_effect_request_inner(control, other),
     }
 }
@@ -6361,6 +6434,8 @@ fn dispatch_agent_or_supervisor_request(control: &ForgeControl, request: ForgeCo
         | ForgeControlRequest::AgentSetFocus { .. }
         | ForgeControlRequest::AgentVerifyExecutionAuthority { .. }
         | ForgeControlRequest::AgentAssignmentMutate { .. }
+        | ForgeControlRequest::AgentAssignmentMutateWithSourceClock { .. }
+        | ForgeControlRequest::EvaluationEvidence { .. }
         | ForgeControlRequest::AgentAssignmentOfferSeal { .. }
         | ForgeControlRequest::AgentAssignmentOfferSealGet { .. }
         | ForgeControlRequest::AgentPublishWorkUpdate { .. }
@@ -6813,6 +6888,30 @@ fn dispatch_agent_request(control: &ForgeControl, request: ForgeControlRequest) 
         ForgeControlRequest::AgentAssignmentMutate { request, response } => {
             let result = runtime_timestamp_millis()
                 .and_then(|admitted_at| control.agent_assignment_mutate(&request, admitted_at));
+            let _ignored = response.send(result);
+        }
+        ForgeControlRequest::AgentAssignmentMutateWithSourceClock {
+            request,
+            service,
+            response,
+        } => {
+            let result = runtime_timestamp_millis().and_then(|admitted_at| {
+                control.agent_assignment_mutate_with_source_clock(
+                    &request,
+                    service,
+                    admitted_at,
+                    runtime_evaluation_clock_reading,
+                )
+            });
+            let _ignored = response.send(result);
+        }
+        ForgeControlRequest::EvaluationEvidence {
+            request,
+            service,
+            response,
+        } => {
+            let result =
+                control.evaluation_evidence(&request, service, runtime_evaluation_clock_reading);
             let _ignored = response.send(result);
         }
         ForgeControlRequest::AgentAssignmentOfferSeal { request, response } => {
@@ -7333,6 +7432,15 @@ fn dispatch_recovery_request(control: &ForgeControl, request: ForgeControlReques
             let _ignored = response.send(control.checkpoint_restore(&request));
         }
         other => dispatch_supervisor_request(control, other),
+    }
+}
+
+fn dispatch_home_transfer_source_request(control: &ForgeControl, request: ForgeControlRequest) {
+    if let ForgeControlRequest::HomeTransferSource { command, response } = request {
+        let result = control.home_transfer_source(&command, || {
+            runtime_timestamp_millis().map_err(|_| forge_persistence::HomeTransferStoreError::Clock)
+        });
+        let _ignored = response.send(result);
     }
 }
 
@@ -7873,6 +7981,22 @@ pub(crate) fn runtime_timestamp_millis() -> Result<TimestampMillis, ControlError
         .map_err(|error| ControlError::with_source(ControlErrorCode::Internal, error))
 }
 
+/// Trusted evaluation source clock. This function is passed by the worker as
+/// a sampler; persistence invokes it only after taking its IMMEDIATE
+/// transaction and validating the exact source transition.
+fn runtime_evaluation_clock_reading() -> EvaluationClockReading {
+    let Ok(duration) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+        return EvaluationClockReading::Unknown;
+    };
+    let Ok(millis) = i64::try_from(duration.as_millis()) else {
+        return EvaluationClockReading::Unknown;
+    };
+    match TimestampMillis::new(millis) {
+        Ok(timestamp) => EvaluationClockReading::Trusted(timestamp),
+        Err(_) => EvaluationClockReading::Unknown,
+    }
+}
+
 fn runtime_lease_window(
     requested_at: TimestampMillis,
     requested_until: TimestampMillis,
@@ -8051,6 +8175,8 @@ where
             | ForgeControlRequest::AgentSetFocus { .. }
             | ForgeControlRequest::AgentVerifyExecutionAuthority { .. }
             | ForgeControlRequest::AgentAssignmentMutate { .. }
+            | ForgeControlRequest::AgentAssignmentMutateWithSourceClock { .. }
+            | ForgeControlRequest::EvaluationEvidence { .. }
             | ForgeControlRequest::AgentAssignmentOfferSeal { .. }
             | ForgeControlRequest::AgentAssignmentOfferSealGet { .. }
             | ForgeControlRequest::AgentPublishWorkUpdate { .. }
@@ -8226,6 +8352,7 @@ where
             | ForgeControlRequest::RecoveryLeaseRelease { .. }
             | ForgeControlRequest::RecoveryMaintenanceRun { .. }
             | ForgeControlRequest::LeadershipWorkCut { .. }
+            | ForgeControlRequest::HomeTransferSource { .. }
             | ForgeControlRequest::RecoveryMaintenanceDurable { .. }
             | ForgeControlRequest::RecoveryMaintenanceGet { .. }) => {
                 reject_queued_recovery(request);
@@ -8416,7 +8543,11 @@ fn reject_queued_agent_state(request: ForgeControlRequest) {
         ForgeControlRequest::AgentGetContext { response, .. } => {
             let _ignored = response.send(worker_shutting_down());
         }
-        ForgeControlRequest::AgentAssignmentMutate { response, .. } => {
+        ForgeControlRequest::AgentAssignmentMutate { response, .. }
+        | ForgeControlRequest::AgentAssignmentMutateWithSourceClock { response, .. } => {
+            let _ignored = response.send(worker_shutting_down());
+        }
+        ForgeControlRequest::EvaluationEvidence { response, .. } => {
             let _ignored = response.send(worker_shutting_down());
         }
         ForgeControlRequest::AgentAssignmentOfferSeal { response, .. } => {
@@ -8727,6 +8858,9 @@ fn reject_queued_dag(request: ForgeControlRequest) {
 fn reject_queued_recovery(request: ForgeControlRequest) {
     match request {
         ForgeControlRequest::LeadershipWorkCut { response, .. } => {
+            let _ignored = response.send(worker_shutting_down());
+        }
+        ForgeControlRequest::HomeTransferSource { response, .. } => {
             let _ignored = response.send(worker_shutting_down());
         }
         ForgeControlRequest::CheckpointRestoreRun { response, .. } => {

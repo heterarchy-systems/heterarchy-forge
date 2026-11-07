@@ -25,6 +25,15 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Select runner-local Rust storage
+        shell: bash
+        run: |
+          mkdir -p "${RUNNER_TEMP}/forge-target" "${RUNNER_TEMP}/forge-tmp"
+          printf 'CARGO_TARGET_DIR=%s/forge-target\n' "${RUNNER_TEMP}" >> "${GITHUB_ENV}"
+          printf 'TMPDIR=%s/forge-tmp\n' "${RUNNER_TEMP}" >> "${GITHUB_ENV}"
 
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.98.0 --profile minimal --component clippy --component rustfmt

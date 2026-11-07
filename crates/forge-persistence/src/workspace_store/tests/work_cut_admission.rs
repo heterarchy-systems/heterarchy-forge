@@ -8,6 +8,8 @@ use forge_domain::{
     WorkCutNodeScope, WorkCutRequest, WorkCutScope, WorkCutSession, WorkCutSide,
 };
 
+mod binding_admission;
+
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 struct CutFixture {

@@ -5,12 +5,17 @@
 //! observation. This module never opens a write store or reconciles state.
 
 mod checkpoint_store;
+mod home_artifact;
 mod workspace_identity;
 
 use checkpoint_store::observe_checkpoint_store;
 pub use checkpoint_store::{
     WorkspaceCheckpointStoreAvailability, WorkspaceCheckpointStoreFinding,
     WorkspaceCheckpointStoreReport, WorkspaceCheckpointStoreStatus,
+};
+use home_artifact::observe_home_artifacts;
+pub use home_artifact::{
+    WorkspaceHomeArtifactDoctorReport, WorkspaceHomeArtifactFinding, WorkspaceHomeArtifactStatus,
 };
 pub use workspace_identity::{
     WORKSPACE_IDENTITY_DOCTOR_MAX_LOCATIONS, WorkspaceIdentityDoctorOutcome,
@@ -52,6 +57,7 @@ pub struct WorkspaceDoctorResult {
     report: WorkspaceDoctorReport,
     git_local_state: GitLocalStateDoctor,
     checkpoint_store: WorkspaceCheckpointStoreReport,
+    home_artifacts: WorkspaceHomeArtifactDoctorReport,
     diff_artifacts: WorkspaceDiffArtifactDoctorReport,
     observation_consistency: WorkspaceDoctorObservationConsistency,
     outcome: WorkspaceDoctorAggregateOutcome,
@@ -63,6 +69,7 @@ impl WorkspaceDoctorResult {
         report: WorkspaceDoctorReport,
         git_local_state: GitLocalStateDoctor,
         checkpoint_store: WorkspaceCheckpointStoreReport,
+        home_artifacts: WorkspaceHomeArtifactDoctorReport,
         diff_artifacts: WorkspaceDiffArtifactDoctorReport,
         observation_consistency: WorkspaceDoctorObservationConsistency,
     ) -> Self {
@@ -70,6 +77,7 @@ impl WorkspaceDoctorResult {
             &report,
             git_local_state,
             &checkpoint_store,
+            &home_artifacts,
             &diff_artifacts,
             observation_consistency,
         );
@@ -78,6 +86,7 @@ impl WorkspaceDoctorResult {
             report,
             git_local_state,
             checkpoint_store,
+            home_artifacts,
             diff_artifacts,
             observation_consistency,
             outcome,
@@ -98,6 +107,10 @@ impl WorkspaceDoctorResult {
 
     pub const fn checkpoint_store(&self) -> &WorkspaceCheckpointStoreReport {
         &self.checkpoint_store
+    }
+
+    pub const fn home_artifacts(&self) -> &WorkspaceHomeArtifactDoctorReport {
+        &self.home_artifacts
     }
 
     pub const fn diff_artifacts(&self) -> &WorkspaceDiffArtifactDoctorReport {
@@ -200,12 +213,12 @@ fn doctor_observation_consistency(
     database_unchanged: bool,
     git_before: GitLocalStateDoctor,
     git_after: GitLocalStateDoctor,
-    checkpoint_unchanged: bool,
+    owned_git_store_unchanged: bool,
     diff_inventory_unchanged: bool,
 ) -> WorkspaceDoctorObservationConsistency {
     if database_unchanged
         && git_before == git_after
-        && checkpoint_unchanged
+        && owned_git_store_unchanged
         && diff_inventory_unchanged
     {
         WorkspaceDoctorObservationConsistency::Stable
@@ -218,6 +231,7 @@ fn aggregate_outcome(
     report: &WorkspaceDoctorReport,
     git: GitLocalStateDoctor,
     checkpoints: &WorkspaceCheckpointStoreReport,
+    home_artifacts: &WorkspaceHomeArtifactDoctorReport,
     diffs: &WorkspaceDiffArtifactDoctorReport,
     observation_consistency: WorkspaceDoctorObservationConsistency,
 ) -> WorkspaceDoctorAggregateOutcome {
@@ -257,7 +271,7 @@ fn aggregate_outcome(
                 | WorkspaceCheckpointStoreStatus::StoreMissing
         )
     });
-    if git_damaged || diff_damaged || checkpoint_damaged {
+    if git_damaged || diff_damaged || checkpoint_damaged || home_artifacts.has_damage() {
         return WorkspaceDoctorAggregateOutcome::Damaged;
     }
 
@@ -273,13 +287,18 @@ fn aggregate_outcome(
             WorkspaceCheckpointStoreStatus::Starting | WorkspaceCheckpointStoreStatus::OrphanRef
         )
     });
-    if report.requires_recovery() || diff_recovery || checkpoint_recovery {
+    if report.requires_recovery()
+        || diff_recovery
+        || checkpoint_recovery
+        || home_artifacts.requires_recovery()
+    {
         return WorkspaceDoctorAggregateOutcome::RecoveryRequired;
     }
 
     if matches!(git, GitLocalStateDoctor::Unavailable)
         || !report.dag_semantics().is_complete()
         || !checkpoints.is_complete()
+        || !home_artifacts.is_complete()
         || checkpoints
             .findings()
             .iter()
@@ -319,6 +338,8 @@ impl ForgeControl {
             .map_err(map_state_layout_error)?;
         let checkpoint_observation =
             observe_checkpoint_store(report.checkpoint_references(), git_local_state, &layout)?;
+        let home_artifact_observation =
+            observe_home_artifacts(report.home_artifact_references(), &layout)?;
         let filesystem = ConfinedWorkspace::open(&layout).map_err(map_filesystem_error)?;
         let artifacts = filesystem
             .diff_artifact_store()
@@ -342,6 +363,7 @@ impl ForgeControl {
             .map_err(map_state_layout_error)?;
         let checkpoint_unchanged =
             checkpoint_observation.source_is_unchanged(report.checkpoint_references(), &layout);
+        let home_artifacts_unchanged = home_artifact_observation.source_is_unchanged(&layout);
         let diff_inventory_unchanged = matches!(
             artifacts.inventory(DiffArtifactInventoryLimit::DEFAULT),
             Ok(current) if current == inventory
@@ -350,10 +372,11 @@ impl ForgeControl {
             database_source.is_unchanged(&layout),
             git_local_state,
             git_local_state_after,
-            checkpoint_unchanged,
+            checkpoint_unchanged && home_artifacts_unchanged,
             diff_inventory_unchanged,
         );
         let checkpoint_store = checkpoint_observation.into_report();
+        let home_artifacts = home_artifact_observation.into_report();
 
         if report.location_id() != locator.location_id()
             || report.workspace_id() != expected.workspace_id()
@@ -384,6 +407,7 @@ impl ForgeControl {
             report,
             git_local_state,
             checkpoint_store,
+            home_artifacts,
             diff_artifacts,
             observation_consistency,
         ))
@@ -777,6 +801,9 @@ mod tests {
         );
         assert!(result.diff_artifacts().findings().is_empty());
         assert!(result.diff_artifacts().is_complete());
+        assert!(result.home_artifacts().findings().is_empty());
+        assert!(result.home_artifacts().is_complete());
+        assert!(result.home_artifacts().metadata_only());
         assert_eq!(result.outcome(), WorkspaceDoctorAggregateOutcome::Healthy);
 
         let wrong = ResolvedWorkspaceScope::from_observation(
@@ -1310,6 +1337,7 @@ mod tests {
             stable.report().clone(),
             stable.git_local_state(),
             stable.checkpoint_store().clone(),
+            stable.home_artifacts().clone(),
             stable.diff_artifacts().clone(),
             WorkspaceDoctorObservationConsistency::Changed,
         );
@@ -1322,6 +1350,32 @@ mod tests {
             WorkspaceDoctorAggregateOutcome::Incomplete
         );
 
+        fs::remove_dir_all(fixture.root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn truncated_home_artifact_coverage_is_incomplete_without_known_findings()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = fixture("home-artifact-incomplete")?;
+        let stable = fixture.control.workspace_doctor(&WorkspaceDoctorRequest {
+            scope: fixture.scope.clone(),
+        })?;
+        let incomplete = WorkspaceDoctorResult::new(
+            stable.scope().clone(),
+            stable.report().clone(),
+            stable.git_local_state(),
+            stable.checkpoint_store().clone(),
+            home_artifact::incomplete_report_for_test(),
+            stable.diff_artifacts().clone(),
+            WorkspaceDoctorObservationConsistency::Stable,
+        );
+
+        assert_eq!(
+            incomplete.outcome(),
+            WorkspaceDoctorAggregateOutcome::Incomplete
+        );
+        assert!(!incomplete.home_artifacts().is_complete());
         fs::remove_dir_all(fixture.root)?;
         Ok(())
     }
@@ -1349,6 +1403,7 @@ mod tests {
             damaged.report().clone(),
             damaged.git_local_state(),
             damaged.checkpoint_store().clone(),
+            damaged.home_artifacts().clone(),
             damaged.diff_artifacts().clone(),
             WorkspaceDoctorObservationConsistency::Changed,
         );

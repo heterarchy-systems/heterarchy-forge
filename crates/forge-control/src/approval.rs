@@ -1,10 +1,10 @@
 use forge_domain::{
     ActivityId, ApprovalAgentBindingDigest, ApprovalDecision, ApprovalRequestId,
     ApprovalRequestState, ApprovalRevision, AutoApprovalScope, BeginExecution,
-    ExecutionActionClass, ExecutionAuthorizationRequest, ExecutionGrant, ExecutionGrantId,
-    ExecutionGrantRevision, ExecutionListLimit, ExecutionPolicyDisposition, GoalWorkAttribution,
-    PolicyRevision, ProjectCommandEvidence, RegisteredApprovalRequest, RuntimeInstanceId,
-    TimestampMillis, WorkspacePolicy,
+    ExecutionActionClass, ExecutionAgentProvenance, ExecutionAuthorizationRequest, ExecutionGrant,
+    ExecutionGrantId, ExecutionGrantRevision, ExecutionListLimit, ExecutionPolicyDisposition,
+    GoalWorkAttribution, PolicyRevision, ProjectCommandEvidence, RegisteredApprovalRequest,
+    RuntimeInstanceId, TimestampMillis, WorkspacePolicy,
 };
 use forge_persistence::{
     AutoApprovalExecutionRecord, BeginExecutionRecord, ExecutionAdmissionContext,
@@ -32,6 +32,7 @@ pub struct ApprovalCreateRequest {
     pub approval_id: ApprovalRequestId,
     pub request: ExecutionAuthorizationRequest,
     pub agent_binding: Option<ApprovalAgentBindingDigest>,
+    pub agent_provenance: Option<ExecutionAgentProvenance>,
     pub expires_at: TimestampMillis,
 }
 
@@ -270,7 +271,15 @@ impl ForgeControl {
                     | ExecutionActionClass::AnalyzedShell
                     | ExecutionActionClass::GeneratedProjectCommand
             ) != request.agent_binding.is_some()
+            || request.agent_binding.is_some() != request.agent_provenance.is_some()
         {
+            return Err(ControlError::new(ControlErrorCode::ApprovalConflict));
+        }
+        if request.agent_provenance.as_ref().is_some_and(|provenance| {
+            provenance.execution_id() != request.request.execution_id()
+                || request.agent_binding
+                    != Some(ApprovalAgentBindingDigest::from_provenance(provenance))
+        }) {
             return Err(ControlError::new(ControlErrorCode::ApprovalConflict));
         }
         let policy = store
@@ -303,9 +312,17 @@ impl ForgeControl {
             None => approval,
         };
         let persisted = if approval.state() == ApprovalRequestState::Pending {
-            store.insert_pending_approval_for_goal(&approval, request.goal)
+            store.insert_pending_approval_for_goal_with_provenance(
+                &approval,
+                request.goal,
+                request.agent_provenance.as_ref(),
+            )
         } else {
-            store.insert_approval_audit_for_goal(&approval, request.goal)
+            store.insert_approval_audit_for_goal_with_provenance(
+                &approval,
+                request.goal,
+                request.agent_provenance.as_ref(),
+            )
         }
         .map_err(map_activity_store_error)?;
         if !self.committed_scope_matches_with_store(&scope, &store) {
@@ -885,6 +902,7 @@ mod tests {
                 approval_id,
                 request: authorization,
                 agent_binding: None,
+                agent_provenance: None,
                 expires_at: forge_domain::TimestampMillis::new(20)?,
             })?;
         assert_eq!(pending.id(), approval_id);
@@ -1106,6 +1124,7 @@ mod tests {
                 approval_id,
                 request: authorization,
                 agent_binding: Some(ApprovalAgentBindingDigest::from_provenance(&provenance)),
+                agent_provenance: Some(provenance.clone()),
                 expires_at: forge_domain::TimestampMillis::new(20)?,
             })?;
         let (_approved, grant) = fixture.control.approve_once(&ApprovalOnceRequest {

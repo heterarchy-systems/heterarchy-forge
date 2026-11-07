@@ -8,6 +8,7 @@ use super::{AgentAssignmentId, AgentAssignmentTransitionError};
 pub enum AgentAssignmentOrigin {
     CoordinatorOffer,
     CutContinuation(AgentAssignmentContinuationOrigin),
+    HomeHandoff(AgentAssignmentHomeHandoffOrigin),
 }
 
 /// A checked lineage description, not a grant to create or claim an assignment.
@@ -44,5 +45,55 @@ impl AgentAssignmentContinuationOrigin {
     }
     pub const fn predecessor_id(self) -> AgentAssignmentId {
         self.predecessor
+    }
+}
+
+/// Source-owned Home handoff identity carried by the successor assignment.
+/// This value describes lineage; it does not authorize or prove a handoff.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AgentAssignmentHomeHandoffOrigin {
+    preparation_id: Uuid,
+    handoff_id: Uuid,
+    predecessor: AgentAssignmentId,
+    root_assignment: AgentAssignmentId,
+}
+
+impl AgentAssignmentHomeHandoffOrigin {
+    pub fn new(
+        preparation_id: Uuid,
+        handoff_id: Uuid,
+        predecessor_id: AgentAssignmentId,
+        root_assignment_id: AgentAssignmentId,
+    ) -> Result<Self, AgentAssignmentTransitionError> {
+        if preparation_id.is_nil()
+            || handoff_id.is_nil()
+            || predecessor_id.into_uuid().is_nil()
+            || root_assignment_id.into_uuid().is_nil()
+        {
+            return Err(AgentAssignmentTransitionError::InvalidHomeHandoffOrigin);
+        }
+        Ok(Self {
+            preparation_id,
+            handoff_id,
+            predecessor: predecessor_id,
+            root_assignment: root_assignment_id,
+        })
+    }
+
+    pub const fn preparation_id(self) -> Uuid {
+        self.preparation_id
+    }
+
+    pub const fn handoff_id(self) -> Uuid {
+        self.handoff_id
+    }
+
+    pub const fn predecessor_id(self) -> AgentAssignmentId {
+        self.predecessor
+    }
+
+    pub const fn root_assignment_id(self) -> AgentAssignmentId {
+        self.root_assignment
     }
 }

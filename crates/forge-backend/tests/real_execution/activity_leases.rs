@@ -9,8 +9,6 @@ use super::*;
 
 use forge_backend::CommandExecutor;
 use serde_json::{Value, json};
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use tokio::time::timeout;
 
@@ -727,79 +725,6 @@ async fn assert_single_release_and_close(
     Ok(())
 }
 
-async fn release_fifo_execution_and_assert_survival(
-    address: SocketAddr,
-    fixture: &Fixture,
-    fifo_path: std::path::PathBuf,
-    approved: ApprovedShell,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let before_release = get_activity(address, fixture, fixture.activity_id.into_uuid()).await?;
-    let lease_revision = lease_revision(&before_release)?;
-    let (status, released) = release(
-        address,
-        fixture,
-        fixture.activity_id.into_uuid(),
-        fixture.runtime_instance_id.into_uuid(),
-        lease_revision,
-    )
-    .await?;
-    assert_eq!(status, 200, "release response: {released}");
-    assert_eq!(released["result"]["status"], "released");
-    assert_open_unleased(
-        &activity_value(&released)?,
-        fixture.activity_id.into_uuid(),
-        lease_revision + 1,
-    );
-    let agent = fixture
-        .client
-        .agent_list(AgentListRequest {
-            scope: fixture.scope.clone(),
-            activity_id: Some(fixture.activity_id),
-            now: timestamp_now()?,
-            limit: AgentListLimit::DEFAULT,
-        })?
-        .into_iter()
-        .find(|projection| projection.agent().id() == fixture.agent_id)
-        .ok_or("source Agent disappeared after Activity lease release")?;
-    assert_eq!(agent.agent().session_id(), Some(fixture.session_id));
-    assert!(agent.agent().attachment_state().is_attached());
-
-    let still_running = wait_for_execution_state(
-        &fixture.client,
-        &fixture.scope,
-        approved.execution_id,
-        forge_domain::ExecutionState::Running,
-    )
-    .await?;
-    assert_eq!(still_running.state(), forge_domain::ExecutionState::Running);
-    let writer = std::thread::spawn(move || -> Result<(), String> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .open(fifo_path)
-            .map_err(|error| format!("FIFO writer open failed: {error}"))?;
-        file.write_all(b"backend-http-execution\n")
-            .map_err(|error| format!("FIFO writer failed: {error}"))
-    });
-    writer.join().map_err(|_| "FIFO writer thread panicked")??;
-
-    let completed = wait_for_execution_state(
-        &fixture.client,
-        &fixture.scope,
-        approved.execution_id,
-        forge_domain::ExecutionState::Completed,
-    )
-    .await?;
-    assert_eq!(completed.state(), forge_domain::ExecutionState::Completed);
-    assert_durable_output(fixture, approved)?;
-    let after_release = get_activity(address, fixture, fixture.activity_id.into_uuid()).await?;
-    assert_open_unleased(
-        &after_release,
-        fixture.activity_id.into_uuid(),
-        lease_revision + 1,
-    );
-    Ok(())
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn real_http_activity_leases_prove_cas_server_time_batch_atomicity_and_release_open()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -815,50 +740,6 @@ async fn real_http_activity_leases_prove_cas_server_time_batch_atomicity_and_rel
     assert_batch_rollbacks(address, &fixture, &second, &third).await?;
     assert_expiry_and_release_batch(address, &fixture, &current_fixture, &fourth).await?;
     assert_single_release_and_close(address, &fixture, &second, &third).await?;
-
-    let shutdown = state.shutdown(Duration::from_secs(5)).await;
-    assert!(
-        shutdown.is_successful(),
-        "backend shutdown did not complete"
-    );
-    fixture.shutdown()?;
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn real_http_activity_release_keeps_inflight_execution_alive()
--> Result<(), Box<dyn std::error::Error>> {
-    let mkfifo = Path::new("/usr/bin/mkfifo");
-    if !mkfifo.is_file() {
-        return Err("/usr/bin/mkfifo is required for the Activity release fixture".into());
-    }
-    let fixture = prepare_fixture()?;
-    let state = backend_state(&fixture)?;
-    let address = serve(state.clone()).await?;
-    let fifo_name = format!("activity-release-{}.fifo", Uuid::now_v7());
-    let fifo_path = fixture.workspace_root.join(&fifo_name);
-    let fifo_status = Command::new(mkfifo).arg(&fifo_path).status()?;
-    if !fifo_status.success() {
-        return Err(format!("mkfifo failed with status {fifo_status}").into());
-    }
-    let approved = prepare_approved_shell_for_script(&fixture, &format!("cat < {fifo_name}"))?;
-    let (status, begin) = post_command(
-        address,
-        "execution.begin",
-        execution_begin_payload(&approved),
-    )
-    .await?;
-    assert_eq!(status, 200, "execution.begin response: {begin}");
-    assert_eq!(begin["ok"], true);
-    let _running = wait_for_execution_state(
-        &fixture.client,
-        &fixture.scope,
-        approved.execution_id,
-        forge_domain::ExecutionState::Running,
-    )
-    .await?;
-
-    release_fifo_execution_and_assert_survival(address, &fixture, fifo_path, approved).await?;
 
     let shutdown = state.shutdown(Duration::from_secs(5)).await;
     assert!(

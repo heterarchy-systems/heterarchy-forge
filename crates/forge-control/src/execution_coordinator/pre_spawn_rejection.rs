@@ -210,7 +210,7 @@ mod tests {
         let cases = [
             (
                 ExecutionSupervisorError::Execution(ExecutionError::PackageVExecutable(
-                    PackageVExecutableError::ExternalStorageRejected,
+                    PackageVExecutableError::ExecutableChanged,
                 )),
                 "package_v_executable",
                 "none",

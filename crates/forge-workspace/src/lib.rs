@@ -55,6 +55,9 @@ pub use git_safety::{
     GitCheckpointObjectVerificationStatus, GitCheckpointRefInventory,
     GitCheckpointRefInventoryEntry, GitCheckpointRefInventoryLimit, GitCheckpointStore,
     GitCheckpointStoreIntegrity, GitRetainedSnapshot, GitSafetyError,
+    HOME_ARTIFACT_REF_INVENTORY_MAX, HOME_ARTIFACT_REF_PREFIX, HomeArtifactPathRead,
+    HomeArtifactRefInventory, HomeArtifactRefInventoryEntry, HomeArtifactRefInventoryLimit,
+    HomeArtifactRefIssue, HomeArtifactStore, HomeArtifactStoreError,
 };
 pub use patch_review::{
     MAX_PATCH_REVIEW_BYTES, PATCH_REVIEW_CONTEXT_LINES, PatchReview, PatchReviewDisposition,

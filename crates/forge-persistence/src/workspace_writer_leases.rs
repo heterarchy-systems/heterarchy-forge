@@ -232,6 +232,13 @@ pub(crate) fn renew(
             principal: command.principal(),
         },
     )?;
+    crate::workspace_home_transfers::guards::ensure_actor_open(
+        &transaction,
+        workspace_id,
+        command.agent_id(),
+        Some(command.session_id()),
+    )
+    .map_err(|error| WriterLeaseStoreError::HomeTransfer(Box::new(error)))?;
     crate::workspace_work_cuts::guards::ensure_lease_renewal_open(
         &transaction,
         workspace_id,
@@ -805,6 +812,8 @@ fn decode_uuid(field: &'static str, value: &[u8]) -> Result<Uuid, WriterLeaseSto
 #[derive(Debug, Error)]
 pub enum WriterLeaseStoreError {
     #[error(transparent)]
+    HomeTransfer(#[from] Box<crate::HomeTransferStoreError>),
+    #[error(transparent)]
     WorkCut(#[from] Box<crate::WorkCutError>),
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
@@ -886,20 +895,28 @@ impl From<crate::WorkCutError> for WriterLeaseStoreError {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{
+        cell::RefCell,
+        fs,
+        path::{Path, PathBuf},
+        sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel},
+        thread::{self, JoinHandle},
+        time::{Duration, Instant},
+    };
 
     use forge_domain::{
         AcquireWriterLease, AgentInstanceId, AgentSessionId, AuthenticatedPrincipal, DirectTokenId,
         ReleaseWriterLease, RenewWriterLease, RuntimeInstanceId, TimestampMillis, WorkspaceId,
-        WorkspaceRelativePath, WriterLeaseDurationMillis, WriterLeaseId, WriterLeaseScope,
-        WriterLeaseScopeEntry, WriterLeaseScopeKind, WriterLeaseState, WriterLeaseStatus,
+        WorkspaceRelativePath, WriterLease, WriterLeaseDurationMillis, WriterLeaseId,
+        WriterLeaseScope, WriterLeaseScopeEntry, WriterLeaseScopeKind, WriterLeaseState,
+        WriterLeaseStatus,
     };
-    use rusqlite::{Connection, params};
+    use rusqlite::{Connection, ErrorCode, TransactionBehavior, params};
     use uuid::Uuid;
 
     use super::{
-        WriterLeaseStoreError, acquire, create_schema, get, list_active, list_active_page, release,
-        release_for_recovery, renew,
+        WriterLeaseStoreError, WriterLeaseTransitionError, acquire, create_schema, get,
+        list_active, list_active_page, release, release_for_recovery, renew,
     };
     use crate::workspace_agents;
 
@@ -911,9 +928,47 @@ mod tests {
         session_id: AgentSessionId,
     }
 
-    fn fixture() -> Result<Fixture, Box<dyn std::error::Error>> {
-        let connection = Connection::open_in_memory()?;
+    struct TempDatabaseRoot(PathBuf);
+
+    impl TempDatabaseRoot {
+        fn create() -> Result<Self, Box<dyn std::error::Error>> {
+            let path = std::env::temp_dir().join(format!(
+                "forge-writer-lease-concurrency-{}-{}",
+                std::process::id(),
+                Uuid::now_v7(),
+            ));
+            fs::create_dir(&path)?;
+            Ok(Self(path))
+        }
+
+        fn database_path(&self) -> PathBuf {
+            self.0.join("workspace.sqlite3")
+        }
+    }
+
+    impl Drop for TempDatabaseRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn configure_connection(connection: &Connection) -> Result<(), Box<dyn std::error::Error>> {
         connection.pragma_update(None, "foreign_keys", true)?;
+        connection.busy_timeout(Duration::from_secs(10))?;
+        let foreign_keys: i64 =
+            connection.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
+        assert_eq!(foreign_keys, 1);
+        Ok(())
+    }
+
+    fn fixture() -> Result<Fixture, Box<dyn std::error::Error>> {
+        fixture_with_connection(Connection::open_in_memory()?)
+    }
+
+    fn fixture_with_connection(
+        connection: Connection,
+    ) -> Result<Fixture, Box<dyn std::error::Error>> {
+        configure_connection(&connection)?;
         connection.execute_batch(
             "CREATE TABLE workspace (
                 singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
@@ -975,6 +1030,31 @@ mod tests {
         })
     }
 
+    fn file_fixture_pair(
+        database_path: &Path,
+    ) -> Result<(Fixture, Fixture), Box<dyn std::error::Error>> {
+        let first = fixture_with_connection(Connection::open(database_path)?)?;
+        let second_agent_id = AgentInstanceId::from_uuid(Uuid::from_u128(0x301));
+        let second_session_id = AgentSessionId::from_uuid(Uuid::from_u128(0x501));
+        insert_writer_agent(
+            &first.connection,
+            first.workspace_id,
+            first.activity_id,
+            second_agent_id,
+            second_session_id,
+        )?;
+        let second_connection = Connection::open(database_path)?;
+        configure_connection(&second_connection)?;
+        let second = Fixture {
+            connection: second_connection,
+            workspace_id: first.workspace_id,
+            activity_id: first.activity_id,
+            agent_id: second_agent_id,
+            session_id: second_session_id,
+        };
+        Ok((first, second))
+    }
+
     fn insert_writer_agent(
         connection: &Connection,
         workspace_id: WorkspaceId,
@@ -1012,6 +1092,19 @@ mod tests {
             WriterLeaseScopeKind::DirectorySubtree,
             WorkspaceRelativePath::new(PathBuf::from(path))?,
         )])?)
+    }
+
+    fn exact_bundle(paths: &[&str]) -> Result<WriterLeaseScope, Box<dyn std::error::Error>> {
+        let entries = paths
+            .iter()
+            .map(|path| {
+                Ok(WriterLeaseScopeEntry::new(
+                    WriterLeaseScopeKind::ExactPath,
+                    WorkspaceRelativePath::new(PathBuf::from(*path))?,
+                ))
+            })
+            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+        Ok(WriterLeaseScope::new(entries)?)
     }
 
     fn command(
@@ -1052,6 +1145,542 @@ mod tests {
             session_id,
             principal,
         )?)
+    }
+
+    struct BusyProbe {
+        sender: SyncSender<WriterLeaseId>,
+        lease_id: WriterLeaseId,
+        deadline: Instant,
+        notified: bool,
+    }
+
+    thread_local! {
+        static SQLITE_BUSY_PROBE: RefCell<Option<BusyProbe>> = const { RefCell::new(None) };
+    }
+
+    fn bounded_sqlite_busy_handler(_previous_calls: i32) -> bool {
+        SQLITE_BUSY_PROBE.with(|probe| {
+            let Ok(mut probe) = probe.try_borrow_mut() else {
+                return false;
+            };
+            let Some(probe) = probe.as_mut() else {
+                return false;
+            };
+            if !probe.notified {
+                match probe.sender.try_send(probe.lease_id) {
+                    Ok(()) => probe.notified = true,
+                    Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
+                        return false;
+                    }
+                }
+            }
+            if Instant::now() >= probe.deadline {
+                return false;
+            }
+            thread::yield_now();
+            true
+        })
+    }
+
+    type AcquireWorkerOutcome = (WriterLeaseId, Result<WriterLease, WriterLeaseStoreError>);
+
+    struct AcquireRaceEvidence {
+        busy_lease_ids: Vec<WriterLeaseId>,
+        outcomes: Vec<AcquireWorkerOutcome>,
+    }
+
+    fn spawn_acquire_worker(
+        mut fixture: Fixture,
+        command: AcquireWriterLease,
+        busy_sender: SyncSender<WriterLeaseId>,
+        result_sender: SyncSender<AcquireWorkerOutcome>,
+    ) -> std::io::Result<JoinHandle<Result<(), String>>> {
+        let lease_id = command.lease_id();
+        thread::Builder::new()
+            .name("writer-lease-race-worker".to_owned())
+            .spawn(move || {
+                SQLITE_BUSY_PROBE.with(|probe| {
+                    *probe.borrow_mut() = Some(BusyProbe {
+                        sender: busy_sender,
+                        lease_id,
+                        deadline: Instant::now() + Duration::from_secs(15),
+                        notified: false,
+                    });
+                });
+                let result = acquire(&mut fixture.connection, &command);
+                SQLITE_BUSY_PROBE.with(|probe| *probe.borrow_mut() = None);
+                result_sender
+                    .send((lease_id, result))
+                    .map_err(|_| "Writer Lease result receiver was dropped".to_owned())
+            })
+    }
+
+    fn join_acquire_workers(
+        handles: Vec<JoinHandle<Result<(), String>>>,
+        result_receiver: &Receiver<AcquireWorkerOutcome>,
+        expected_results: usize,
+    ) -> Result<Vec<AcquireWorkerOutcome>, Box<dyn std::error::Error>> {
+        let mut failures = Vec::new();
+        for joined in handles.into_iter().map(JoinHandle::join) {
+            match joined {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => failures.push(error),
+                Err(_) => failures.push("Writer Lease worker panicked".to_owned()),
+            }
+        }
+
+        let mut outcomes = Vec::with_capacity(expected_results);
+        for _ in 0..expected_results {
+            match result_receiver.recv() {
+                Ok(outcome) => outcomes.push(outcome),
+                Err(error) => {
+                    failures.push(format!(
+                        "Writer Lease worker result channel closed: {error}"
+                    ));
+                    break;
+                }
+            }
+        }
+        if failures.is_empty() {
+            Ok(outcomes)
+        } else {
+            Err(std::io::Error::other(failures.join("; ")).into())
+        }
+    }
+
+    fn acquire_race_behind_sqlite_writer(
+        first_fixture: Fixture,
+        first_command: AcquireWriterLease,
+        second_fixture: Fixture,
+        second_command: AcquireWriterLease,
+        holder: &mut Connection,
+        second_starts_first: bool,
+    ) -> Result<AcquireRaceEvidence, Box<dyn std::error::Error>> {
+        first_fixture
+            .connection
+            .busy_handler(Some(bounded_sqlite_busy_handler))?;
+        second_fixture
+            .connection
+            .busy_handler(Some(bounded_sqlite_busy_handler))?;
+        let holder_transaction =
+            holder.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (busy_sender, busy_receiver) = sync_channel(2);
+        let (result_sender, result_receiver) = sync_channel(2);
+
+        let (early_fixture, early_command, late_fixture, late_command) = if second_starts_first {
+            (second_fixture, second_command, first_fixture, first_command)
+        } else {
+            (first_fixture, first_command, second_fixture, second_command)
+        };
+        let early_worker = match spawn_acquire_worker(
+            early_fixture,
+            early_command,
+            busy_sender.clone(),
+            result_sender.clone(),
+        ) {
+            Ok(worker) => worker,
+            Err(error) => {
+                drop(busy_sender);
+                drop(result_sender);
+                holder_transaction.rollback()?;
+                return Err(error.into());
+            }
+        };
+        let late_worker = match spawn_acquire_worker(
+            late_fixture,
+            late_command,
+            busy_sender.clone(),
+            result_sender.clone(),
+        ) {
+            Ok(worker) => worker,
+            Err(error) => {
+                drop(busy_sender);
+                drop(result_sender);
+                let rollback = holder_transaction.rollback();
+                join_acquire_workers(vec![early_worker], &result_receiver, 1)?;
+                rollback?;
+                return Err(error.into());
+            }
+        };
+        drop(busy_sender);
+        drop(result_sender);
+
+        let mut busy_lease_ids = Vec::with_capacity(2);
+        let mut rendezvous_error = None;
+        for _ in 0..2 {
+            match busy_receiver.recv_timeout(Duration::from_secs(10)) {
+                Ok(lease_id) => busy_lease_ids.push(lease_id),
+                Err(error) => {
+                    rendezvous_error = Some(error);
+                    break;
+                }
+            }
+        }
+        let rollback = holder_transaction.rollback();
+        let outcomes = join_acquire_workers(vec![early_worker, late_worker], &result_receiver, 2);
+        let outcomes = outcomes?;
+        rollback?;
+        if let Some(error) = rendezvous_error {
+            return Err(std::io::Error::other(format!(
+                "both Writer Lease workers did not observe SQLite contention: {error}"
+            ))
+            .into());
+        }
+        Ok(AcquireRaceEvidence {
+            busy_lease_ids,
+            outcomes,
+        })
+    }
+
+    fn scope_entry_count(
+        connection: &Connection,
+        lease_id: WriterLeaseId,
+    ) -> rusqlite::Result<i64> {
+        connection.query_row(
+            "SELECT COUNT(*) FROM writer_lease_scope_entries WHERE lease_id = ?1",
+            params![lease_id.into_uuid().as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+    }
+
+    fn assert_active_lease(
+        connection: &Connection,
+        lease_id: WriterLeaseId,
+        expected_scope: &WriterLeaseScope,
+        expected_revision: forge_domain::WriterLeaseRevision,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let stored = get(connection, lease_id)?.ok_or("expected Writer Lease was absent")?;
+        assert_eq!(stored.id(), lease_id);
+        assert_eq!(stored.state(), WriterLeaseState::Active);
+        assert_eq!(stored.revision(), expected_revision);
+        assert_eq!(stored.scope(), expected_scope);
+        assert_eq!(
+            scope_entry_count(connection, lease_id)?,
+            i64::try_from(expected_scope.entries().len())?
+        );
+        Ok(())
+    }
+
+    fn run_sqlite_contention_case(
+        case_id: u128,
+        first_paths: &[&str],
+        second_paths: &[&str],
+        second_starts_first: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let database_root = TempDatabaseRoot::create()?;
+        let database_path = database_root.database_path();
+        let (first, second) = file_fixture_pair(&database_path)?;
+        let workspace_id = first.workspace_id;
+        let first_scope = exact_bundle(first_paths)?;
+        let second_scope = exact_bundle(second_paths)?;
+        let first_lease_id = 0xA000_u128 + case_id * 2;
+        let second_lease_id = first_lease_id + 1;
+        let first_command = command(&first, first_lease_id, first_scope.clone(), 1_000, 5_000)?;
+        let second_command = command_with_identity(
+            &second,
+            second_lease_id,
+            second_scope.clone(),
+            1_000,
+            5_000,
+            second.session_id,
+            AuthenticatedPrincipal::TrustedStdio,
+        )?;
+        let mut holder = Connection::open(&database_path)?;
+        configure_connection(&holder)?;
+        let evidence = acquire_race_behind_sqlite_writer(
+            first,
+            first_command,
+            second,
+            second_command,
+            &mut holder,
+            second_starts_first,
+        )?;
+
+        assert_eq!(evidence.busy_lease_ids.len(), 2);
+        assert!(
+            evidence
+                .busy_lease_ids
+                .contains(&WriterLeaseId::from_uuid(Uuid::from_u128(first_lease_id)))
+        );
+        assert!(
+            evidence
+                .busy_lease_ids
+                .contains(&WriterLeaseId::from_uuid(Uuid::from_u128(second_lease_id)))
+        );
+        assert_eq!(evidence.outcomes.len(), 2);
+        let successful = evidence
+            .outcomes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (_, result))| result.is_ok().then_some(index))
+            .collect::<Vec<_>>();
+        assert_eq!(successful.len(), 1);
+        let winner_index = successful[0];
+        let loser_index = 1 - winner_index;
+        let winner_id = evidence.outcomes[winner_index].0;
+        let loser_id = evidence.outcomes[loser_index].0;
+        let winner_scope = if winner_id == WriterLeaseId::from_uuid(Uuid::from_u128(first_lease_id))
+        {
+            &first_scope
+        } else {
+            assert_eq!(
+                winner_id,
+                WriterLeaseId::from_uuid(Uuid::from_u128(second_lease_id))
+            );
+            &second_scope
+        };
+        let winner = evidence.outcomes[winner_index]
+            .1
+            .as_ref()
+            .map_err(|error| std::io::Error::other(format!("winner failed: {error:?}")))?;
+        assert_eq!(winner.id(), winner_id);
+        assert_eq!(winner.scope(), winner_scope);
+        match &evidence.outcomes[loser_index].1 {
+            Err(WriterLeaseStoreError::ScopeConflict {
+                conflicting_lease_id,
+            }) => assert_eq!(*conflicting_lease_id, winner_id),
+            Err(error) => {
+                return Err(std::io::Error::other(format!(
+                    "losing acquisition returned {error:?} instead of ScopeConflict"
+                ))
+                .into());
+            }
+            Ok(_) => return Err("both overlapping acquisitions succeeded".into()),
+        }
+
+        let readback = Connection::open(&database_path)?;
+        configure_connection(&readback)?;
+        let stored_winner = get(&readback, winner_id)?.ok_or("winner was not durable")?;
+        assert_eq!(stored_winner.state(), WriterLeaseState::Active);
+        assert_eq!(stored_winner.scope(), winner_scope);
+        assert!(get(&readback, loser_id)?.is_none());
+        assert_eq!(scope_entry_count(&readback, loser_id)?, 0);
+        assert_eq!(
+            scope_entry_count(&readback, winner_id)?,
+            i64::try_from(winner_scope.entries().len())?
+        );
+        let active = list_active(&readback, workspace_id)?;
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].id(), winner_id);
+        Ok(())
+    }
+
+    fn assert_active_lease_pair(
+        first_fixture: &Fixture,
+        second_fixture: &Fixture,
+        first_lease: &WriterLease,
+        second_lease: &WriterLease,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        assert_active_lease(
+            &first_fixture.connection,
+            first_lease.id(),
+            first_lease.scope(),
+            first_lease.revision(),
+        )?;
+        assert_active_lease(
+            &second_fixture.connection,
+            second_lease.id(),
+            second_lease.scope(),
+            second_lease.revision(),
+        )
+    }
+
+    fn assert_scope_conflict_without_persisting(
+        fixture: &mut Fixture,
+        failed_id: WriterLeaseId,
+        requested_scope: &WriterLeaseScope,
+        expected_conflict: WriterLeaseId,
+        observed_at: i64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let request = command(
+            fixture,
+            failed_id.into_uuid().as_u128(),
+            requested_scope.clone(),
+            observed_at,
+            5_000,
+        )?;
+        match acquire(&mut fixture.connection, &request) {
+            Err(WriterLeaseStoreError::ScopeConflict {
+                conflicting_lease_id,
+            }) => assert_eq!(conflicting_lease_id, expected_conflict),
+            Err(error) => {
+                return Err(std::io::Error::other(format!(
+                    "cross-owner resource acquisition returned {error:?} instead of the expected ScopeConflict"
+                ))
+                .into());
+            }
+            Ok(_) => return Err("overlapping Writer Lease was admitted".into()),
+        }
+        assert!(get(&fixture.connection, failed_id)?.is_none());
+        assert_eq!(scope_entry_count(&fixture.connection, failed_id)?, 0);
+        Ok(())
+    }
+
+    fn assert_release_fences_preserve_pair(
+        first: &mut Fixture,
+        second: &Fixture,
+        first_lease: &WriterLease,
+        second_lease: &WriterLease,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let wrong_owner = ReleaseWriterLease::new(
+            first_lease.id(),
+            second.agent_id,
+            first_lease.revision(),
+            TimestampMillis::new(1_200)?,
+            second.session_id,
+            AuthenticatedPrincipal::TrustedStdio,
+        );
+        assert!(matches!(
+            release(
+                &mut first.connection,
+                wrong_owner,
+                first.workspace_id,
+                first.activity_id,
+            ),
+            Err(WriterLeaseStoreError::Transition(
+                WriterLeaseTransitionError::StaleOwner
+            ))
+        ));
+        assert_active_lease_pair(first, second, first_lease, second_lease)?;
+
+        let stale_revision = ReleaseWriterLease::new(
+            first_lease.id(),
+            first.agent_id,
+            first_lease.revision().checked_next()?,
+            TimestampMillis::new(1_300)?,
+            first.session_id,
+            AuthenticatedPrincipal::TrustedStdio,
+        );
+        assert!(matches!(
+            release(
+                &mut first.connection,
+                stale_revision,
+                first.workspace_id,
+                first.activity_id,
+            ),
+            Err(WriterLeaseStoreError::Transition(
+                WriterLeaseTransitionError::StaleRevision
+            ))
+        ));
+        assert_active_lease_pair(first, second, first_lease, second_lease)
+    }
+
+    fn release_a_and_prove_progress(
+        first: &mut Fixture,
+        second: &mut Fixture,
+        first_lease: &WriterLease,
+        second_lease: &WriterLease,
+        first_owns_a: bool,
+        scope_a: &WriterLeaseScope,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (a_owner, b_owner) = if first_owns_a {
+            (first_lease, second_lease)
+        } else {
+            (second_lease, first_lease)
+        };
+        let (a_owner_agent, a_owner_session) = if first_owns_a {
+            (first.agent_id, first.session_id)
+        } else {
+            (second.agent_id, second.session_id)
+        };
+        let released = release(
+            &mut first.connection,
+            ReleaseWriterLease::new(
+                a_owner.id(),
+                a_owner_agent,
+                a_owner.revision(),
+                TimestampMillis::new(1_400)?,
+                a_owner_session,
+                AuthenticatedPrincipal::TrustedStdio,
+            ),
+            first.workspace_id,
+            first.activity_id,
+        )?;
+        assert_eq!(released.state(), WriterLeaseState::Released);
+        assert_eq!(released.revision(), a_owner.revision().checked_next()?);
+        let released_readback = get(&second.connection, a_owner.id())?
+            .ok_or("released A lease was absent from the other connection")?;
+        assert_eq!(released_readback.state(), WriterLeaseState::Released);
+        assert_eq!(released_readback.revision(), released.revision());
+
+        let progress_id = WriterLeaseId::from_uuid(Uuid::from_u128(0xB104));
+        let progressed = if first_owns_a {
+            let request = command(second, 0xB104, scope_a.clone(), 1_500, 5_000)?;
+            acquire(&mut second.connection, &request)?
+        } else {
+            let request = command(first, 0xB104, scope_a.clone(), 1_500, 5_000)?;
+            acquire(&mut first.connection, &request)?
+        };
+        assert_eq!(progressed.id(), progress_id);
+        assert_eq!(progressed.scope(), scope_a);
+        assert_active_lease(
+            &first.connection,
+            progressed.id(),
+            scope_a,
+            progressed.revision(),
+        )?;
+        assert_active_lease(
+            &first.connection,
+            b_owner.id(),
+            b_owner.scope(),
+            b_owner.revision(),
+        )?;
+        assert_eq!(list_active(&first.connection, first.workspace_id)?.len(), 2);
+        Ok(())
+    }
+
+    fn assert_incremental_conflict_direction(
+        first_owns_a: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let database_root = TempDatabaseRoot::create()?;
+        let (mut first, mut second) = file_fixture_pair(&database_root.database_path())?;
+        let scope_a = exact("src/a.rs")?;
+        let scope_b = exact("src/b.rs")?;
+        let (first_scope, second_scope) = if first_owns_a {
+            (scope_a.clone(), scope_b.clone())
+        } else {
+            (scope_b.clone(), scope_a.clone())
+        };
+        let first_command = command(&first, 0xB100, first_scope.clone(), 1_000, 5_000)?;
+        let second_command = command(&second, 0xB101, second_scope.clone(), 1_000, 5_000)?;
+        let first_existing = acquire(&mut first.connection, &first_command)?;
+        let second_existing = acquire(&mut second.connection, &second_command)?;
+        assert_active_lease_pair(&first, &second, &first_existing, &second_existing)?;
+
+        let (first_addition, second_addition) = if first_owns_a {
+            (&scope_b, &scope_a)
+        } else {
+            (&scope_a, &scope_b)
+        };
+        assert_scope_conflict_without_persisting(
+            &mut first,
+            WriterLeaseId::from_uuid(Uuid::from_u128(0xB102)),
+            first_addition,
+            second_existing.id(),
+            1_100,
+        )?;
+        assert_scope_conflict_without_persisting(
+            &mut second,
+            WriterLeaseId::from_uuid(Uuid::from_u128(0xB103)),
+            second_addition,
+            first_existing.id(),
+            1_100,
+        )?;
+        assert_active_lease_pair(&first, &second, &first_existing, &second_existing)?;
+        assert_release_fences_preserve_pair(
+            &mut first,
+            &second,
+            &first_existing,
+            &second_existing,
+        )?;
+        release_a_and_prove_progress(
+            &mut first,
+            &mut second,
+            &first_existing,
+            &second_existing,
+            first_owns_a,
+            &scope_a,
+        )
     }
 
     #[test]
@@ -1347,6 +1976,94 @@ mod tests {
             Err(WriterLeaseStoreError::AgentDetached)
         ));
         assert!(get(&fixture.connection, lease.lease_id())?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn sqlite_busy_writer_lease_races_commit_one_atomic_scope()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (round, second_starts_first) in [(0_u128, false), (1, true)] {
+            run_sqlite_contention_case(
+                round * 10,
+                &["src/shared.rs"],
+                &["src/shared.rs"],
+                second_starts_first,
+            )?;
+            run_sqlite_contention_case(
+                round * 10 + 1,
+                &["src/a.rs", "src/b.rs"],
+                &["src/b.rs", "src/a.rs"],
+                second_starts_first,
+            )?;
+            run_sqlite_contention_case(
+                round * 10 + 2,
+                &["src/a.rs", "src/shared.rs"],
+                &["src/b.rs", "src/shared.rs"],
+                second_starts_first,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cross_owner_resource_acquisition_conflicts_preserve_both_owner_orders()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_incremental_conflict_direction(true)?;
+        assert_incremental_conflict_direction(false)?;
+        Ok(())
+    }
+
+    #[test]
+    fn failed_second_scope_insert_rolls_back_lease_and_first_scope_row()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut fixture = fixture()?;
+        fixture.connection.execute_batch(
+            "CREATE TEMP TRIGGER abort_second_writer_lease_scope
+             BEFORE INSERT ON main.writer_lease_scope_entries
+             WHEN NEW.ordinal = 1
+             BEGIN
+                 SELECT RAISE(ABORT, 'test second scope insert failure');
+             END;",
+        )?;
+        let scope = exact_bundle(&["src/a.rs", "src/b.rs"])?;
+        let failed_command = command(&fixture, 0xC100, scope, 1_000, 5_000)?;
+        let failed_id = failed_command.lease_id();
+        let sqlite_error = match acquire(&mut fixture.connection, &failed_command) {
+            Err(WriterLeaseStoreError::Sqlite(error)) => error,
+            Err(error) => {
+                return Err(std::io::Error::other(format!(
+                    "expected the trigger's SQLite constraint error, got {error:?}"
+                ))
+                .into());
+            }
+            Ok(_) => return Err("scope-entry trigger did not abort acquisition".into()),
+        };
+        assert_eq!(
+            sqlite_error.sqlite_error_code(),
+            Some(ErrorCode::ConstraintViolation)
+        );
+        assert!(get(&fixture.connection, failed_id)?.is_none());
+        let lease_rows: i64 = fixture.connection.query_row(
+            "SELECT COUNT(*) FROM writer_leases WHERE lease_id = ?1",
+            params![failed_id.into_uuid().as_bytes().as_slice()],
+            |row| row.get(0),
+        )?;
+        assert_eq!(lease_rows, 0);
+        assert_eq!(scope_entry_count(&fixture.connection, failed_id)?, 0);
+
+        fixture
+            .connection
+            .execute_batch("DROP TRIGGER temp.abort_second_writer_lease_scope;")?;
+        let retry = command(&fixture, 0xC101, exact("src/valid.rs")?, 1_100, 5_000)?;
+        let acquired = acquire(&mut fixture.connection, &retry)?;
+        assert_eq!(acquired.id(), retry.lease_id());
+        assert_eq!(acquired.scope(), retry.scope());
+        assert_active_lease(
+            &fixture.connection,
+            acquired.id(),
+            retry.scope(),
+            acquired.revision(),
+        )?;
         Ok(())
     }
 }

@@ -306,8 +306,6 @@ pub(super) fn validate_package_verification_scope(
     if (source.starts_with(layout.workspace_root()) && !source.starts_with(layout.state_root()))
         || executable.starts_with(layout.workspace_root())
         || executable.starts_with(layout.state_root())
-        || executable.starts_with("/Volumes/256.SSD")
-        || source.starts_with("/Volumes/256.SSD")
     {
         return Err(SandboxBackendError::VerificationSourceScope);
     }
@@ -463,7 +461,12 @@ pub enum SandboxBackendError {
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::io::{self, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::{Command, Stdio};
+    use std::thread;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use crate::{
         ExecutionLaunchKind, RustCiDiscoveryInput, RustCiHostArchitecture,
@@ -472,6 +475,254 @@ mod tests {
     use forge_workspace::WorkspaceStateLayout;
 
     use super::*;
+
+    const PACKAGE_SANDBOX_CHILD_ENV: &str = "FORGE_PACKAGE_V_SANDBOX_CHILD";
+    const PACKAGE_SANDBOX_CHILD_MARKER: &str = "package-sandbox-child-v1";
+    const PACKAGE_SANDBOX_SOURCE_ENV: &str = "FORGE_PACKAGE_V_SANDBOX_SOURCE";
+    const PACKAGE_SANDBOX_LIVE_ENV: &str = "FORGE_PACKAGE_V_SANDBOX_LIVE";
+    const PACKAGE_SANDBOX_SECRET_ENV: &str = "FORGE_PACKAGE_V_SANDBOX_SECRET";
+    const PACKAGE_SANDBOX_SOCKET_ENV: &str = "FORGE_PACKAGE_V_SANDBOX_SOCKET";
+
+    struct PackageSandboxFixture(std::path::PathBuf);
+
+    impl Drop for PackageSandboxFixture {
+        fn drop(&mut self) {
+            let _ignored = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn permission_denied<T>(result: io::Result<T>, operation: &str) -> io::Result<()> {
+        match result {
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => Ok(()),
+            Err(error) => Err(io::Error::new(
+                error.kind(),
+                format!("{operation} failed for an unexpected reason: {error}"),
+            )),
+            Ok(_) => Err(io::Error::other(format!(
+                "{operation} was unexpectedly allowed"
+            ))),
+        }
+    }
+
+    fn stop_child(child: &mut std::process::Child) {
+        let _ignored = child.kill();
+        let _ignored = child.wait();
+    }
+
+    fn package_sandbox_child_probe() -> Result<(), Box<dyn std::error::Error>> {
+        let required_path = |name| -> io::Result<std::path::PathBuf> {
+            Ok(std::path::PathBuf::from(
+                std::env::var_os(name).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, format!("missing {name}"))
+                })?,
+            ))
+        };
+        let source = required_path(PACKAGE_SANDBOX_SOURCE_ENV)?;
+        let live = required_path(PACKAGE_SANDBOX_LIVE_ENV)?;
+        let secret = required_path(PACKAGE_SANDBOX_SECRET_ENV)?;
+        assert_eq!(fs::read(&source)?, b"package-source-original\n");
+        permission_denied(fs::read(&live), "live Workspace read")?;
+        permission_denied(fs::read(&secret), "private state read")?;
+
+        match fs::OpenOptions::new().write(true).open(&source) {
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {}
+            Err(error) => {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("source write open failed unexpectedly: {error}"),
+                )
+                .into());
+            }
+            Ok(mut file) => {
+                permission_denied(file.write_all(b"package-source-tampered\n"), "source write")?;
+            }
+        }
+
+        let socket: std::net::SocketAddr = std::env::var(PACKAGE_SANDBOX_SOCKET_ENV)?.parse()?;
+        permission_denied(TcpStream::connect(socket), "loopback connection")?;
+        println!("PACKAGE_V_SANDBOX_CHILD_OK");
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an actual macOS Seatbelt child process"]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "The control and child denial assertions form one ordered sandbox proof."
+    )]
+    fn package_verification_sandbox_denies_out_of_scope_access()
+    -> Result<(), Box<dyn std::error::Error>> {
+        if std::env::var(PACKAGE_SANDBOX_CHILD_ENV).as_deref() == Ok(PACKAGE_SANDBOX_CHILD_MARKER) {
+            package_sandbox_child_probe()?;
+            return Ok(());
+        }
+
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let temp_base = configured_tempdir()?;
+        let root = temp_base.join(format!("forge-package-sandbox-{unique}"));
+        fs::create_dir(&root)?;
+        let fixture = PackageSandboxFixture(root.clone());
+        let workspace_root = root.join("workspace");
+        fs::create_dir(&workspace_root)?;
+        WorkspaceStateLayout::initialize(&workspace_root)?;
+        let layout = WorkspaceStateLayout::inspect_existing(&workspace_root)?
+            .ok_or("workspace state layout missing")?;
+        let source_root = layout
+            .state_root()
+            .join("artifacts/verification/package-sandbox/source");
+        fs::create_dir_all(&source_root)?;
+        let source = source_root.join("input.txt");
+        let live = workspace_root.join("live.txt");
+        let secret = layout.state_root().join("private-secret.txt");
+        fs::write(&source, b"package-source-original\n")?;
+        fs::write(&live, b"live-workspace-secret\n")?;
+        fs::write(&secret, b"private-state-secret\n")?;
+
+        fs::write(&source, b"unsandboxed-control-write\n")?;
+        assert_eq!(fs::read(&source)?, b"unsandboxed-control-write\n");
+        fs::write(&source, b"package-source-original\n")?;
+        assert_eq!(fs::read(&live)?, b"live-workspace-secret\n");
+        assert_eq!(fs::read(&secret)?, b"private-state-secret\n");
+        let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        listener.set_nonblocking(true)?;
+        let socket = listener.local_addr()?;
+        let control = TcpStream::connect(socket)?;
+        let control_deadline = Instant::now() + Duration::from_secs(2);
+        let (accepted, _) = loop {
+            match listener.accept() {
+                Ok(accepted) => break accepted,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= control_deadline {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "unsandboxed loopback control connection was not accepted",
+                        )
+                        .into());
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
+        drop((control, accepted));
+
+        let executable = root.join("package-sandbox-test-executable");
+        fs::copy(std::env::current_exe()?, &executable)?;
+        let mut permissions = fs::metadata(&executable)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&executable, permissions)?;
+        let capability = PackageVExecutableCapability::prepare_at(&executable)?;
+        let profile = MacOsSandboxProfile::for_package_verification_launch(
+            &layout,
+            &source_root,
+            &capability,
+        )?;
+        let test_name = "sandbox::tests::package_verification_sandbox_denies_out_of_scope_access";
+        let mut child = Command::new(SANDBOX_EXEC_PATH)
+            .args(["-p", profile.as_str()])
+            .arg(&executable)
+            .args(["--ignored", "--exact", test_name, "--nocapture"])
+            .current_dir(&source_root)
+            .env_clear()
+            .env("TMPDIR", &temp_base)
+            .env(PACKAGE_SANDBOX_CHILD_ENV, PACKAGE_SANDBOX_CHILD_MARKER)
+            .env(PACKAGE_SANDBOX_SOURCE_ENV, &source)
+            .env(PACKAGE_SANDBOX_LIVE_ENV, &live)
+            .env(PACKAGE_SANDBOX_SECRET_ENV, &secret)
+            .env(PACKAGE_SANDBOX_SOCKET_ENV, socket.to_string())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut connected = false;
+        let status = loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    connected = true;
+                    drop(stream);
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => {
+                    stop_child(&mut child);
+                    return Err(error.into());
+                }
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => {}
+                Err(error) => {
+                    stop_child(&mut child);
+                    return Err(error.into());
+                }
+            }
+            if Instant::now() >= deadline {
+                let _ignored = child.kill();
+                let output = child.wait_with_output()?;
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("PackageV sandbox child timed out: {output:?}"),
+                )
+                .into());
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        let output = child.wait_with_output()?;
+        assert!(status.success(), "sandbox child failed: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("PACKAGE_V_SANDBOX_CHILD_OK"),
+            "sandbox child did not report its denial checks: {output:?}"
+        );
+        assert!(
+            !connected,
+            "sandbox child connected to the loopback listener"
+        );
+        assert_eq!(fs::read(&source)?, b"package-source-original\n");
+        assert_eq!(fs::read(&live)?, b"live-workspace-secret\n");
+        assert_eq!(fs::read(&secret)?, b"private-state-secret\n");
+        drop(listener);
+        drop(fixture);
+        Ok(())
+    }
+
+    fn configured_tempdir() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+        let configured = std::env::var_os("TMPDIR").ok_or("TMPDIR must be configured")?;
+        let configured = std::path::PathBuf::from(configured);
+        if !configured.is_absolute() {
+            return Err("TMPDIR must be absolute".into());
+        }
+        let canonical = fs::canonicalize(&configured)?;
+        if canonical != configured || !canonical.is_dir() {
+            return Err("TMPDIR must be an existing canonical directory".into());
+        }
+        Ok(canonical)
+    }
+
+    #[test]
+    fn package_verification_scope_accepts_configured_storage_paths()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let root = configured_tempdir()?.join(format!("forge-package-scope-{unique}"));
+        fs::create_dir(&root)?;
+        let workspace_root = root.join("workspace");
+        fs::create_dir(&workspace_root)?;
+        WorkspaceStateLayout::initialize(&workspace_root)?;
+        let layout = WorkspaceStateLayout::inspect_existing(&workspace_root)?
+            .ok_or("workspace state layout missing")?;
+        let source = layout
+            .state_root()
+            .join("artifacts/verification/package-v/source");
+        fs::create_dir_all(&source)?;
+        let executable = root.join("package-v-backend");
+        fs::write(&executable, b"backend")?;
+        let mut permissions = fs::metadata(&executable)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&executable, permissions)?;
+
+        validate_package_verification_scope(&layout, &source, &executable)?;
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
 
     #[test]
     #[cfg(target_os = "macos")]

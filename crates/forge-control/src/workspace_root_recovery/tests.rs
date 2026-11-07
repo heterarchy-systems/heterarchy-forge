@@ -235,6 +235,7 @@ fn seed_preserved_delegation(
          DROP TABLE IF EXISTS expired_activity_recovery_receipts;
          DROP TABLE root_recovery_delegation_receipts",
     )?;
+    crate::legacy_agent_fixture::remove_empty_evaluation_schema(&connection)?;
     connection.pragma_update(None, "user_version", 62)?;
     connection.execute(
         "UPDATE workspace SET root_fingerprint=?1",
@@ -284,7 +285,10 @@ fn preserved_v2_witness_prepares_commits_and_reads_back_without_v1_reinterpretat
             authority,
         ),
     )?;
-    assert_eq!(prepared.schema_version(), 69);
+    assert_eq!(
+        prepared.schema_version(),
+        forge_persistence::CURRENT_WORKSPACE_SCHEMA_VERSION
+    );
     assert_ne!(
         prepared.observation().witness(),
         probe.observation().witness()

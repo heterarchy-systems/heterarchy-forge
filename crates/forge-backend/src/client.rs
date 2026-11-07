@@ -38,8 +38,17 @@ use uuid::Uuid;
 use crate::config::{FORGE_API_VERSION, MAX_BODY_BYTES};
 use crate::ops::CommandOp;
 
+#[path = "client/evaluation_evidence.rs"]
+mod evaluation_evidence;
+mod home_transfer;
 #[path = "client/root_recovery.rs"]
 mod root_recovery;
+
+pub use evaluation_evidence::ForgeHttpEvaluationEvidenceError;
+pub use home_transfer::{
+    ForgeHttpHomeTransferSourceError, PreparedHomeTransferSourceCommand,
+    ReservedHomeTransferSourceSend,
+};
 
 const EFFECT_FACT_OUTBOX_PATH: &str = "/api/v1/commands/effect_fact.outbox";
 const MAX_HEADER_BYTES: usize = 8 * 1024;
@@ -905,20 +914,15 @@ fn migration_scope_payload(scope: &ResolvedWorkspaceScope) -> Result<Value, Forg
     }))
 }
 
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "The payload is assembled into an owned bounded HTTP envelope."
-)]
 fn migration_request_body(
     op: CommandOp,
     scope: Value,
     fields: Value,
     request_id: Uuid,
 ) -> Result<Vec<u8>, ForgeHttpClientError> {
-    let mut payload = fields
-        .as_object()
-        .cloned()
-        .ok_or(ForgeHttpClientError::InvalidRequest)?;
+    let Value::Object(mut payload) = fields else {
+        return Err(ForgeHttpClientError::InvalidRequest);
+    };
     payload.insert("scope".to_owned(), scope);
     let envelope = json!({
         "forge_api": FORGE_API_VERSION,
@@ -926,11 +930,7 @@ fn migration_request_body(
         "op": op.as_str(),
         "payload": Value::Object(payload),
     });
-    let body = to_vec(&envelope).map_err(|_| ForgeHttpClientError::Request)?;
-    if body.len() > MAX_REQUEST_BYTES {
-        return Err(ForgeHttpClientError::RequestTooLarge);
-    }
-    Ok(body)
+    bounded_request_body(&envelope)
 }
 
 #[allow(
@@ -948,7 +948,11 @@ fn root_recovery_request_body(
         "op": op.as_str(),
         "payload": payload,
     });
-    let body = to_vec(&envelope).map_err(|_| ForgeHttpClientError::Request)?;
+    bounded_request_body(&envelope)
+}
+
+fn bounded_request_body(envelope: &Value) -> Result<Vec<u8>, ForgeHttpClientError> {
+    let body = to_vec(envelope).map_err(|_| ForgeHttpClientError::Request)?;
     if body.len() > MAX_REQUEST_BYTES {
         return Err(ForgeHttpClientError::RequestTooLarge);
     }
@@ -1411,11 +1415,7 @@ fn request_body(
         "op": "effect_fact.outbox",
         "payload": payload,
     });
-    let body = to_vec(&envelope).map_err(|_| ForgeHttpClientError::Request)?;
-    if body.len() > MAX_REQUEST_BYTES {
-        return Err(ForgeHttpClientError::RequestTooLarge);
-    }
-    Ok(body)
+    bounded_request_body(&envelope)
 }
 
 fn decode_response(
@@ -2486,6 +2486,151 @@ mod tests {
         }
         stop.send(()).map_err(|()| "host did not accept shutdown")?;
         join.await??;
+        Ok(())
+    }
+
+    #[test]
+    fn migration_request_body_limit_counts_final_utf8_bytes() -> Result<(), Box<dyn Error>> {
+        const LIMIT: usize = 64 * 1024;
+        assert_eq!(MAX_REQUEST_BYTES, LIMIT);
+
+        let operation = CommandOp::AgentOperationsFreezeGet;
+        let scope = json!({"workspace_id": "scope"});
+        let request_id = Uuid::from_u128(0x501);
+        let empty_body =
+            migration_request_body(operation, scope.clone(), json!({"padding": ""}), request_id)?;
+        let empty_value = serde_json::to_vec("")?;
+        let empty_body_text = std::str::from_utf8(&empty_body)?;
+        let empty_value_text = std::str::from_utf8(&empty_value)?;
+        let fixed_bytes = empty_body.len() - empty_value.len();
+        let fixed_characters = empty_body_text.chars().count() - empty_value_text.chars().count();
+        assert_eq!(fixed_bytes, fixed_characters);
+
+        let projected_size = |padding: &str| -> Result<(usize, usize), Box<dyn Error>> {
+            let encoded_padding = serde_json::to_vec(padding)?;
+            let encoded_padding_text = std::str::from_utf8(&encoded_padding)?;
+            Ok((
+                fixed_bytes + encoded_padding.len(),
+                fixed_characters + encoded_padding_text.chars().count(),
+            ))
+        };
+
+        let ascii_exact = "x".repeat(LIMIT - fixed_bytes - empty_value.len());
+        assert_eq!(projected_size(&ascii_exact)?, (LIMIT, LIMIT));
+        let accepted_ascii = migration_request_body(
+            operation,
+            scope.clone(),
+            json!({"padding": ascii_exact}),
+            request_id,
+        )?;
+        assert_eq!(accepted_ascii.len(), LIMIT);
+
+        let utf8_exact = format!(
+            "é{}",
+            "x".repeat(LIMIT - fixed_bytes - empty_value.len() - 2)
+        );
+        assert_eq!(projected_size(&utf8_exact)?, (LIMIT, LIMIT - 1));
+        let accepted_utf8 = migration_request_body(
+            operation,
+            scope.clone(),
+            json!({"padding": utf8_exact}),
+            request_id,
+        )?;
+        assert_eq!(accepted_utf8.len(), LIMIT);
+
+        let ascii_over = "x".repeat(LIMIT + 1 - fixed_bytes - empty_value.len());
+        assert_eq!(projected_size(&ascii_over)?, (LIMIT + 1, LIMIT + 1));
+        assert_eq!(
+            migration_request_body(
+                operation,
+                scope.clone(),
+                json!({"padding": ascii_over}),
+                request_id,
+            ),
+            Err(ForgeHttpClientError::RequestTooLarge)
+        );
+
+        let utf8_over = format!(
+            "é{}",
+            "x".repeat(LIMIT + 1 - fixed_bytes - empty_value.len() - 2)
+        );
+        assert_eq!(projected_size(&utf8_over)?, (LIMIT + 1, LIMIT));
+        assert_eq!(
+            migration_request_body(operation, scope, json!({"padding": utf8_over}), request_id),
+            Err(ForgeHttpClientError::RequestTooLarge)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn migration_request_body_keeps_invalid_request_priority_and_scope_override()
+    -> Result<(), Box<dyn Error>> {
+        let operation = CommandOp::AgentOperationsFreezeGet;
+        let request_id = Uuid::from_u128(0x502);
+        assert_eq!(
+            migration_request_body(
+                operation,
+                Value::String("s".repeat(MAX_REQUEST_BYTES)),
+                Value::String("f".repeat(MAX_REQUEST_BYTES)),
+                request_id,
+            ),
+            Err(ForgeHttpClientError::InvalidRequest)
+        );
+
+        let supplied_scope = json!({"workspace_id": "supplied", "revision": 7});
+        let body = migration_request_body(
+            operation,
+            supplied_scope.clone(),
+            json!({
+                "scope": {"workspace_id": "original"},
+                "migration_id": "preserved",
+            }),
+            request_id,
+        )?;
+        let envelope: Value = serde_json::from_slice(&body)?;
+        assert_eq!(envelope["request_id"], json!(request_id));
+        assert_eq!(envelope["op"], operation.as_str());
+        assert_eq!(envelope["payload"]["scope"], supplied_scope);
+        assert_eq!(envelope["payload"]["migration_id"], "preserved");
+        Ok(())
+    }
+
+    #[test]
+    fn request_body_builders_preserve_their_wire_bytes() -> Result<(), Box<dyn Error>> {
+        let request_id = Uuid::from_u128(0x10b);
+        let migration_body = migration_request_body(
+            CommandOp::AgentOperationsFreezeGet,
+            json!({
+                "workspace_id": Uuid::from_u128(0x101),
+                "workspace_revision": 1,
+            }),
+            json!({
+                "migration_id": Uuid::from_u128(0x103),
+                "destination_id": Uuid::from_u128(0x104),
+            }),
+            request_id,
+        )?;
+        assert_eq!(
+            std::str::from_utf8(&migration_body)?,
+            r#"{"forge_api":1,"op":"agent.operations.freeze_get","payload":{"destination_id":"00000000-0000-0000-0000-000000000104","migration_id":"00000000-0000-0000-0000-000000000103","scope":{"workspace_id":"00000000-0000-0000-0000-000000000101","workspace_revision":1}},"request_id":"00000000-0000-0000-0000-00000000010b"}"#
+        );
+
+        let root_recovery_body = root_recovery_request_body(
+            CommandOp::WorkspaceRootRecoveryProbe,
+            json!({"locator": "locator-v1", "expected_workspace_id": null}),
+            request_id,
+        )?;
+        assert_eq!(
+            std::str::from_utf8(&root_recovery_body)?,
+            r#"{"forge_api":1,"op":"workspace.root_recovery.probe","payload":{"expected_workspace_id":null,"locator":"locator-v1"},"request_id":"00000000-0000-0000-0000-00000000010b"}"#
+        );
+
+        let effect_fact_request = request(0)?;
+        let effect_fact_body = request_body(&effect_fact_request, request_id)?;
+        assert_eq!(
+            std::str::from_utf8(&effect_fact_body)?,
+            r#"{"forge_api":1,"op":"effect_fact.outbox","payload":{"after":0,"destination_id":"00000000-0000-0000-0000-000000000104","limit":1,"migration_id":"00000000-0000-0000-0000-000000000103","scope":{"locator":{"expected_revision":1,"location_id":"00000000-0000-0000-0000-000000000102","relative_root":"."},"workspace_id":"00000000-0000-0000-0000-000000000101","workspace_revision":1}},"request_id":"00000000-0000-0000-0000-00000000010b"}"#
+        );
         Ok(())
     }
 }

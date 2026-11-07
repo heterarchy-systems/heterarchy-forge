@@ -15,7 +15,7 @@ files and use a different credential for each direction.
 From the Orchestration checkout:
 
 ```sh
-cargo run --locked -p heterarchy-orchestration-mcp -- \
+cargo run --locked -p heterarchy-orchestration-backend -- \
   session-authority serve 9101 \
   --catalog /absolute/path/orchestration-sessions.sqlite3 \
   --secret-file /absolute/path/session-service.secret
@@ -108,7 +108,7 @@ The capability endpoint reports the current command surface:
 | `agent.assignment_offer_seal`, `agent.assignment_offer_seal_get` | Seal future admission for one exact Activity/Assignment key and read back the seal plus the current global Assignment row. |
 | `node.start`, `node.complete` | Apply the existing authority-checked node transitions. |
 | `command.list` | Read the sealed command catalog and fingerprint. |
-| `command.submit`, `shell.submit` | Submit exact session-bound command/shell requests through the host-owned approval coordinator. Submission is separate from an execution success receipt. |
+| `command.submit` | Submit exact session-bound sealed project command requests through the host-owned approval coordinator. Submission is separate from an execution success receipt. |
 | `approval.get`, `approval.pending` | Read an exact approval audit or bounded pending projection; pending observation reconciles only elapsed authority through the existing owner. |
 | `execution.begin`, `execution.read`, `execution.output`, `execution.cancel` | Start preapproved execution through the approval application owner and execution admission owner, read bounded binary-safe output, and cancel with current session and provenance checks. |
 | `execution.stop_workspace`, `execution.stop_workspace_get` | Capture one exact Pending execution/approval/grant/auto-scope stop through the existing administrative owner, request native cancellation, and observe the original paired receipt without repeating cancellation. |
@@ -853,8 +853,8 @@ the original plan for exact owner readback before any identical retry. This is
 a live-owner protocol, not a durable causal stop or restart receipt.
 
 Approval/scheduling policy and grant issuance remain Orchestration-owned target
-contracts. Existing `command.submit`/`shell.submit` still traverse the transitional
-Forge-local approval coordinator; they do not establish completed ownership
+contracts. Existing `command.submit` still traverses the transitional
+Forge-local approval coordinator; it does not establish completed ownership
 cutover. Approval decision/auto-policy mutation routes are not added as a parity
 shortcut. Native Agent binding/delegation/departure, recovery maintenance,
 Workspace removal and complete downstream HTTP caller parity remain open.
@@ -914,3 +914,64 @@ IDs. Schema59 stores actual native closure/reap/output/manifest facts atomically
 with terminal evidence. Stop target settlement and admission release remain
 unimplemented follow-through. Source and Writer Lease quiescence are outside
 this execution-stop intent.
+
+## Home-transfer reservation retirement
+
+`home_transfer.reservation_retire_unused` retires one exact, still-unused
+binding reservation captured as Pending in an original Home Source preparation.
+It uses the configured private Source service identity and a distinct,
+short-lived retirement grant bound to the complete retirement request digest.
+Prepare and Abort grants do not authorize it. The request identifies the current
+Workspace scope, original preparation ID, original Source request/outcome
+digests and selected reservation request ID.
+
+The Workspace owner validates current scope/delegation and the original capture
+under one immediate transaction. It compares the native reservation provenance
+and rejects existing activation, rejection, materialized Agent or attributable
+work/history. Source time is sampled after those checks. Schema72 records an
+immutable retirement and prevents later activation, rejection or materialization
+of the retired identity. An already-used reservation must follow its actual
+handoff/settlement path; it is not relabeled as unused.
+
+`home_transfer.reservation_retirement_get` reads the original receipt by both
+preparation ID and reservation request ID, plus the expected retirement request
+digest. It does not require an OPEN target Session or an unexpired old grant.
+Unknown mutation replies retain those exact readback keys. The Rust client
+retains its prepared mutation and can construct this Get using a freshly
+resolved Workspace scope; it does not resend the mutation. A missing result
+remains unconfirmed and does not release a hold or authorize another operation.
+
+The old reservation and original Prepared capsule remain unchanged. Current
+inventory version2 can describe a Retired reservation, while version1 capsules
+remain readable and retain their original bytes. The original record's
+`captured_pending_binding_reservation_ids` method returns historical candidates,
+not current eligibility. Retirement Get validates its own terminal provenance;
+full Source readiness must validate the original capture and remaining work
+separately.
+
+Retirement does not settle other reservations, assignments, leases or effects,
+remove the Prepared fence, change Home membership, decide fault/credit or
+activate a destination binding. The Orchestration preparation/Source-dispatch
+APIs are separate consumers; no automatic retirement orchestration is implied
+by exposing these Source operations.
+## Home handback archives
+
+Workspace schema 73 adds a native Home artifact stage/seal journal. The native
+WorkspaceStore capture and member-read methods preserve declared file bytes in
+the Forge-owned Git store. They require current Source authority and retain the
+original Prepared record. There is no artifact mutation HTTP command in this
+slice, and a sealed archive does not grant a recipient an Assignment or change
+Team membership.
+
+`workspace.doctor` includes `home_artifacts`. Its `metadata_only` field is true:
+`retained_ref_matched` confirms the recorded ref/commit relationship, not a full
+blob-integrity audit. `pending_capture` and `published_pending_seal` require
+owner recovery; missing/conflicting/unmatched refs are not cleanup candidates.
+Truncated observations remain incomplete.
+
+An uncertain capture is recovered by its exact original identity. A missing
+ref does not authorize recapturing changed live files or releasing its durable
+pin. Pending and sealed pins protect Workspace removal/root recovery; archived
+paths are not an atomic Workspace snapshot or proof that all unfinished work
+has been handed over. Actual recipient acceptance, assignment application and
+provider-worktree custody remain separate required operations.

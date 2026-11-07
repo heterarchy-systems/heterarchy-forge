@@ -13,6 +13,8 @@ use crate::{
     OrchestrationIssuerId, RuntimeInstanceId, TimestampMillis,
 };
 
+/// Persisted continuation receipt contract version; separate from the source
+/// schema census manifest version and kept stable for completed receipts.
 pub const UNSTARTED_ACTIVITY_CONTINUATION_CENSUS_VERSION: u16 = 1;
 pub const UNSTARTED_ACTIVITY_CONTINUATION_DIGEST_BYTES: usize = 32;
 pub const UNSTARTED_ACTIVITY_CONTINUATION_MAX_AGENT_COUNT: u16 = 256;
@@ -125,7 +127,7 @@ impl UnstartedActivityContinuationExpectation {
     }
 }
 
-/// The first fail-closed reason found by the closed schema-v66 census.
+/// The first fail-closed reason found by the closed schema-v70 census.
 #[must_use]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UnstartedActivityContinuationBlocker {
@@ -143,6 +145,8 @@ pub enum UnstartedActivityContinuationBlocker {
     PendingActivation,
     OrphanRecord,
     UnclassifiedSchemaObject,
+    EvaluationEvidencePresent,
+    EvaluationProvenanceUnknown,
 }
 
 /// Read-only probe. A run must re-compute every field after `BEGIN IMMEDIATE`.

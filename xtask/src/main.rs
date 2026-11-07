@@ -7,8 +7,13 @@ mod doctor;
 mod package;
 mod policy_package;
 mod test_runner;
+mod workspace_root;
+
+#[cfg(test)]
+mod test_support;
 
 use doctor::doctor;
+use workspace_root::workspace_root;
 
 use std::env;
 use std::ffi::{OsStr, OsString};
@@ -97,6 +102,24 @@ const PROCESS_CAPTURE_STREAM_COUNT: usize = 2;
 const REQUIRED_CARGO_DENY_VERSION: &str = "cargo-deny 0.20.2";
 const REQUIRED_CARGO_AUDIT_VERSION: &str = "cargo-audit 0.22.2";
 const MSRV_TOOLCHAIN: &str = "1.98.0";
+const MSRV_CHECK_ARGUMENTS: &[&str] = &["check", "--locked", "--workspace", "--all-targets"];
+const REPO_AFFECTING_COMMANDS: &[&str] = &[
+    "rules",
+    "harness",
+    "fmt",
+    "check",
+    "test",
+    "ci",
+    "doctor",
+    "deps",
+    "supply-chain",
+    "extended",
+    "perf",
+    "msrv",
+    "persistence",
+    "package",
+    "policy-package",
+];
 const RUST_CI_SANDBOX_MARKER_ENV: &str = "HETERARCHY_FORGE_RUST_CI_SANDBOX";
 const RUST_CI_SANDBOX_MARKER_VALUE: &str = "v1";
 const RUST_CI_TEST_POLICY_ENV: &str = "HETERARCHY_FORGE_RUST_CI_TEST_POLICY";
@@ -117,66 +140,84 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
-    match env::args().nth(1).as_deref().unwrap_or("help") {
-        "rules" => rules(),
-        "harness" => harness(),
-        "fmt" => cargo(&["fmt", "--all", "--", "--check"]),
-        "check" => check(),
-        "test" => test(),
-        "ci" => ci(),
-        "doctor" => doctor(),
-        "deps" => deps(),
-        "supply-chain" => supply_chain(),
-        "extended" => extended(),
-        "perf" => perf(),
-        "msrv" => msrv(),
-        "persistence" => persistence(),
-        "package" => package::run(&workspace_root()),
-        "policy-package" => policy_package::run(&workspace_root(), env::args().skip(2)),
-        "help" | "--help" | "-h" => {
-            println!(
-                "usage: cargo xtask <rules|harness|fmt|check|test|ci|doctor|deps|supply-chain|extended|perf|msrv|persistence|package|policy-package>"
-            );
-            Ok(())
-        }
+    let command = env::args().nth(1).unwrap_or_else(|| "help".to_owned());
+    if matches!(command.as_str(), "help" | "--help" | "-h") {
+        print_usage();
+        return Ok(());
+    }
+    if !REPO_AFFECTING_COMMANDS.contains(&command.as_str()) {
+        return Err(format!("unknown command {command:?}"));
+    }
+
+    let root = workspace_root()?;
+    eprintln!(
+        "cargo xtask: selected Forge workspace root: {}",
+        root.display()
+    );
+    match command.as_str() {
+        "rules" => rules(&root),
+        "harness" => harness(&root),
+        "fmt" => cargo(&root, &["fmt", "--all", "--", "--check"]),
+        "check" => check(&root),
+        "test" => test(&root),
+        "ci" => ci(&root),
+        "doctor" => doctor(&root),
+        "deps" => deps(&root),
+        "supply-chain" => supply_chain(&root),
+        "extended" => extended(&root),
+        "perf" => perf(&root),
+        "msrv" => msrv(&root),
+        "persistence" => persistence(&root),
+        "package" => package::run(&root),
+        "policy-package" => policy_package::run(&root, env::args().skip(2)),
         other => Err(format!("unknown command {other:?}")),
     }
 }
 
-fn ci() -> Result<(), String> {
-    rules()?;
-    require_nonempty_file(&workspace_root().join("Cargo.lock"), "Cargo lockfile")?;
-    cargo(&["fmt", "--all", "--", "--check"])?;
-    check()?;
-    test()
+fn print_usage() {
+    println!(
+        "usage: cargo xtask <rules|harness|fmt|check|test|ci|doctor|deps|supply-chain|extended|perf|msrv|persistence|package|policy-package>"
+    );
 }
 
-fn check() -> Result<(), String> {
-    cargo(&["check", "--locked", "--workspace", "--all-targets"])?;
-    cargo(&[
-        "clippy",
-        "--locked",
-        "--workspace",
-        "--all-targets",
-        "--",
-        "-D",
-        "warnings",
-    ])
+fn ci(root: &Path) -> Result<(), String> {
+    rules(root)?;
+    require_nonempty_file(&root.join("Cargo.lock"), "Cargo lockfile")?;
+    cargo(root, &["fmt", "--all", "--", "--check"])?;
+    check(root)?;
+    test(root)
 }
 
-fn test() -> Result<(), String> {
+fn check(root: &Path) -> Result<(), String> {
+    cargo(root, &["check", "--locked", "--workspace", "--all-targets"])?;
+    cargo(
+        root,
+        &[
+            "clippy",
+            "--locked",
+            "--workspace",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ],
+    )
+}
+
+fn test(root: &Path) -> Result<(), String> {
     if outer_rust_ci_test_profile_enabled() {
         println!("{OUTER_RUST_CI_PROFILE_NOTICE}");
         test_workspace(
+            root,
             true,
             &[(RUST_CI_TEST_POLICY_ENV, RUST_CI_TEST_POLICY_VALUE)],
         )
     } else {
-        test_workspace(false, &[])
+        test_workspace(root, false, &[])
     }
 }
 
-fn test_workspace(quiet: bool, environment: &[(&str, &str)]) -> Result<(), String> {
+fn test_workspace(root: &Path, quiet: bool, environment: &[(&str, &str)]) -> Result<(), String> {
     let mut workspace_arguments = vec!["test"];
     if quiet {
         workspace_arguments.push("--quiet");
@@ -188,7 +229,7 @@ fn test_workspace(quiet: bool, environment: &[(&str, &str)]) -> Result<(), Strin
         "--exclude",
         FORGE_EXECUTION_PACKAGE,
     ]);
-    cargo_test_with_runner_policy(&workspace_arguments, environment)?;
+    cargo_test_with_runner_policy(root, &workspace_arguments, environment)?;
 
     let mut execution_arguments = vec!["test"];
     if quiet {
@@ -197,7 +238,7 @@ fn test_workspace(quiet: bool, environment: &[(&str, &str)]) -> Result<(), Strin
     execution_arguments.extend(["--locked", "-p", FORGE_EXECUTION_PACKAGE, "--all-targets"]);
     let mut execution_environment = environment.to_vec();
     execution_environment.push((RUST_TEST_THREADS_ENV, FORGE_EXECUTION_TEST_THREADS));
-    cargo_test_with_runner_policy(&execution_arguments, &execution_environment)
+    cargo_test_with_runner_policy(root, &execution_arguments, &execution_environment)
 }
 
 fn outer_rust_ci_test_profile_enabled() -> bool {
@@ -215,33 +256,41 @@ fn outer_rust_ci_test_profile_enabled_for(
         && test_policy == Some(RUST_CI_TEST_POLICY_VALUE)
 }
 
-fn persistence() -> Result<(), String> {
-    let root = workspace_root();
-    verify_forge_persistence_source_policy(&root)?;
-    cargo(&[
-        "check",
-        "--locked",
-        "-p",
-        "forge-persistence",
-        "--all-targets",
-    ])?;
-    cargo(&[
-        "clippy",
-        "--locked",
-        "-p",
-        "forge-persistence",
-        "--all-targets",
-        "--",
-        "-D",
-        "warnings",
-    ])?;
-    cargo(&[
-        "test",
-        "--locked",
-        "-p",
-        "forge-persistence",
-        "--all-targets",
-    ])?;
+fn persistence(root: &Path) -> Result<(), String> {
+    verify_forge_persistence_source_policy(root)?;
+    cargo(
+        root,
+        &[
+            "check",
+            "--locked",
+            "-p",
+            "forge-persistence",
+            "--all-targets",
+        ],
+    )?;
+    cargo(
+        root,
+        &[
+            "clippy",
+            "--locked",
+            "-p",
+            "forge-persistence",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ],
+    )?;
+    cargo(
+        root,
+        &[
+            "test",
+            "--locked",
+            "-p",
+            "forge-persistence",
+            "--all-targets",
+        ],
+    )?;
     println!("Heterarchy Forge persistence harness passed");
     Ok(())
 }
@@ -269,7 +318,7 @@ struct DoctorSandbox {
 
 impl DoctorSandbox {
     fn create() -> Result<Self, String> {
-        let root = env::temp_dir().join(format!(
+        let root = test_runner::configured_temporary_base()?.join(format!(
             "heterarchy-forge-xtask-doctor-{}-{}",
             std::process::id(),
             unique_suffix()
@@ -351,60 +400,49 @@ fn unique_suffix() -> u128 {
         .map_or(0, |duration| duration.as_nanos())
 }
 
-fn deps() -> Result<(), String> {
-    let root = workspace_root();
+fn deps(root: &Path) -> Result<(), String> {
     require_nonempty_file(&root.join("Cargo.lock"), "Cargo lockfile")?;
     require_nonempty_file(&root.join("deny.toml"), "cargo-deny policy")?;
-    require_tool_version("cargo-deny", REQUIRED_CARGO_DENY_VERSION, &root)?;
-    cargo(&["deny", "check"])
+    require_tool_version("cargo-deny", REQUIRED_CARGO_DENY_VERSION, root)?;
+    cargo(root, &["deny", "check"])
 }
 
-fn supply_chain() -> Result<(), String> {
-    let root = workspace_root();
-    deps()?;
-    require_tool_version("cargo-audit", REQUIRED_CARGO_AUDIT_VERSION, &root)?;
-    cargo(&["audit"])
+fn supply_chain(root: &Path) -> Result<(), String> {
+    deps(root)?;
+    require_tool_version("cargo-audit", REQUIRED_CARGO_AUDIT_VERSION, root)?;
+    cargo(root, &["audit"])
 }
 
-fn extended() -> Result<(), String> {
-    ci()?;
-    msrv()?;
-    supply_chain()?;
-    cargo(&["test", "--locked", "--workspace", "--doc"])?;
-    cargo(&[
-        "--config",
-        "build.rustdocflags=[\"-D\",\"warnings\"]",
-        "doc",
-        "--locked",
-        "--workspace",
-        "--no-deps",
-    ])
-}
-
-fn msrv() -> Result<(), String> {
-    command_in(
-        "rustup",
+fn extended(root: &Path) -> Result<(), String> {
+    ci(root)?;
+    msrv(root)?;
+    supply_chain(root)?;
+    cargo(root, &["test", "--locked", "--workspace", "--doc"])?;
+    cargo(
+        root,
         &[
-            "run",
-            MSRV_TOOLCHAIN,
-            "cargo",
-            "check",
+            "--config",
+            "build.rustdocflags=[\"-D\",\"warnings\"]",
+            "doc",
             "--locked",
             "--workspace",
-            "--all-targets",
+            "--no-deps",
         ],
-        &workspace_root(),
     )
 }
 
-fn perf() -> Result<(), String> {
-    if !workspace_has_bench_target()? {
+fn msrv(root: &Path) -> Result<(), String> {
+    cargo(root, MSRV_CHECK_ARGUMENTS)
+}
+
+fn perf(root: &Path) -> Result<(), String> {
+    if !workspace_has_bench_target(root)? {
         return Err(
             "performance command is unconfigured: no workspace benchmark target found".to_owned(),
         );
     }
     println!("running benchmarks as measurement evidence; no release-budget PASS is implied");
-    cargo(&["bench", "--locked", "--workspace"])
+    cargo(root, &["bench", "--locked", "--workspace"])
 }
 
 fn require_tool_version(program: &str, expected: &str, root: &Path) -> Result<(), String> {
@@ -438,24 +476,23 @@ fn require_tool_version(program: &str, expected: &str, root: &Path) -> Result<()
     }
 }
 
-fn rules() -> Result<(), String> {
-    let root = workspace_root();
+fn rules(root: &Path) -> Result<(), String> {
     require_nonempty_file(&root.join("AGENTS.md"), "root agent instructions")?;
-    verify_rust_only_sources(&root)?;
-    verify_workspace_manifest(&root)?;
-    verify_forge_persistence_source_policy(&root)?;
-    let metadata = cargo_metadata(&root)?;
+    verify_rust_only_sources(root)?;
+    verify_workspace_manifest(root)?;
+    verify_forge_persistence_source_policy(root)?;
+    let metadata = cargo_metadata(root)?;
     verify_manifest_lints(&metadata)?;
     verify_locked_metadata(&metadata)?;
-    policy_package::verify(&root)?;
+    policy_package::verify(root)?;
 
     println!("Heterarchy Forge Rust rules verification passed");
     Ok(())
 }
 
-fn harness() -> Result<(), String> {
-    verify_private_harness(&workspace_root())?;
-    rules()?;
+fn harness(root: &Path) -> Result<(), String> {
+    verify_private_harness(root)?;
+    rules(root)?;
     println!("Heterarchy Forge local Rust Harness verification passed");
     Ok(())
 }
@@ -924,8 +961,8 @@ fn cargo_target_directory(root: &Path) -> Result<PathBuf, String> {
     Ok(PathBuf::from(target))
 }
 
-fn workspace_has_bench_target() -> Result<bool, String> {
-    let metadata = cargo_metadata(&workspace_root())?;
+fn workspace_has_bench_target(root: &Path) -> Result<bool, String> {
+    let metadata = cargo_metadata(root)?;
     let packages = metadata
         .get("packages")
         .and_then(JsonValue::as_array)
@@ -1444,61 +1481,96 @@ fn wait_for_child(
     })
 }
 
-fn cargo(arguments: &[&str]) -> Result<(), String> {
-    cargo_with_environment(arguments, &[])
+fn cargo(root: &Path, arguments: &[&str]) -> Result<(), String> {
+    cargo_with_environment(root, arguments, &[])
 }
 
-fn cargo_with_environment(arguments: &[&str], environment: &[(&str, &str)]) -> Result<(), String> {
-    cargo_with_optional_test_runner(arguments, environment, None)
+fn cargo_with_environment(
+    root: &Path,
+    arguments: &[&str],
+    environment: &[(&str, &str)],
+) -> Result<(), String> {
+    cargo_with_optional_test_runner(root, arguments, environment, None)
 }
 
 fn cargo_test_with_runner_policy(
+    root: &Path,
     arguments: &[&str],
     environment: &[(&str, &str)],
 ) -> Result<(), String> {
     if outer_rust_ci_test_profile_enabled() {
-        cargo_with_environment(arguments, environment)
+        cargo_with_environment(root, arguments, environment)
     } else {
-        let runner_config = test_runner::cargo_runner_config(&workspace_root())?;
-        cargo_with_optional_test_runner(arguments, environment, Some(&runner_config))
+        let runner_config = test_runner::cargo_runner_config(root)?;
+        cargo_with_optional_test_runner(root, arguments, environment, Some(&runner_config))
     }
 }
 
 fn cargo_with_optional_test_runner(
+    root: &Path,
     arguments: &[&str],
     environment: &[(&str, &str)],
     runner_config: Option<&str>,
 ) -> Result<(), String> {
     let temporary_config = verification_temp_config(env::var_os("FORGE_VERIFY_TMPDIR").as_deref())?;
-    let mut pinned_arguments = pinned_cargo_arguments(arguments.iter().copied());
-    if let Some(config) = runner_config {
-        pinned_arguments.splice(3..3, ["--config", config]);
-    }
-    if let Some(config) = temporary_config.as_deref() {
-        // Cargo [env] force=true can override the parent process's TMPDIR.
-        // Carry this explicit verification-only setting to each child Cargo,
-        // without modifying inherited, repository or product storage policy.
-        pinned_arguments.splice(
-            3..3,
-            ["--config", config, "--config", "env.TMPDIR.force=true"],
-        );
-    }
-    command_in_with_environment("rustup", &pinned_arguments, &workspace_root(), environment)
+    let pinned_arguments =
+        cargo_command_arguments(arguments.iter().copied(), runner_config, &temporary_config);
+    command_in_with_environment("rustup", &pinned_arguments, root, environment)
 }
 
-fn verification_temp_config(directory: Option<&OsStr>) -> Result<Option<String>, String> {
-    let Some(directory) = directory else {
-        return Ok(None);
+fn cargo_command_arguments<'a>(
+    arguments: impl IntoIterator<Item = &'a str>,
+    runner_config: Option<&'a str>,
+    temporary_config: &'a str,
+) -> Vec<&'a str> {
+    let mut arguments = pinned_cargo_arguments(arguments);
+    if let Some(config) = runner_config {
+        arguments.splice(3..3, ["--config", config]);
+    }
+    // Force the validated TMPDIR so Cargo config cannot redirect child builds.
+    arguments.splice(
+        3..3,
+        [
+            "--config",
+            temporary_config,
+            "--config",
+            "env.TMPDIR.force=true",
+        ],
+    );
+    arguments
+}
+
+fn verification_temp_config(directory: Option<&OsStr>) -> Result<String, String> {
+    let directory = match directory {
+        Some(directory) => test_runner::validate_verification_directory(Path::new(directory))?,
+        None => test_runner::configured_temporary_base()?,
     };
-    let directory = Path::new(directory);
-    let directory = test_runner::validate_internal_directory(directory)?;
+    cargo_temp_config(&directory)
+}
+
+#[cfg(test)]
+fn verification_temp_config_for(
+    temporary_base: &Path,
+    directory: Option<&Path>,
+) -> Result<String, String> {
+    let temporary_base = test_runner::validate_temporary_directory(temporary_base)?;
+    let directory = match directory {
+        Some(directory) => {
+            test_runner::validate_verification_directory_under(&temporary_base, directory)?
+        }
+        None => temporary_base,
+    };
+    cargo_temp_config(&directory)
+}
+
+fn cargo_temp_config(directory: &Path) -> Result<String, String> {
     let directory = directory
         .to_str()
-        .ok_or_else(|| "FORGE_VERIFY_TMPDIR must be representable in Cargo TOML".to_owned())?;
-    Ok(Some(format!(
+        .ok_or_else(|| "Cargo TMPDIR must be representable in Cargo TOML".to_owned())?;
+    Ok(format!(
         "env.TMPDIR.value={}",
         toml::Value::String(directory.to_owned())
-    )))
+    ))
 }
 
 fn pinned_cargo_arguments<'a>(arguments: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
@@ -1508,10 +1580,6 @@ fn pinned_cargo_arguments<'a>(arguments: impl IntoIterator<Item = &'a str>) -> V
     pinned_arguments.extend(["run", MSRV_TOOLCHAIN, "cargo"]);
     pinned_arguments.extend(iterator);
     pinned_arguments
-}
-
-fn command(program: &str, arguments: &[&str]) -> Result<(), String> {
-    command_in(program, arguments, &workspace_root())
 }
 
 fn command_in(program: impl AsRef<OsStr>, arguments: &[&str], cwd: &Path) -> Result<(), String> {
@@ -1599,19 +1667,12 @@ fn pinned_toolchain_bin(cwd: &Path) -> Result<PathBuf, String> {
         .ok_or_else(|| format!("pinned rustc path has no parent: {}", rustc.display()))
 }
 
-fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).parent().map_or_else(
-        || PathBuf::from(env!("CARGO_MANIFEST_DIR")),
-        Path::to_path_buf,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
     use std::io::{self, Cursor, Read};
     use std::os::unix::fs::symlink;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::process::{Command, Stdio};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1619,11 +1680,13 @@ mod tests {
 
     use super::{
         BoundedReadError, MAX_DOCTOR_OUTPUT_BYTES, capture_process, capture_process_until,
-        is_lowercase_sha256, is_safe_relative_path, pinned_cargo_arguments, read_bounded,
-        read_capped, toml_at, validate_harness_manifest_fields, verification_temp_config,
+        cargo_command_arguments, is_lowercase_sha256, is_safe_relative_path,
+        pinned_cargo_arguments, read_bounded, read_capped, toml_at,
+        validate_harness_manifest_fields, verification_temp_config_for,
         verify_forge_local_asset_not_shared_manifested, verify_forge_persistence_manifests,
         workspace_member_manifest_paths,
     };
+    use crate::test_support::WorkspaceRootFixtures;
     use serde_json::json;
     use toml::Value as TomlValue;
 
@@ -1649,21 +1712,22 @@ mod tests {
     #[test]
     fn cargo_subprocess_arguments_are_pinned_to_repository_toolchain() {
         assert_eq!(
-            pinned_cargo_arguments(["check", "--locked"]),
-            vec!["run", super::MSRV_TOOLCHAIN, "cargo", "check", "--locked"]
+            pinned_cargo_arguments(super::MSRV_CHECK_ARGUMENTS.iter().copied()),
+            vec![
+                "run",
+                super::MSRV_TOOLCHAIN,
+                "cargo",
+                "check",
+                "--locked",
+                "--workspace",
+                "--all-targets",
+            ]
         );
     }
 
     #[test]
-    fn verification_temp_config_preserves_absence_and_escapes_explicit_directory()
-    -> Result<(), String> {
-        assert_eq!(verification_temp_config(None)?, None);
-        let base = if cfg!(target_os = "macos") {
-            PathBuf::from("/private/tmp")
-        } else {
-            PathBuf::from("/tmp")
-        };
-        let base = super::test_runner::validate_internal_directory(&base)?;
+    fn cargo_msrv_arguments_force_default_and_override_tmpdir_values() -> Result<(), String> {
+        let base = super::test_runner::configured_temporary_base()?;
         let sandbox_root = base.join(format!(
             "heterarchy-forge-xtask-temp-config-{}-{}",
             std::process::id(),
@@ -1672,32 +1736,83 @@ mod tests {
         fs::create_dir(&sandbox_root).map_err(|error| error.to_string())?;
         let directory = sandbox_root.join("tmp space 한글");
         fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
-        let config = verification_temp_config(Some(directory.as_os_str()))?
-            .ok_or_else(|| "explicit temp configuration missing".to_owned())?;
-        let parsed: TomlValue = toml::from_str(&format!("{config}\nenv.TMPDIR.force=true"))
-            .map_err(|error| error.to_string())?;
-        let canonical = fs::canonicalize(&directory).map_err(|error| error.to_string())?;
-        assert_eq!(
-            parsed["env"]["TMPDIR"]["value"].as_str(),
-            canonical.to_str()
+        let default_config = verification_temp_config_for(&base, None)?;
+        let override_config = verification_temp_config_for(&base, Some(&directory))?;
+        let default_arguments = cargo_command_arguments(
+            super::MSRV_CHECK_ARGUMENTS.iter().copied(),
+            None,
+            &default_config,
         );
-        assert_eq!(parsed["env"]["TMPDIR"]["force"].as_bool(), Some(true));
+        let override_arguments = cargo_command_arguments(
+            super::MSRV_CHECK_ARGUMENTS.iter().copied(),
+            None,
+            &override_config,
+        );
+        for (arguments, config, expected_directory) in [
+            (&default_arguments, &default_config, &base),
+            (&override_arguments, &override_config, &directory),
+        ] {
+            assert_eq!(
+                &arguments[..7],
+                &[
+                    "run",
+                    super::MSRV_TOOLCHAIN,
+                    "cargo",
+                    "--config",
+                    config.as_str(),
+                    "--config",
+                    "env.TMPDIR.force=true",
+                ]
+            );
+            assert_eq!(&arguments[7..], super::MSRV_CHECK_ARGUMENTS);
+            let parsed: TomlValue = toml::from_str(config).map_err(|error| error.to_string())?;
+            let expected_directory =
+                fs::canonicalize(expected_directory).map_err(|error| error.to_string())?;
+            assert_eq!(
+                parsed["env"]["TMPDIR"]["value"].as_str(),
+                expected_directory.to_str()
+            );
+        }
+        let runner_config = "target.x86_64-apple-darwin.runner=[\"xtask\",\"test-runner\"]";
+        let runner_arguments = cargo_command_arguments(
+            super::MSRV_CHECK_ARGUMENTS.iter().copied(),
+            Some(runner_config),
+            &default_config,
+        );
+        assert_eq!(
+            &runner_arguments[..9],
+            &[
+                "run",
+                super::MSRV_TOOLCHAIN,
+                "cargo",
+                "--config",
+                default_config.as_str(),
+                "--config",
+                "env.TMPDIR.force=true",
+                "--config",
+                runner_config,
+            ]
+        );
+        assert_eq!(&runner_arguments[9..], super::MSRV_CHECK_ARGUMENTS);
         fs::remove_dir_all(&sandbox_root).map_err(|error| error.to_string())?;
         Ok(())
     }
 
     #[test]
     fn verification_temp_config_rejects_relative_missing_file_and_symlink() -> Result<(), String> {
-        assert!(verification_temp_config(Some(Path::new("relative").as_os_str())).is_err());
+        let temporary_base = super::test_runner::configured_temporary_base()?;
         let sandbox = super::DoctorSandbox::create()?;
         let missing = sandbox.root.join("missing");
-        assert!(verification_temp_config(Some(missing.as_os_str())).is_err());
+        assert!(
+            verification_temp_config_for(&temporary_base, Some(Path::new("relative"))).is_err()
+        );
+        assert!(verification_temp_config_for(&temporary_base, Some(&missing)).is_err());
         let file = sandbox.root.join("file");
         fs::write(&file, b"temporary fixture").map_err(|error| error.to_string())?;
-        assert!(verification_temp_config(Some(file.as_os_str())).is_err());
+        assert!(verification_temp_config_for(&temporary_base, Some(&file)).is_err());
         let link = sandbox.root.join("link");
         symlink(&sandbox.root, &link).map_err(|error| error.to_string())?;
-        assert!(verification_temp_config(Some(link.as_os_str())).is_err());
+        assert!(verification_temp_config_for(&temporary_base, Some(&link)).is_err());
         Ok(())
     }
 
@@ -1976,6 +2091,22 @@ database = { package = "sea-orm", version = "2" }
     }
 
     #[test]
+    fn local_harness_command_fails_when_the_private_tree_is_missing() -> Result<(), String> {
+        let fixtures = WorkspaceRootFixtures::new()?;
+        fs::remove_dir_all(fixtures.forge_a.join(".agents"))
+            .map_err(|error| format!("cannot remove private Harness fixture: {error}"))?;
+
+        let Err(error) = super::harness(&fixtures.forge_a) else {
+            return Err(
+                "local Harness command must fail when private authority is absent".to_owned(),
+            );
+        };
+        assert!(error.contains("Rust project profile"));
+        assert!(super::REPO_AFFECTING_COMMANDS.contains(&"harness"));
+        Ok(())
+    }
+
+    #[test]
     fn private_harness_validation_fails_when_the_tree_is_missing() -> Result<(), String> {
         let sandbox = super::DoctorSandbox::create()?;
         assert!(!sandbox.root.join(super::HARNESS_DIR).exists());
@@ -2063,7 +2194,7 @@ database = { package = "sea-orm", version = "2" }
         if native_process_tests_are_unavailable() {
             return Ok(());
         }
-        let pid_path = std::env::temp_dir().join(format!(
+        let pid_path = super::test_runner::configured_temporary_base()?.join(format!(
             "heterarchy-forge-xtask-capture-{}-{}.pid",
             std::process::id(),
             line!()
@@ -2107,7 +2238,7 @@ database = { package = "sea-orm", version = "2" }
         if native_process_tests_are_unavailable() {
             return Ok(());
         }
-        let pid_path = std::env::temp_dir().join(format!(
+        let pid_path = super::test_runner::configured_temporary_base()?.join(format!(
             "heterarchy-forge-xtask-descendant-{}-{}.pid",
             std::process::id(),
             line!()

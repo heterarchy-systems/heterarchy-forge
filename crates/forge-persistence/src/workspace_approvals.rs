@@ -22,6 +22,7 @@ use crate::workspace_executions::{
 use crate::workspace_goals::{self, GoalStoreError};
 use crate::workspace_verification::{self, VerificationStoreError};
 
+pub(crate) mod agent_provenance;
 pub(crate) mod cleanup;
 pub(crate) use cleanup::prepare_cleanup_plan_in_transaction;
 pub use cleanup::{
@@ -309,29 +310,33 @@ fn insert_pending(
     request: &RegisteredApprovalRequest,
 ) -> Result<RegisteredApprovalRequest, ApprovalStoreError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let result = insert_pending_in_transaction(&transaction, request)?;
+    let result = insert_pending_with_provenance_in_transaction(&transaction, request, None)?;
     transaction.commit()?;
     Ok(result)
 }
 
-pub(crate) fn insert_pending_in_transaction(
+pub(crate) fn insert_pending_with_provenance_in_transaction(
     transaction: &Transaction<'_>,
     request: &RegisteredApprovalRequest,
+    provenance: Option<&ExecutionAgentProvenance>,
 ) -> Result<RegisteredApprovalRequest, ApprovalStoreError> {
     if request.state() != ApprovalRequestState::Pending {
         return Err(ApprovalStoreError::InvalidTransition);
     }
     validate_agent_binding(request)?;
+    if let Some(provenance) = provenance {
+        agent_provenance::validate_provenance_for_approval(request, provenance)?;
+    }
     let auth = request.request();
-    if get_approval_by_execution_tx(
+    let existing = get_approval_by_execution_tx(
         transaction,
         auth.workspace_id(),
         auth.activity_id(),
         auth.execution_id(),
-    )?
-    .is_none()
-    {
+    )?;
+    if existing.is_none() {
         crate::workspace_execution_stops::ensure_execution_open(transaction, auth.workspace_id())?;
+        ensure_home_approval_open(transaction, request, provenance)?;
     }
     let permissions = auth.requested().get();
     let inserted = transaction.execute(
@@ -371,17 +376,29 @@ pub(crate) fn insert_pending_in_transaction(
     {
         return Err(ApprovalStoreError::IdentityConflict);
     }
+    if inserted > 0 {
+        agent_provenance::record_in_transaction(transaction, &persisted, provenance)?;
+    } else if let Some(provenance) = provenance
+        && agent_provenance::get_in_transaction(transaction, &persisted)?
+            .is_some_and(|stored| stored != *provenance)
+    {
+        return Err(ApprovalStoreError::IdentityConflict);
+    }
     Ok(persisted)
 }
 
-pub(crate) fn insert_approval_audit_in_transaction(
+pub(crate) fn insert_approval_audit_with_provenance_in_transaction(
     transaction: &Transaction<'_>,
     request: &RegisteredApprovalRequest,
+    provenance: Option<&ExecutionAgentProvenance>,
 ) -> Result<RegisteredApprovalRequest, ApprovalStoreError> {
     if request.state() == ApprovalRequestState::Pending {
         return Err(ApprovalStoreError::InvalidTransition);
     }
     validate_agent_binding(request)?;
+    if let Some(provenance) = provenance {
+        agent_provenance::validate_provenance_for_approval(request, provenance)?;
+    }
     let auth = request.request();
     if let Some(existing) = get_approval_by_execution_tx(
         transaction,
@@ -389,13 +406,19 @@ pub(crate) fn insert_approval_audit_in_transaction(
         auth.activity_id(),
         auth.execution_id(),
     )? {
-        return if existing == *request {
-            Ok(existing)
-        } else {
-            Err(ApprovalStoreError::IdentityConflict)
-        };
+        if existing != *request {
+            return Err(ApprovalStoreError::IdentityConflict);
+        }
+        if let Some(provenance) = provenance
+            && agent_provenance::get_in_transaction(transaction, &existing)?
+                .is_some_and(|stored| stored != *provenance)
+        {
+            return Err(ApprovalStoreError::IdentityConflict);
+        }
+        return Ok(existing);
     }
     insert_approval_tx(transaction, request)?;
+    agent_provenance::record_in_transaction(transaction, request, provenance)?;
     Ok(request.clone())
 }
 
@@ -438,14 +461,22 @@ pub(crate) fn get_approval_with_execution_and_grant(
     id: ApprovalRequestId,
 ) -> Result<ApprovalExecutionGrantReadback, ApprovalStoreError> {
     let transaction = connection.unchecked_transaction()?;
-    let Some(approval) = get_approval_tx(&transaction, id)? else {
-        transaction.commit()?;
+    let result = get_approval_with_execution_and_grant_in_transaction(&transaction, id)?;
+    transaction.commit()?;
+    Ok(result)
+}
+
+/// Read the same owner evidence inside a caller-owned consistent transaction.
+pub(crate) fn get_approval_with_execution_and_grant_in_transaction(
+    connection: &Transaction<'_>,
+    id: ApprovalRequestId,
+) -> Result<ApprovalExecutionGrantReadback, ApprovalStoreError> {
+    let Some(approval) = get_approval_tx(connection, id)? else {
         return Ok(None);
     };
     let execution =
-        workspace_executions::get_execution_tx(&transaction, approval.request().execution_id())?;
-    let grant = get_grant_by_approval_tx(&transaction, approval.id())?;
-    transaction.commit()?;
+        workspace_executions::get_execution_tx(connection, approval.request().execution_id())?;
+    let grant = get_grant_by_approval_tx(connection, approval.id())?;
     Ok(Some((approval, execution, grant)))
 }
 
@@ -490,6 +521,7 @@ pub(crate) fn approve_once(
     {
         return Err(ApprovalStoreError::InvalidExpiry);
     }
+    ensure_persisted_home_approval_open(&transaction, &current)?;
     let approved = current
         .decide(ApprovalDecision::Approve, expected_revision, observed_at)
         .map_err(|_| ApprovalStoreError::InvalidTransition)?;
@@ -542,6 +574,9 @@ pub(crate) fn create_auto_scope(
             &transaction,
             scope.workspace_id(),
         )?;
+        if let Some(activity_id) = scope.activity_id() {
+            ensure_home_activity_open(&transaction, scope.workspace_id(), activity_id)?;
+        }
     }
     let permissions = scope.permission_ceiling();
     let inserted = transaction.execute(
@@ -718,6 +753,7 @@ pub(crate) fn consume_auto_scope_and_begin_execution(
     )
     .map_err(|_| ApprovalStoreError::InvalidTransition)?;
     insert_approval_tx(&transaction, &approval)?;
+    agent_provenance::record_in_transaction(&transaction, &approval, begin.provenance())?;
     insert_grant_tx(&transaction, &grant, Some(scope_id))?;
     update_auto_scope_tx(
         &transaction,
@@ -764,6 +800,11 @@ fn existing_auto_approval_execution(
         return Err(ApprovalStoreError::IdentityConflict);
     }
     validate_agent_provenance_binding(&approval, begin.record().provenance())?;
+    if let Some(stored) = agent_provenance::get_in_transaction(transaction, &approval)?
+        && begin.record().provenance() != Some(&stored)
+    {
+        return Err(ApprovalStoreError::IdentityConflict);
+    }
     let scope = get_auto_scope_by_execution_tx(transaction, request.execution_id())?
         .ok_or(ApprovalStoreError::AutoScopeMissing)?;
     Ok(AutoApprovalExecutionRecord {
@@ -1191,6 +1232,51 @@ fn validate_agent_provenance_binding(
         (false, None, _) => Ok(()),
         _ => Err(ApprovalStoreError::IdentityConflict),
     }
+}
+
+fn ensure_persisted_home_approval_open(
+    connection: &Connection,
+    approval: &RegisteredApprovalRequest,
+) -> Result<(), ApprovalStoreError> {
+    let provenance = agent_provenance::get_in_transaction(connection, approval)?;
+    ensure_home_approval_open(connection, approval, provenance.as_ref())
+}
+
+fn ensure_home_approval_open(
+    connection: &Connection,
+    approval: &RegisteredApprovalRequest,
+    provenance: Option<&ExecutionAgentProvenance>,
+) -> Result<(), ApprovalStoreError> {
+    match provenance {
+        Some(provenance) => {
+            agent_provenance::validate_provenance_for_approval(approval, provenance)?;
+            crate::workspace_home_transfers::guards::ensure_actor_open(
+                connection,
+                approval.request().workspace_id(),
+                provenance.agent_id(),
+                provenance.session_id(),
+            )
+            .map_err(|error| ApprovalStoreError::HomeTransfer(Box::new(error)))
+        }
+        None => ensure_home_activity_open(
+            connection,
+            approval.request().workspace_id(),
+            approval.request().activity_id(),
+        ),
+    }
+}
+
+fn ensure_home_activity_open(
+    connection: &Connection,
+    workspace_id: WorkspaceId,
+    activity_id: ActivityId,
+) -> Result<(), ApprovalStoreError> {
+    crate::workspace_home_transfers::guards::ensure_activity_open(
+        connection,
+        workspace_id,
+        activity_id,
+    )
+    .map_err(|error| ApprovalStoreError::HomeTransfer(Box::new(error)))
 }
 
 fn update_approval_tx(
@@ -1765,6 +1851,8 @@ fn validate_foreign_keys(
 #[derive(Debug, Error)]
 pub enum ApprovalStoreError {
     #[error(transparent)]
+    HomeTransfer(#[from] Box<crate::HomeTransferStoreError>),
+    #[error(transparent)]
     StopFence(#[from] crate::workspace_execution_stops::ExecutionStopStoreError),
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
@@ -1940,6 +2028,7 @@ mod tests {
         crate::workspace_verification::create_schema(&connection)?;
         crate::workspace_goal_deletion::create_schema(&connection)?;
         create_schema(&connection)?;
+        agent_provenance::schema::create_schema(&connection)?;
         crate::workspace_semantic_events::create_schema(&connection)?;
         crate::workspace_admission_envelopes::create_schema(&connection)?;
         crate::workspace_agent_migration::create_schema(&connection)?;

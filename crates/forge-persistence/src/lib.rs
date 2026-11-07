@@ -56,6 +56,21 @@ pub use workspace_goal_deletion::{
 };
 pub use workspace_store::OwnedWorkspaceStopCapture;
 pub use workspace_store::{GoalDeletionAdmission, GoalDeletionStore};
+pub(crate) mod workspace_evaluation_evidence;
+mod workspace_home_transfers;
+
+pub use workspace_home_transfers::artifacts::{
+    HomeArtifactCaptureOutcome, HomeArtifactDoctorReference, HomeArtifactDoctorReport,
+    HomeArtifactJournalError, HomeArtifactReadback, HomeArtifactSealRecord,
+    HomeArtifactStageRecord,
+};
+pub use workspace_home_transfers::{
+    HomeHandoffAcceptanceOutcome, HomeHandoffAcceptanceOutcomeKind,
+    HomeHandoffAcceptanceOutcomeRecord, HomeHandoffApplicationStoreError,
+    HomeHandoffAppliedAcceptance, HomeHandoffAssignmentLineage, HomeHandoffCaseSnapshot,
+    HomeHandoffInitialSuccessorSnapshot, HomeHandoffProposalEvidence, HomeHandoffProposalOutcome,
+    HomeHandoffProposalRecord, HomeHandoffProposalStoreError, HomeHandoffSourceAssignmentPin,
+};
 mod workspace_queue_settings;
 mod workspace_recovery;
 mod workspace_semantic_events;
@@ -69,6 +84,9 @@ mod workspace_writer_leases;
 #[cfg(test)]
 #[path = "legacy_agent_seed.rs"]
 pub(crate) mod legacy_agent_seed;
+
+#[cfg(test)]
+pub(crate) mod evaluation_schema_fixture;
 
 pub use agent_session_catalog::{
     AGENT_SESSION_APPLICATION_ID, AGENT_SESSION_SCHEMA_VERSION, AgentSessionCatalog,
@@ -164,10 +182,11 @@ pub use workspace_semantic_events::{
     SemanticEventRecord, SemanticEventSubjects, WorkspaceSemanticSnapshot,
 };
 pub use workspace_store::{
-    BeginFileMutationDiffResult, FileMutationDiffRecord, FileMutationReadSnapshot,
-    RecoveryRunOperation, RootRecoveryAuthorityBlocker, RootRecoveryIdentityObservation,
-    RootRecoveryOperation, RootRecoveryProbe, RootRecoveryReceipt, RootRecoveryStoreError,
-    SourceTreeReadSnapshot, WORKSPACE_APPLICATION_ID, WorkspaceDoctorCount,
+    BeginFileMutationDiffResult, EvaluationAssignmentReview, EvaluationAssignmentSubmission,
+    EvaluationEvidenceMutationIdentity, EvaluationT1ClosureOutcome, FileMutationDiffRecord,
+    FileMutationReadSnapshot, RecoveryRunOperation, RootRecoveryAuthorityBlocker,
+    RootRecoveryIdentityObservation, RootRecoveryOperation, RootRecoveryProbe, RootRecoveryReceipt,
+    RootRecoveryStoreError, SourceTreeReadSnapshot, WORKSPACE_APPLICATION_ID, WorkspaceDoctorCount,
     WorkspaceDoctorIntegrity, WorkspaceDoctorOutcome, WorkspaceDoctorReport,
     WorkspaceDoctorSourceObservation, WorkspaceJournalBinding, WorkspaceStateRemovalBlocker,
     WorkspaceStore, WorkspaceStoreError, WorkspaceStoreHealth, delegated_authority_digest,
@@ -214,3 +233,12 @@ pub use workspace_executions::native_closure::ExecutionNativeClosureSnapshot;
 
 mod workspace_coordinator_recovery;
 pub use workspace_coordinator_recovery::CoordinatorRecoveryStoreError;
+pub use workspace_store::CURRENT_SCHEMA_VERSION as CURRENT_WORKSPACE_SCHEMA_VERSION;
+
+pub use workspace_home_transfers::{
+    HomeTransferReservationRetirementOutcome, HomeTransferReservationRetirementRecord,
+    HomeTransferReservationRetirementRecordParts, HomeTransferSourceInventoryError,
+    HomeTransferSourceOutcome, HomeTransferSourceRecord, HomeTransferSourceRecordParts,
+    HomeTransferSourceState, HomeTransferStoreError, decode_home_transfer_source_request,
+    encode_home_transfer_source_request,
+};

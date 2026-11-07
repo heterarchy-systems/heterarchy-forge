@@ -72,6 +72,7 @@ fn fixture_connection(
     crate::workspace_verification::create_schema(&connection)?;
     crate::workspace_goal_deletion::create_schema(&connection)?;
     crate::workspace_approvals::create_schema(&connection)?;
+    crate::workspace_approvals::agent_provenance::schema::create_schema(&connection)?;
     crate::workspace_semantic_events::create_schema(&connection)?;
     crate::workspace_admission_envelopes::create_schema(&connection)?;
     crate::workspace_agent_migration::create_schema(&connection)?;

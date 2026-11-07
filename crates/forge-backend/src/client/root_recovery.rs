@@ -29,7 +29,6 @@ use crate::ops::workspace_root_recovery::{
     WorkspaceRootRecoveryReceiptWire, WorkspaceRootRecoveryWorkspaceWire,
 };
 
-const CURRENT_SCHEMA_VERSION: i64 = 63;
 const OPERATOR_KIND_EXPLICIT_OWNER: i64 = 0;
 const INTENT_DOMAIN: &[u8] = b"forge.workspace.root-recovery.intent.v1\0";
 const INTENT_V2_DOMAIN: &[u8] = b"forge.workspace.root-recovery.intent.v2\0";
@@ -43,8 +42,10 @@ pub(super) fn validate_probe(
     if response.status != WorkspaceRootRecoveryProbeStatus::Observed
         || response.locator != request.locator().encode()
         || response.location_revision != request.locator().expected_revision().get()
-        || response.requires_schema_upgrade != (response.schema_version < CURRENT_SCHEMA_VERSION)
-        || !(1..=CURRENT_SCHEMA_VERSION).contains(&response.schema_version)
+        || response.requires_schema_upgrade
+            != (response.schema_version < forge_persistence::CURRENT_WORKSPACE_SCHEMA_VERSION)
+        || !(1..=forge_persistence::CURRENT_WORKSPACE_SCHEMA_VERSION)
+            .contains(&response.schema_version)
         || response.authority_mode != expected_authority_wire(request.authority_mode())?
         || request
             .expected_workspace_id()
@@ -70,7 +71,7 @@ pub(super) fn validate_prepare(
     if response.status != WorkspaceRootRecoveryProbeStatus::Prepared
         || response.locator != request.locator().encode()
         || response.location_revision != request.locator().expected_revision().get()
-        || response.schema_version != CURRENT_SCHEMA_VERSION
+        || response.schema_version != forge_persistence::CURRENT_WORKSPACE_SCHEMA_VERSION
         || response.requires_schema_upgrade
         || response.authority_mode != expected_authority_wire(request.authority_mode())?
     {
@@ -620,7 +621,7 @@ mod tests {
             status: WorkspaceRootRecoveryProbeStatus::Observed,
             locator: fixture.locator.encode(),
             location_revision: fixture.locator.expected_revision().get(),
-            schema_version: CURRENT_SCHEMA_VERSION,
+            schema_version: forge_persistence::CURRENT_WORKSPACE_SCHEMA_VERSION,
             requires_schema_upgrade: false,
             workspace: WorkspaceRootRecoveryWorkspaceWire {
                 workspace_id: Uuid::from_u128(0x999),
@@ -651,7 +652,7 @@ mod tests {
             status: WorkspaceRootRecoveryProbeStatus::Prepared,
             locator: fixture.prepare.locator().encode(),
             location_revision: fixture.prepare.locator().expected_revision().get(),
-            schema_version: CURRENT_SCHEMA_VERSION,
+            schema_version: forge_persistence::CURRENT_WORKSPACE_SCHEMA_VERSION,
             requires_schema_upgrade: false,
             workspace: workspace_wire(fixture.prepare.expected_workspace()),
             observation,

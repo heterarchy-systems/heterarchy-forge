@@ -11,6 +11,10 @@ use crate::{ForgeControl, ForgeControlClient, ResolvedWorkspaceScope};
 #[path = "../../forge-persistence/src/legacy_agent_seed.rs"]
 mod rows;
 
+#[path = "../../forge-persistence/src/evaluation_schema_fixture.rs"]
+mod evaluation_schema;
+pub(crate) use evaluation_schema::remove_empty_evaluation_schema;
+
 pub(crate) fn seed_agent_in_database(
     database: &Path,
     agent: &RegisteredAgentInstance,

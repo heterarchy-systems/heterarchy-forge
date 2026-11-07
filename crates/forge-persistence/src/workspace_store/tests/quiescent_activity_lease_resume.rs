@@ -363,6 +363,7 @@ fn schema_v68_adds_empty_quiescent_resume_ledger_and_preserves_existing_rows() -
 
     let old = Connection::open(&database_path)?;
     old.pragma_update(None, "journal_mode", "DELETE")?;
+    crate::evaluation_schema_fixture::remove_empty_evaluation_schema(&old)?;
     old.execute_batch("DROP TABLE quiescent_activity_lease_resume_receipts")?;
     old.pragma_update(
         None,
@@ -410,6 +411,7 @@ fn schema_v68_quiescent_migration_preserves_started_receipt_across_reopen() -> T
 
     let old = Connection::open(&database_path)?;
     old.pragma_update(None, "journal_mode", "DELETE")?;
+    crate::evaluation_schema_fixture::remove_empty_evaluation_schema(&old)?;
     old.execute_batch("DROP TABLE quiescent_activity_lease_resume_receipts")?;
     old.pragma_update(
         None,

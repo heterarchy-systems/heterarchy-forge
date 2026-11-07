@@ -14,6 +14,7 @@ mod coordinator_recovery;
 mod dag;
 mod diff;
 mod diff_retention;
+mod evaluation_evidence;
 mod execution;
 mod execution_admission;
 mod expired_activity_recovery;
@@ -22,6 +23,7 @@ mod generated_command;
 mod goal;
 mod goal_deletion;
 mod goal_mutation;
+mod home_transfer;
 mod location;
 mod principal;
 mod quiescent_activity_lease_resume;
@@ -37,6 +39,20 @@ mod workspace;
 mod workspace_root_recovery;
 mod writer_lease;
 
+pub use evaluation_evidence::{
+    EVALUATION_DIGEST_BYTES, EvaluationAdmissionTiming, EvaluationClockReading,
+    EvaluationClockUncertainty, EvaluationCoverageUnknownReason, EvaluationCutId, EvaluationDigest,
+    EvaluationEvidenceError, EvaluationManifestId, EvaluationManifestMember,
+    EvaluationManifestProposal, EvaluationObligationId, EvaluationOriginalAssignmentBinding,
+    EvaluationOriginalBindingStatus, EvaluationPlanBinding, EvaluationPlanId,
+    EvaluationRegisteredManifest, EvaluationRegisteredManifestMember, EvaluationReviewCut,
+    EvaluationReviewCutId, EvaluationReviewCutMember, EvaluationReviewOutcome,
+    EvaluationReviewReceipt, EvaluationReviewState, EvaluationRevision, EvaluationSourceIdentity,
+    EvaluationSourceSequence, EvaluationSubmissionReceipt, EvaluationT1CloseRequest,
+    EvaluationT1Coverage, EvaluationT1CoverageCut, EvaluationT1CoverageMember,
+    EvaluationWorkUnitId, MAX_EVALUATION_MANIFEST_MEMBERS, classify_t1_coverage,
+};
+
 pub use workspace_root_recovery::{
     WorkspaceRootRecoveryAuthorityMode, WorkspaceRootRecoveryDelegatedAuthority,
     WorkspaceRootRecoveryDelegationFence, WorkspaceRootRecoveryError,
@@ -48,16 +64,17 @@ pub use workspace_root_recovery::{
 pub use agent_assignment::{
     AcknowledgeAgentAssignmentCancellation, AgentAssignmentContinuationError,
     AgentAssignmentContinuationOrigin, AgentAssignmentContinuationPlan, AgentAssignmentCoordinator,
-    AgentAssignmentId, AgentAssignmentIdParseError, AgentAssignmentOrigin, AgentAssignmentResult,
-    AgentAssignmentResultError, AgentAssignmentRevision, AgentAssignmentRevisionError,
-    AgentAssignmentSourceError, AgentAssignmentSourceRef, AgentAssignmentSourceUrl,
-    AgentAssignmentState, AgentAssignmentSummary, AgentAssignmentTarget,
-    AgentAssignmentTransitionError, AgentAssignmentWorktreeReceipt, CancelAgentAssignment,
-    ClaimAgentAssignment, InterruptAgentAssignment, MAX_AGENT_ASSIGNMENT_RESULT_BYTES,
-    MAX_AGENT_ASSIGNMENT_SOURCE_BYTES, MAX_AGENT_ASSIGNMENT_SOURCE_URL_BYTES,
-    MAX_AGENT_ASSIGNMENT_SOURCES, MAX_AGENT_ASSIGNMENTS_PER_WORKSPACE, OfferAgentAssignment,
-    RegisteredAgentAssignment, ReviewAgentAssignment, SubmitAgentAssignment, WorkCreditBudget,
-    WorkCreditBudgetError,
+    AgentAssignmentHomeHandoffAcceptance, AgentAssignmentHomeHandoffOrigin,
+    AgentAssignmentHomeHandoffTransition, AgentAssignmentId, AgentAssignmentIdParseError,
+    AgentAssignmentOrigin, AgentAssignmentResult, AgentAssignmentResultError,
+    AgentAssignmentRevision, AgentAssignmentRevisionError, AgentAssignmentSourceError,
+    AgentAssignmentSourceRef, AgentAssignmentSourceUrl, AgentAssignmentState,
+    AgentAssignmentSummary, AgentAssignmentTarget, AgentAssignmentTransitionError,
+    AgentAssignmentWorktreeReceipt, CancelAgentAssignment, ClaimAgentAssignment,
+    InterruptAgentAssignment, MAX_AGENT_ASSIGNMENT_RESULT_BYTES, MAX_AGENT_ASSIGNMENT_SOURCE_BYTES,
+    MAX_AGENT_ASSIGNMENT_SOURCE_URL_BYTES, MAX_AGENT_ASSIGNMENT_SOURCES,
+    MAX_AGENT_ASSIGNMENTS_PER_WORKSPACE, OfferAgentAssignment, RegisteredAgentAssignment,
+    ReviewAgentAssignment, SubmitAgentAssignment, WorkCreditBudget, WorkCreditBudgetError,
 };
 pub use goal_deletion::{GoalDeletionRequest, GoalDeletionTarget};
 
@@ -228,6 +245,26 @@ pub use goal::{
     MAX_GOAL_OBJECTIVE_BYTES, MAX_GOAL_REASON_BYTES, MAX_GOAL_REVIEW_CHECKS,
     MAX_GOAL_STATEMENT_BYTES, MAX_GOAL_STATEMENTS_PER_KIND, MAX_GOAL_VERIFICATION_REQUIREMENTS,
     RegisteredGoal,
+};
+pub use home_transfer::{
+    HomeArtifactArchive, HomeArtifactArchiveError, HomeArtifactCaptureIntent,
+    HomeArtifactCaptureIntentError, HomeArtifactId, HomeArtifactIdError, HomeArtifactIdParseError,
+    HomeArtifactIntentDigest, HomeArtifactManifest, HomeArtifactManifestDigest,
+    HomeArtifactManifestError, HomeArtifactPathEntry, HomeArtifactPathState,
+    HomeHandoffAcceptanceGrant, HomeHandoffAcceptanceReceiptDigest,
+    HomeHandoffAffinityAdmissionReferenceDigest, HomeHandoffDomainError,
+    HomeHandoffHomeTeamAuthority, HomeHandoffNodeBindingDigest, HomeHandoffProposalRequest,
+    HomeHandoffProposalRequestDigest, HomeHandoffRecipientParticipation, HomeHandoffTakeRequest,
+    HomeHandoffTakeRequestDigest, HomeHandoffTakeRequestSnapshotError,
+    HomeHandoffTemporaryDispatchAuthority, HomeHandoffWorkAuthority,
+    HomeTransferReservationRetirementError, HomeTransferReservationRetirementGrant,
+    HomeTransferReservationRetirementRequest, HomeTransferReservationRetirementRequestDigest,
+    HomeTransferSourceAction, HomeTransferSourceBinding, HomeTransferSourceError,
+    HomeTransferSourceGrant, HomeTransferSourceRequest, HomeTransferSourceRequestDigest,
+    HomeTransferSourceScope, HomeTransferSourceSubject, HomeTransferSourceWitness,
+    MAX_HOME_ARTIFACT_FILE_BYTES, MAX_HOME_ARTIFACT_MANIFEST_BYTES, MAX_HOME_ARTIFACT_PATHS,
+    MAX_HOME_ARTIFACT_TOTAL_BYTES, MAX_HOME_HANDOFF_REQUEST_SNAPSHOT_BYTES,
+    MAX_HOME_TRANSFER_SOURCE_BINDINGS, MAX_HOME_TRANSFER_SOURCE_SESSIONS,
 };
 pub use location::{
     LocationId, LocationIdParseError, LocationListLimit, LocationListLimitError, LocationName,

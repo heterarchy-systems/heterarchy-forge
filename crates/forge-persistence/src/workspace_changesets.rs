@@ -648,6 +648,71 @@ pub(crate) fn source_tree_read_data(
     let change_set = query_change_set_header(connection, change_set_id)?.ok_or(
         ChangeSetStoreError::CorruptRecord("source_tree_requests.change_set"),
     )?;
+    let TreeMutationReadState {
+        applied_mutations,
+        mutation_count,
+    } = tree_mutation_read_state(connection, change_set_id)?;
+    if mutation_count == 0 {
+        return Err(ChangeSetStoreError::CorruptRecord("tree_mutations.rows"));
+    }
+    Ok(Some(SourceTreeReadData {
+        change_set,
+        request_digest,
+        applied_mutations,
+        mutation_count,
+    }))
+}
+
+/// Canonical tree header and bounded mutation state, including legacy intents
+/// that predate the optional source-tree request digest journal.
+pub(crate) struct TreeChangeSetReadData {
+    pub(crate) change_set: RegisteredChangeSet,
+    pub(crate) request_digest: Option<SourceTreeRequestDigest>,
+    pub(crate) applied_mutations: Vec<TreeMutationId>,
+    pub(crate) mutation_count: usize,
+}
+
+pub(crate) fn tree_change_set_read_data(
+    connection: &Connection,
+    change_set_id: ChangeSetId,
+) -> Result<Option<TreeChangeSetReadData>, ChangeSetStoreError> {
+    let request_digest = crate::workspace_source_tree_requests::get(connection, change_set_id)
+        .map_err(map_source_tree_request_store_error)?;
+    let Some(change_set) = query_change_set_header(connection, change_set_id)? else {
+        if request_digest.is_some() {
+            return Err(ChangeSetStoreError::CorruptRecord(
+                "source_tree_requests.change_set",
+            ));
+        }
+        return Ok(None);
+    };
+    let TreeMutationReadState {
+        applied_mutations,
+        mutation_count,
+    } = tree_mutation_read_state(connection, change_set_id)?;
+    if mutation_count == 0 {
+        if request_digest.is_some() {
+            return Err(ChangeSetStoreError::CorruptRecord("tree_mutations.rows"));
+        }
+        return Ok(None);
+    }
+    Ok(Some(TreeChangeSetReadData {
+        change_set,
+        request_digest,
+        applied_mutations,
+        mutation_count,
+    }))
+}
+
+struct TreeMutationReadState {
+    applied_mutations: Vec<TreeMutationId>,
+    mutation_count: usize,
+}
+
+fn tree_mutation_read_state(
+    connection: &Connection,
+    change_set_id: ChangeSetId,
+) -> Result<TreeMutationReadState, ChangeSetStoreError> {
     let id = change_set_id.into_uuid().into_bytes();
     let bounded_limit = i64::try_from(MAX_TREE_CHANGESET_MUTATIONS + 1)
         .map_err(|_| ChangeSetStoreError::CorruptRecord("tree_mutations.limit"))?;
@@ -680,15 +745,10 @@ pub(crate) fn source_tree_read_data(
             _ => return Err(ChangeSetStoreError::CorruptRecord("tree_mutation.applied")),
         }
     }
-    if mutation_count == 0 {
-        return Err(ChangeSetStoreError::CorruptRecord("tree_mutations.rows"));
-    }
-    Ok(Some(SourceTreeReadData {
-        change_set,
-        request_digest,
+    Ok(TreeMutationReadState {
         applied_mutations,
         mutation_count,
-    }))
+    })
 }
 
 pub(crate) fn begin(

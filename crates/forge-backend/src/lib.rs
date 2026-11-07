@@ -28,8 +28,9 @@ pub mod session_protocol;
 pub use auth::IssuerAuth;
 pub use bridge::{BridgeDrainReport, BridgeOutcome, CommandExecutor, ControlBridge};
 pub use client::{
-    ForgeHttpClient, ForgeHttpClientConfigError, ForgeHttpClientError, ForgeHttpMutationError,
-    ForgeHttpMutationRequest, ForgeHttpServiceCode,
+    ForgeHttpClient, ForgeHttpClientConfigError, ForgeHttpClientError,
+    ForgeHttpHomeTransferSourceError, ForgeHttpMutationError, ForgeHttpMutationRequest,
+    ForgeHttpServiceCode, PreparedHomeTransferSourceCommand, ReservedHomeTransferSourceSend,
 };
 pub use config::{
     BackendConfig, ConfigError, DEFAULT_COMMAND_DEADLINE, DEFAULT_SSE_POLL_INTERVAL,
@@ -42,6 +43,10 @@ pub use error::{ErrorCode, ForgeError, ReadbackHint};
 pub use events::{
     EventPage, EventQuery, EventQueryError, EventRecord, Frame, StreamEnd, Subjects,
     SubscriberGuard,
+};
+pub use forge_control::{
+    HomeTransferSourceCommand, HomeTransferSourceOperation, HomeTransferSourceResponse,
+    HomeTransferSourceService,
 };
 pub use http::{AppState, ServerJoinState, ShutdownPhase, ShutdownReport, router, serve};
 pub use ops::workspace_root_recovery::{
@@ -56,3 +61,10 @@ pub use ops::workspace_root_recovery::{
 pub use ops::{Command, CommandOp, parse_command};
 pub use recovery::{StartupRecoveryReport, run_startup_recovery};
 pub use serve_fence::{ServeFence, ServeFenceError};
+// Public immutable Source observation contracts used by the official client.
+// These codecs validate consistency; they grant no Source authentication.
+pub use forge_persistence::{
+    HomeTransferReservationRetirementRecord, HomeTransferReservationRetirementRecordParts,
+    HomeTransferSourceRecord, HomeTransferSourceRecordParts, HomeTransferSourceState,
+    decode_home_transfer_source_request, encode_home_transfer_source_request,
+};

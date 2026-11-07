@@ -7,12 +7,19 @@ use super::*;
 use crate::{ExpiredActivityRecoveryOperation, ExpiredActivityRecoveryStoreRequest};
 use forge_domain::{
     ActivityId, ActivityState, AgentInstanceId, AgentSessionId, AuthenticatedPrincipal,
-    BootstrapActivity, ExpiredActivityRecoveryExpectation, ExpiredActivityRecoveryProbeScope,
-    ExpiredActivityRecoverySessionEvidence, ForgeBackendId, OrchestrationIssuerId,
-    RecoveryLeaseDurationMillis, RuntimeInstanceId,
+    BootstrapActivity, ExpiredActivityRecoveryBlocker, ExpiredActivityRecoveryExpectation,
+    ExpiredActivityRecoveryProbeScope, ExpiredActivityRecoverySessionEvidence, ForgeBackendId,
+    HomeTransferReservationRetirementGrant, HomeTransferReservationRetirementRequest,
+    HomeTransferSourceAction, HomeTransferSourceGrant, HomeTransferSourceRequest,
+    HomeTransferSourceScope, HomeTransferSourceSubject, HomeTransferSourceWitness,
+    OrchestrationIssuerId, RecoveryLeaseDurationMillis, RuntimeInstanceId, TimestampMillis,
 };
 use rusqlite::{OptionalExtension, params};
 use uuid::Uuid;
+
+fn home_source_clock(value: i64) -> Result<TimestampMillis, crate::HomeTransferStoreError> {
+    TimestampMillis::new(value).map_err(|_| crate::HomeTransferStoreError::Clock)
+}
 
 #[test]
 fn expired_attached_activity_recovers_atomically_and_reopens_with_history()
@@ -395,6 +402,233 @@ fn schema_v63_to_v64_migration_recreates_empty_receipts_and_foreign_keys()
         .optional()?;
     assert!(foreign_key_violation.is_none());
     drop(migrated);
+    std::fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[test]
+fn valid_reservation_retirement_is_terminal_without_releasing_prepared_activity_fence()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (root, _layout, mut store, _) =
+        store_with_activity("expired-successor-retired-reservation")?;
+    let workspace = store.workspace()?;
+    let first_activity = store.bootstrap_activity(&BootstrapActivity::new(
+        ActivityId::from_uuid(Uuid::from_u128(0xEE10)),
+        workspace.id(),
+        workspace.revision(),
+        RuntimeInstanceId::from_uuid(Uuid::from_u128(0xEE11)),
+        timestamp(500)?,
+        timestamp(2)?,
+    ))?;
+    let workspace = store.workspace()?;
+    let second_activity = store.bootstrap_activity(&BootstrapActivity::new(
+        ActivityId::from_uuid(Uuid::from_u128(0xEE1F)),
+        workspace.id(),
+        workspace.revision(),
+        RuntimeInstanceId::from_uuid(Uuid::from_u128(0xEE20)),
+        timestamp(500)?,
+        timestamp(2)?,
+    ))?;
+    let destination = Uuid::from_u128(0xEE12);
+    let backend = ForgeBackendId::from_uuid(Uuid::from_u128(0xEE13));
+    let issuer = OrchestrationIssuerId::from_uuid(Uuid::from_u128(0xEE14));
+    let freeze = store.freeze_agent_operations(&crate::AgentOperationsFreezeRequest::new(
+        Uuid::from_u128(0xEE15),
+        destination,
+        timestamp(3)?,
+    )?)?;
+    let first_session_id = AgentSessionId::from_uuid(Uuid::from_u128(0xEE16));
+    let first_reservation_request = crate::AgentBindingReservationRequest::new(
+        Uuid::from_u128(0xEE17),
+        first_activity.id(),
+        AgentInstanceId::from_uuid(Uuid::from_u128(0xEE18)),
+        first_session_id,
+        AuthenticatedPrincipal::TrustedStdio,
+        timestamp(4)?,
+    )?;
+    let first_reservation =
+        store.reserve_agent_binding(&freeze, &first_reservation_request, timestamp(5)?)?;
+    let second_session_id = AgentSessionId::from_uuid(Uuid::from_u128(0xEE21));
+    let second_reservation_request = crate::AgentBindingReservationRequest::new(
+        Uuid::from_u128(0xEE22),
+        second_activity.id(),
+        AgentInstanceId::from_uuid(Uuid::from_u128(0xEE23)),
+        second_session_id,
+        AuthenticatedPrincipal::TrustedStdio,
+        timestamp(4)?,
+    )?;
+    let _second_reservation =
+        store.reserve_agent_binding(&freeze, &second_reservation_request, timestamp(6)?)?;
+    let delegation = store.delegate_agent_operations(&freeze, [0x5A; 32], timestamp(7)?)?;
+
+    let workspace = store.workspace()?;
+    let preparation_id = Uuid::from_u128(0xEE19);
+    let source_request = HomeTransferSourceRequest::new(
+        HomeTransferSourceWitness::new(preparation_id, [0xA1; 32], [0xB2; 32])?,
+        HomeTransferSourceScope::new(workspace.id(), workspace.revision(), backend, destination)?,
+        HomeTransferSourceSubject::new(
+            Uuid::from_u128(0xEE1A),
+            1,
+            Uuid::from_u128(0xEE1B),
+            Uuid::from_u128(0xEE1C),
+            Uuid::from_u128(0xEE1D),
+            Uuid::from_u128(0xEE1E),
+            1,
+            1,
+        )?,
+        vec![first_session_id, second_session_id],
+        Vec::new(),
+    )?;
+    let source_grant = HomeTransferSourceGrant::new(
+        issuer,
+        HomeTransferSourceAction::Prepare,
+        source_request.request_digest(),
+        timestamp(8)?,
+        timestamp(100)?,
+    )?;
+    let prepared = store.prepare_home_transfer_source(
+        &source_request,
+        source_grant,
+        issuer,
+        backend,
+        delegation.destination_id(),
+        || home_source_clock(10),
+    )?;
+    let original_inventory = prepared
+        .record()
+        .inventory_payload()
+        .ok_or("Prepared Home source has no inventory")?
+        .to_vec();
+    assert_eq!(original_inventory.get(5), Some(&2));
+
+    let before_first_retirement =
+        super::super::expired_activity_recovery::started_activity_physical_blockers(
+            &store.connection,
+            workspace.id(),
+            first_activity.id(),
+            64,
+        )?;
+    let before_second_retirement =
+        super::super::expired_activity_recovery::started_activity_physical_blockers(
+            &store.connection,
+            workspace.id(),
+            second_activity.id(),
+            64,
+        )?;
+    assert_eq!(before_first_retirement.pending_count, 1);
+    assert_eq!(before_second_retirement.pending_count, 1);
+    assert_eq!(
+        super::super::expired_activity_recovery::first_blocker(
+            &store.connection,
+            workspace.id(),
+            first_activity.id(),
+        )?,
+        Some(ExpiredActivityRecoveryBlocker::PendingBindingActivation)
+    );
+    assert_eq!(
+        super::super::expired_activity_recovery::first_blocker(
+            &store.connection,
+            workspace.id(),
+            second_activity.id(),
+        )?,
+        Some(ExpiredActivityRecoveryBlocker::PendingBindingActivation)
+    );
+
+    let retirement_request = HomeTransferReservationRetirementRequest::new(
+        source_request.scope(),
+        preparation_id,
+        source_request.request_digest(),
+        *prepared.record().outcome_digest(),
+        first_reservation.request().request_id(),
+    )?;
+    let retirement_grant = HomeTransferReservationRetirementGrant::new(
+        issuer,
+        retirement_request.request_digest(),
+        timestamp(11)?,
+        timestamp(100)?,
+    )?;
+    let retired = crate::workspace_home_transfers::retirements::retire(
+        &mut store.connection,
+        &retirement_request,
+        retirement_grant,
+        issuer,
+        backend,
+        destination,
+        || home_source_clock(12),
+    )?;
+    assert_eq!(retired.record().request(), &retirement_request);
+
+    let after_first_retirement =
+        super::super::expired_activity_recovery::started_activity_physical_blockers(
+            &store.connection,
+            workspace.id(),
+            first_activity.id(),
+            64,
+        )?;
+    let after_second_retirement =
+        super::super::expired_activity_recovery::started_activity_physical_blockers(
+            &store.connection,
+            workspace.id(),
+            second_activity.id(),
+            64,
+        )?;
+    assert_eq!(after_first_retirement.pending_count, 0);
+    assert_eq!(
+        after_first_retirement.row_count,
+        before_first_retirement.row_count + 1
+    );
+    assert_ne!(
+        after_first_retirement.digest,
+        before_first_retirement.digest
+    );
+    assert_eq!(after_second_retirement.pending_count, 1);
+    assert_eq!(
+        after_second_retirement.row_count,
+        before_second_retirement.row_count
+    );
+    assert_eq!(
+        after_second_retirement.digest,
+        before_second_retirement.digest
+    );
+    assert_eq!(
+        super::super::expired_activity_recovery::first_blocker(
+            &store.connection,
+            workspace.id(),
+            first_activity.id(),
+        )?,
+        None
+    );
+    assert_eq!(
+        super::super::expired_activity_recovery::first_blocker(
+            &store.connection,
+            workspace.id(),
+            second_activity.id(),
+        )?,
+        Some(ExpiredActivityRecoveryBlocker::PendingBindingActivation)
+    );
+    assert!(
+        crate::workspace_home_transfers::blocks_activity_continuation(
+            &store.connection,
+            workspace.id(),
+            first_activity.id(),
+        )?
+    );
+    assert!(
+        crate::workspace_home_transfers::blocks_activity_continuation(
+            &store.connection,
+            workspace.id(),
+            second_activity.id(),
+        )?
+    );
+    let persisted = store
+        .get_home_transfer_source(preparation_id, issuer, backend, destination)?
+        .ok_or("Prepared source disappeared after retirement")?;
+    assert_eq!(
+        persisted.inventory_payload(),
+        Some(original_inventory.as_slice())
+    );
+
+    drop(store);
     std::fs::remove_dir_all(root)?;
     Ok(())
 }

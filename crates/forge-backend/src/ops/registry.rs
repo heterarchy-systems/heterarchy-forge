@@ -335,6 +335,7 @@ pub(super) fn execute_workspace_doctor(
     let report = result.report();
     let checkpoints = result.checkpoint_store();
     let diffs = result.diff_artifacts();
+    let home_artifacts = result.home_artifacts();
     Ok(json!({
         "outcome": match result.outcome() {
             Outcome::Healthy => "healthy",
@@ -368,6 +369,24 @@ pub(super) fn execute_workspace_doctor(
         "diff_artifacts": {
             "finding_count": diffs.findings().len(),
             "complete": diffs.is_complete(),
+        },
+        "home_artifacts": {
+            "metadata_only": home_artifacts.metadata_only(),
+            "complete": home_artifacts.is_complete(),
+            "database_truncated": home_artifacts.database_truncated(),
+            "refs_truncated": home_artifacts.refs_truncated(),
+            "findings_truncated": home_artifacts.findings_truncated(),
+            "findings": home_artifacts.findings().iter().map(|finding| json!({
+                "artifact_id": finding.artifact_id().map(forge_domain::HomeArtifactId::into_uuid),
+                "status": match finding.status() {
+                    forge_control::WorkspaceHomeArtifactStatus::RetainedRefMatched => "retained_ref_matched",
+                    forge_control::WorkspaceHomeArtifactStatus::PublishedPendingSeal => "published_pending_seal",
+                    forge_control::WorkspaceHomeArtifactStatus::PendingCapture => "pending_capture",
+                    forge_control::WorkspaceHomeArtifactStatus::Missing => "missing",
+                    forge_control::WorkspaceHomeArtifactStatus::Conflicting => "conflicting",
+                    forge_control::WorkspaceHomeArtifactStatus::ProtectedUnresolved => "protected_unresolved",
+                },
+            })).collect::<Vec<_>>(),
         },
     }))
 }

@@ -38,6 +38,13 @@ pub(crate) mod worker_worktree;
 #[path = "worker_worktree_linux.rs"]
 pub(crate) mod worker_worktree_linux;
 
+mod home_artifact;
+pub use home_artifact::{
+    HOME_ARTIFACT_REF_INVENTORY_MAX, HOME_ARTIFACT_REF_PREFIX, HomeArtifactPathRead,
+    HomeArtifactRefInventory, HomeArtifactRefInventoryEntry, HomeArtifactRefInventoryLimit,
+    HomeArtifactRefIssue, HomeArtifactStore, HomeArtifactStoreError,
+};
+
 /// Pinned Git executable used for all Forge-owned Git operations.
 ///
 /// macOS uses the Command Line Tools binary directly, avoiding the xcrun shim.

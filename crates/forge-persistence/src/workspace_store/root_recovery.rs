@@ -437,6 +437,7 @@ impl WorkspaceStore {
             ));
         }
 
+        super::ensure_no_retained_home_artifact_refs(layout)?;
         let database = ReadOnlyDoctorDatabase::open_under_exclusive(layout, gate)?;
         let ownership = inspect_database(&database.connection)?;
         let shape = recovery_schema_shape(ownership)?;
@@ -541,6 +542,7 @@ impl WorkspaceStore {
         if probe.schema_version == CURRENT_SCHEMA_VERSION {
             return Ok(());
         }
+        super::ensure_no_retained_home_artifact_refs(layout)?;
         if !matches!(
             probe.schema_version,
             super::PREVIOUS_ROOT_RECOVERY_SCHEMA_VERSION
@@ -551,6 +553,11 @@ impl WorkspaceStore {
                 | super::PREVIOUS_STARTED_ACTIVITY_LEASE_RESUME_SCHEMA_VERSION
                 | super::PREVIOUS_ADMISSION_IDENTITY_SCHEMA_VERSION
                 | super::PREVIOUS_QUIESCENT_ACTIVITY_LEASE_RESUME_SCHEMA_VERSION
+                | super::PREVIOUS_EVALUATION_EVIDENCE_SCHEMA_VERSION
+                | super::PREVIOUS_HOME_TRANSFER_SOURCE_SCHEMA_VERSION
+                | super::PREVIOUS_HOME_TRANSFER_RESERVATION_RETIREMENT_SCHEMA_VERSION
+                | super::PREVIOUS_HOME_ARTIFACT_SCHEMA_VERSION
+                | super::PREVIOUS_HOME_HANDOFF_SCHEMA_VERSION
         ) {
             return Err(RootRecoveryStoreError::SchemaUpgradeRequired {
                 actual: probe.schema_version,
@@ -587,6 +594,13 @@ impl WorkspaceStore {
             super::PREVIOUS_QUIESCENT_ACTIVITY_LEASE_RESUME_SCHEMA_VERSION => {
                 WorkspaceSchemaShape::V68
             }
+            super::PREVIOUS_EVALUATION_EVIDENCE_SCHEMA_VERSION => WorkspaceSchemaShape::V69,
+            super::PREVIOUS_HOME_TRANSFER_SOURCE_SCHEMA_VERSION => WorkspaceSchemaShape::V70,
+            super::PREVIOUS_HOME_TRANSFER_RESERVATION_RETIREMENT_SCHEMA_VERSION => {
+                WorkspaceSchemaShape::V71
+            }
+            super::PREVIOUS_HOME_ARTIFACT_SCHEMA_VERSION => WorkspaceSchemaShape::V72,
+            super::PREVIOUS_HOME_HANDOFF_SCHEMA_VERSION => WorkspaceSchemaShape::V73,
             _ => unreachable!("schema version was checked above"),
         };
         validate_schema_shape_for_version(&connection, source_shape)?;
@@ -597,6 +611,46 @@ impl WorkspaceStore {
             return Err(RootRecoveryStoreError::WorkspaceChanged);
         }
         validate_authority_mode(&connection, current.id(), probe.authority_mode)?;
+        if source_shape == WorkspaceSchemaShape::V73 {
+            gate.ensure_root_binding(layout.workspace_root(), root_fingerprint)
+                .map_err(WorkspaceStoreError::StateGate)?;
+            ensure_source_identity(&probe.source, layout, root_fingerprint)?;
+            if let Err(source) = super::migrate_home_handoff_schema(&mut connection, BUSY_TIMEOUT) {
+                let observed = schema_version(&connection).map_err(|readback| {
+                    RootRecoveryStoreError::SchemaMigrationCommittedUnconfirmed {
+                        source: Box::new(RootRecoveryStoreError::Store(readback)),
+                    }
+                })?;
+                return if observed == CURRENT_SCHEMA_VERSION {
+                    Err(
+                        RootRecoveryStoreError::SchemaMigrationCommittedUnconfirmed {
+                            source: Box::new(RootRecoveryStoreError::Store(source)),
+                        },
+                    )
+                } else {
+                    Err(RootRecoveryStoreError::Store(source))
+                };
+            }
+            let post_version = schema_version(&connection).map_err(|source| {
+                RootRecoveryStoreError::SchemaMigrationCommittedUnconfirmed {
+                    source: Box::new(RootRecoveryStoreError::Store(source)),
+                }
+            })?;
+            if post_version != CURRENT_SCHEMA_VERSION {
+                return Err(
+                    RootRecoveryStoreError::SchemaMigrationCommittedUnconfirmed {
+                        source: Box::new(RootRecoveryStoreError::SchemaUpgradeRequired {
+                            actual: post_version,
+                            current: CURRENT_SCHEMA_VERSION,
+                        }),
+                    },
+                );
+            }
+            gate.ensure_root_binding(layout.workspace_root(), root_fingerprint)
+                .map_err(WorkspaceStoreError::StateGate)?;
+            ensure_source_identity(&probe.source, layout, root_fingerprint)?;
+            return Ok(());
+        }
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         validate_authority_mode(&transaction, current.id(), probe.authority_mode)?;
         if source_shape == WorkspaceSchemaShape::V61 {
@@ -661,6 +715,11 @@ impl WorkspaceStore {
                 | WorkspaceSchemaShape::V66
                 | WorkspaceSchemaShape::V67
                 | WorkspaceSchemaShape::V68
+                | WorkspaceSchemaShape::V69
+                | WorkspaceSchemaShape::V70
+                | WorkspaceSchemaShape::V71
+                | WorkspaceSchemaShape::V72
+                | WorkspaceSchemaShape::V73
         ) {
             return Err(RootRecoveryStoreError::SchemaUpgradeRequired {
                 actual: probe.schema_version,
@@ -693,6 +752,38 @@ impl WorkspaceStore {
                     })
                 })?;
         }
+        if !source_shape.includes_evaluation_evidence() {
+            crate::workspace_evaluation_evidence::create_schema(&transaction).map_err(|error| {
+                RootRecoveryStoreError::Store(WorkspaceStoreError::EvaluationEvidence(Box::new(
+                    error,
+                )))
+            })?;
+        }
+        if !source_shape.includes_home_transfer_source() {
+            crate::workspace_home_transfers::schema::create_schema(&transaction).map_err(
+                |error| RootRecoveryStoreError::Store(WorkspaceStoreError::HomeTransfer(error)),
+            )?;
+        }
+        if !source_shape.includes_approval_agent_provenance() {
+            crate::workspace_approvals::agent_provenance::schema::create_schema(&transaction)
+                .map_err(|error| {
+                    RootRecoveryStoreError::Store(WorkspaceStoreError::Approval(error))
+                })?;
+        }
+        if !source_shape.includes_home_reservation_retirement() {
+            crate::workspace_home_transfers::retirements::schema::create_schema(&transaction)
+                .map_err(|error| {
+                    RootRecoveryStoreError::Store(WorkspaceStoreError::HomeTransfer(error))
+                })?;
+        }
+        if !source_shape.includes_home_artifacts() {
+            crate::workspace_home_transfers::artifacts::schema::create_schema(&transaction)
+                .map_err(|error| {
+                    RootRecoveryStoreError::Store(WorkspaceStoreError::HomeArtifact(Box::new(
+                        error,
+                    )))
+                })?;
+        }
         if probe.schema_version < super::PREVIOUS_QUIESCENT_ACTIVITY_LEASE_RESUME_SCHEMA_VERSION {
             crate::workspace_admission_envelopes::migrate_identity_schema(&transaction)
                 .map_err(WorkspaceStoreError::from)?;
@@ -701,14 +792,38 @@ impl WorkspaceStore {
             .map_err(WorkspaceStoreError::StateGate)?;
         ensure_source_identity(&probe.source, layout, root_fingerprint)?;
         transaction
-            .pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)
+            .pragma_update(
+                None,
+                "user_version",
+                super::PREVIOUS_HOME_HANDOFF_SCHEMA_VERSION,
+            )
             .map_err(WorkspaceStoreError::from)?;
-        validate_schema_shape_for_version(&transaction, WorkspaceSchemaShape::Current)?;
+        validate_schema_shape_for_version(&transaction, WorkspaceSchemaShape::V73)?;
         transaction.commit().map_err(|source| {
             RootRecoveryStoreError::SchemaMigrationCommittedUnconfirmed {
                 source: Box::new(RootRecoveryStoreError::Store(WorkspaceStoreError::Sqlite(
                     source,
                 ))),
+            }
+        })?;
+        let post_version = schema_version(&connection).map_err(|source| {
+            RootRecoveryStoreError::SchemaMigrationCommittedUnconfirmed {
+                source: Box::new(RootRecoveryStoreError::Store(source)),
+            }
+        })?;
+        if post_version != super::PREVIOUS_HOME_HANDOFF_SCHEMA_VERSION {
+            return Err(
+                RootRecoveryStoreError::SchemaMigrationCommittedUnconfirmed {
+                    source: Box::new(RootRecoveryStoreError::SchemaUpgradeRequired {
+                        actual: post_version,
+                        current: CURRENT_SCHEMA_VERSION,
+                    }),
+                },
+            );
+        }
+        super::migrate_home_handoff_schema(&mut connection, BUSY_TIMEOUT).map_err(|source| {
+            RootRecoveryStoreError::SchemaMigrationCommittedUnconfirmed {
+                source: Box::new(RootRecoveryStoreError::Store(source)),
             }
         })?;
         let post_version = schema_version(&connection).map_err(|source| {
@@ -794,6 +909,7 @@ impl WorkspaceStore {
         }
         probe.source.ensure_unchanged(layout)?;
         let intent_digest = request_intent_digest(request);
+        super::ensure_no_retained_home_artifact_refs(layout)?;
         let mut connection = open_transition_connection(layout, gate, &probe.source)?;
         validate_schema_shape_for_version(&connection, WorkspaceSchemaShape::Current)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -993,6 +1109,31 @@ fn recovery_schema_shape(
         {
             Ok(WorkspaceSchemaShape::V68)
         }
+        DatabaseOwnership::Outdated { version }
+            if version == super::PREVIOUS_EVALUATION_EVIDENCE_SCHEMA_VERSION =>
+        {
+            Ok(WorkspaceSchemaShape::V69)
+        }
+        DatabaseOwnership::Outdated { version }
+            if version == super::PREVIOUS_HOME_TRANSFER_SOURCE_SCHEMA_VERSION =>
+        {
+            Ok(WorkspaceSchemaShape::V70)
+        }
+        DatabaseOwnership::Outdated { version }
+            if version == super::PREVIOUS_HOME_TRANSFER_RESERVATION_RETIREMENT_SCHEMA_VERSION =>
+        {
+            Ok(WorkspaceSchemaShape::V71)
+        }
+        DatabaseOwnership::Outdated { version }
+            if version == super::PREVIOUS_HOME_ARTIFACT_SCHEMA_VERSION =>
+        {
+            Ok(WorkspaceSchemaShape::V72)
+        }
+        DatabaseOwnership::Outdated { version }
+            if version == super::PREVIOUS_HOME_HANDOFF_SCHEMA_VERSION =>
+        {
+            Ok(WorkspaceSchemaShape::V73)
+        }
         DatabaseOwnership::Outdated { version } => {
             Err(RootRecoveryStoreError::SchemaUpgradeRequired {
                 actual: version,
@@ -1035,6 +1176,9 @@ fn recovery_doctor_report(
         .map_err(|source| RootRecoveryStoreError::Store(WorkspaceStoreError::Dag(source)))?;
     let diff_references = crate::workspace_diffs::doctor_references(connection)
         .map_err(|source| RootRecoveryStoreError::Store(WorkspaceStoreError::Diff(source)))?;
+    let home_artifact_references =
+        crate::workspace_home_transfers::artifacts::doctor_references(connection, workspace.id())
+            .map_err(|error| WorkspaceStoreError::HomeArtifact(Box::new(error)))?;
     Ok(WorkspaceDoctorReport::new(
         WorkspaceDoctorIdentity {
             schema_version,
@@ -1049,6 +1193,7 @@ fn recovery_doctor_report(
             stale_executions,
             stale_checkpoint_restores,
             checkpoint_references,
+            home_artifact_references,
             dag_semantics,
             diff_references,
         },
@@ -2133,6 +2278,94 @@ mod tests {
     }
 
     #[test]
+    fn schema_v71_root_probe_is_read_only_and_upgrade_adds_retirement_schema()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_home_root_schema_upgrade(71)
+    }
+
+    #[test]
+    fn schema_v72_root_probe_is_read_only_and_upgrade_adds_artifact_schema()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_home_root_schema_upgrade(72)
+    }
+
+    fn assert_home_root_schema_upgrade(version: i64) -> Result<(), Box<dyn std::error::Error>> {
+        let (root, layout, mut store, _workspace_id) =
+            store_fixture(&format!("schema-v{version}-home-upgrade"))?;
+        let authority = delegated_fixture_authority(&mut store)?;
+        let expected = store.workspace()?;
+        let actual_fingerprint = layout.root_fingerprint()?;
+        let mut old_fingerprint = actual_fingerprint.into_bytes();
+        old_fingerprint[0] ^= 1;
+        let new_table = match version {
+            71 => {
+                crate::evaluation_schema_fixture::remove_empty_home_reservation_retirement_schema_objects(&store.connection)?;
+                "home_transfer_reservation_retirements"
+            }
+            72 => {
+                crate::evaluation_schema_fixture::remove_empty_home_artifact_schema_objects(
+                    &store.connection,
+                )?;
+                "home_transfer_artifact_stages"
+            }
+            _ => return Err("unsupported Home root-upgrade fixture".into()),
+        };
+        store
+            .connection
+            .pragma_update(None, "user_version", version)?;
+        store.connection.execute(
+            "UPDATE workspace SET root_fingerprint=?1",
+            params![old_fingerprint.as_slice()],
+        )?;
+        drop(store);
+
+        let existing = WorkspaceStateLayout::inspect_existing(&root)?.ok_or("layout missing")?;
+        let identity =
+            WorkspaceStore::inspect_existing_root_recovery_identity_read_only(&existing)?;
+        assert_eq!(identity.schema_version(), version);
+        assert_eq!(
+            Connection::open(existing.database_path())?.query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE type='table' AND name=?1",
+                [new_table],
+                |row| row.get::<_, i64>(0),
+            )?,
+            0
+        );
+        let gate = WorkspaceStateExclusiveGate::acquire(&root, actual_fingerprint)?;
+        let expected = RegisteredWorkspace::from_parts_with_revision(
+            expected.id(),
+            expected.location_id(),
+            expected.root().clone(),
+            WorkspaceRootFingerprint::from_bytes(old_fingerprint),
+            expected.created_at(),
+            expected.updated_at(),
+            expected.revision(),
+        );
+        let probe = WorkspaceStore::probe_root_recovery_preserving_delegated_freeze(
+            &existing, &gate, &expected, authority,
+        )?;
+        assert_eq!(probe.schema_version(), version);
+        assert!(probe.requires_schema_upgrade());
+
+        let prepared = WorkspaceStore::prepare_root_recovery(&existing, &gate, &probe)?;
+        assert_eq!(prepared.schema_version(), CURRENT_SCHEMA_VERSION);
+        assert!(!prepared.requires_schema_upgrade());
+        let connection = Connection::open(existing.database_path())?;
+        crate::workspace_home_transfers::retirements::schema::validate_schema(&connection)?;
+        crate::workspace_home_transfers::artifacts::schema::validate_schema(&connection)?;
+        let stored = decode_workspace(
+            query_workspace_row(&connection)?
+                .ok_or("Workspace row missing after schema upgrade")?,
+        )?;
+        assert_eq!(stored, expected);
+        drop(connection);
+        drop(gate);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
     fn schema_v63_root_preparation_upgrades_only_explicitly_to_current()
     -> Result<(), Box<dyn std::error::Error>> {
         let (root, layout, mut store, _workspace_id) = store_fixture("schema-v63-prepare")?;
@@ -2335,6 +2568,84 @@ mod tests {
         crate::workspace_admission_envelopes::validate_schema(&Connection::open(
             existing.database_path(),
         )?)?;
+        drop(gate);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn schema_v69_root_preparation_adds_empty_later_evidence_schemas()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (root, layout, mut store, _) = store_fixture("evaluation-v69-prepare")?;
+        let authority = delegated_fixture_authority(&mut store)?;
+        let expected = store.workspace()?;
+        let actual = layout.root_fingerprint()?;
+        let mut previous = actual.into_bytes();
+        previous[0] ^= 1;
+        crate::evaluation_schema_fixture::remove_empty_evaluation_schema(&store.connection)?;
+        store.connection.pragma_update(
+            None,
+            "user_version",
+            super::super::PREVIOUS_EVALUATION_EVIDENCE_SCHEMA_VERSION,
+        )?;
+        store.connection.execute(
+            "UPDATE workspace SET root_fingerprint=?1",
+            params![previous.as_slice()],
+        )?;
+        drop(store);
+
+        let existing = WorkspaceStateLayout::inspect_existing(&root)?.ok_or("layout missing")?;
+        let gate = WorkspaceStateExclusiveGate::acquire(&root, actual)?;
+        let expected = RegisteredWorkspace::from_parts_with_revision(
+            expected.id(),
+            expected.location_id(),
+            expected.root().clone(),
+            WorkspaceRootFingerprint::from_bytes(previous),
+            expected.created_at(),
+            expected.updated_at(),
+            expected.revision(),
+        );
+        let probe = WorkspaceStore::probe_root_recovery_preserving_delegated_freeze(
+            &existing, &gate, &expected, authority,
+        )?;
+        assert_eq!(probe.schema_version(), 69);
+        let prepared = WorkspaceStore::prepare_root_recovery(&existing, &gate, &probe)?;
+        assert_eq!(prepared.schema_version(), CURRENT_SCHEMA_VERSION);
+        let connection = Connection::open(existing.database_path())?;
+        crate::workspace_evaluation_evidence::validate_schema(&connection)?;
+        for (kind, name) in crate::workspace_evaluation_evidence::schema_objects() {
+            if kind != "table" {
+                continue;
+            }
+            let row_count: i64 =
+                connection.query_row(&format!("SELECT COUNT(*) FROM {name}"), [], |row| {
+                    row.get(0)
+                })?;
+            assert_eq!(row_count, 0, "root preparation fabricated rows in {name}");
+        }
+        crate::workspace_home_transfers::schema::validate_schema(&connection)?;
+        for (kind, name) in crate::workspace_home_transfers::schema::schema_objects() {
+            if kind == "table" {
+                let row_count: i64 =
+                    connection.query_row(&format!("SELECT COUNT(*) FROM {name}"), [], |row| {
+                        row.get(0)
+                    })?;
+                assert_eq!(row_count, 0, "root preparation fabricated rows in {name}");
+            }
+        }
+        crate::workspace_approvals::agent_provenance::schema::validate_schema(&connection)?;
+        for (kind, name, _) in
+            crate::workspace_approvals::agent_provenance::schema::schema_objects()
+        {
+            if kind == "table" {
+                let row_count: i64 =
+                    connection.query_row(&format!("SELECT COUNT(*) FROM {name}"), [], |row| {
+                        row.get(0)
+                    })?;
+                assert_eq!(row_count, 0, "root preparation fabricated rows in {name}");
+            }
+        }
+        drop(connection);
         drop(gate);
         fs::remove_dir_all(root)?;
         Ok(())

@@ -70,3 +70,6 @@ must_use_candidate = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 missing_const_for_fn = "allow"
+
+[profile.dev.package.sha2]
+opt-level = 3

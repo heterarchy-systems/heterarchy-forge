@@ -32,9 +32,6 @@ const STARTUP_LOG_BYTES: usize = 16 * 1024;
 const SECRET_MODE: u32 = 0o600;
 const SESSION_SERVICE_SECRET: &str = "standalone-session-service-secret";
 
-#[path = "standalone/workspace_stop_outage.rs"]
-mod workspace_stop_outage;
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires CARGO_BIN_EXE_forge-backend and FORGE_ORCHESTRATION_BACKEND_BIN"]
 async fn standalone_processes_use_remote_session_authority_without_local_fallback()
@@ -109,21 +106,22 @@ async fn run_cross_process(
         .wait_for_endpoint(STARTUP_TIMEOUT, parse_backend_endpoint)
         .await?;
 
-    let approved = prepare_approved_shell(fixture)?;
-    assert_http_execution(backend_address, &approved, fixture).await?;
     assert_http_snapshot(backend_address, fixture).await?;
     let diff_id =
         lease_readback::assert_http_lease_and_mutation_readback(backend_address, fixture).await?;
     readback_enrichment::assert_http_readback_enrichment(backend_address, fixture, diff_id).await?;
-    let authority = approved.authority.clone();
+    let authority = authority_json(
+        fixture,
+        ExecutionId::from_uuid(Uuid::now_v7()),
+        &ExecutionCommandId::new("ci".to_owned())?,
+        timestamp_now()?,
+    );
     let read_payload = json!({
         "authority": authority.clone(),
         "after_sequence": 0,
         "max_bytes": forge_domain::MIN_EXECUTION_OUTPUT_READ_BYTES,
         "max_events": forge_domain::MAX_EXECUTION_OUTPUT_READ_EVENTS,
     });
-    execution_waits::assert_http_execution_wait(backend_address, &approved, fixture).await?;
-    assert_durable_output(fixture, approved)?;
     planning_writes::assert_http_planning(backend_address, fixture).await?;
     effect_fact_reads::assert_http_effect_fact_outbox(backend_address, fixture).await?;
     assert_admin_lease_available(backend_address, fixture).await?;
@@ -167,8 +165,6 @@ async fn assert_remote_session_outage(
     // this independent durable owner; session-bound operations below fail closed.
     assert_admin_lease_available(backend_address, fixture).await?;
 
-    workspace_stop_outage::assert_unavailable_stop_owner(backend_address, fixture).await?;
-
     let (status, failed_read) =
         post_command(backend_address, "execution.read", read_payload).await?;
     assert_ne!(
@@ -195,7 +191,13 @@ async fn assert_remote_session_outage(
     let (status, failed_wait) = post_command(
         backend_address,
         "execution.wait",
-        execution_waits::wait_payload(&authority, 0, 0),
+        json!({
+            "authority": authority.clone(),
+            "after_sequence": 0,
+            "max_bytes": forge_domain::MIN_EXECUTION_OUTPUT_READ_BYTES,
+            "max_events": forge_domain::MAX_EXECUTION_OUTPUT_READ_EVENTS,
+            "timeout_ms": 0,
+        }),
     )
     .await?;
     assert_eq!(status, 503);

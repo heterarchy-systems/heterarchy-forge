@@ -297,9 +297,11 @@ fn map_rejection_error(error: WorkspaceStoreError) -> ControlError {
             | Error::Activation(_)
             | Error::Agent(_) => ControlErrorCode::AgentConflict,
             Error::CommitUnconfirmed(_) => return ControlError::committed(),
-            Error::DamagedSchema(_) | Error::Corrupt(_) | Error::Clock | Error::Sqlite(_) => {
-                ControlErrorCode::PersistenceFailure
-            }
+            Error::DamagedSchema(_)
+            | Error::Corrupt(_)
+            | Error::Clock
+            | Error::Sqlite(_)
+            | Error::Retirement(_) => ControlErrorCode::PersistenceFailure,
         };
         return ControlError::with_source(code, error);
     }
