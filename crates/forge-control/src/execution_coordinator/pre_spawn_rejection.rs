@@ -120,6 +120,7 @@ impl NativeStartErrorDiagnostic {
 
 fn verification_input_subclass(error: &VerificationInputError) -> &'static str {
     match error {
+        VerificationInputError::PublicationUnconfirmed { .. } => "publication_unconfirmed",
         VerificationInputError::Cancelled => "cancelled",
         VerificationInputError::Filesystem(_) => "filesystem",
         VerificationInputError::Manifest(_) => "manifest",
@@ -209,7 +210,7 @@ mod tests {
         let cases = [
             (
                 ExecutionSupervisorError::Execution(ExecutionError::PackageVExecutable(
-                    PackageVExecutableError::ExternalStorageRejected,
+                    PackageVExecutableError::ExecutableChanged,
                 )),
                 "package_v_executable",
                 "none",

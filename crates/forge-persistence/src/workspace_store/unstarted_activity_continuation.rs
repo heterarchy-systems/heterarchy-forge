@@ -31,6 +31,8 @@ pub(crate) mod provenance;
 
 const DOMAIN_PROBE: &[u8] = b"heterarchy.forge.unstarted-activity-continuation.probe.v1";
 const DOMAIN_PLAN: &[u8] = b"heterarchy.forge.unstarted-activity-continuation.plan.v1";
+const DOMAIN_EVALUATION_PLAN: &[u8] =
+    b"heterarchy.forge.unstarted-activity-continuation.evaluation-plan.v1";
 const DOMAIN_RECEIPT: &[u8] = b"heterarchy.forge.unstarted-activity-continuation.receipt.v1";
 const MAX_AGENT_ROWS: usize = forge_domain::MAX_AGENT_LIST_RESULTS as usize;
 const AGENT_CENSUS_LIMIT: usize = MAX_AGENT_ROWS + 1;
@@ -369,6 +371,16 @@ pub(super) fn census_components_for_test(
     workspace_id: forge_domain::WorkspaceId,
     activity_id: forge_domain::ActivityId,
 ) -> Vec<(&'static str, String)> {
+    let plan_census_report = match connection.unchecked_transaction() {
+        Ok(transaction) => format!(
+            "{:?}",
+            plan_census(&transaction, workspace_id, activity_id).map(|(_, blocker)| blocker)
+        ),
+        Err(error) => format!(
+            "{:?}",
+            UnstartedActivityContinuationStoreError::Sqlite(error)
+        ),
+    };
     vec![
         (
             "forbidden_inventory",
@@ -405,13 +417,7 @@ pub(super) fn census_components_for_test(
                 .map(|_| ())
             ),
         ),
-        (
-            "plan_census",
-            format!(
-                "{:?}",
-                plan_census(connection, workspace_id, activity_id).map(|(_, blocker)| blocker)
-            ),
-        ),
+        ("plan_census", plan_census_report),
     ]
 }
 
@@ -755,7 +761,7 @@ where
     reason = "The closed positive census keeps each admissible plan family and first blocker explicit."
 )]
 fn plan_census(
-    connection: &Connection,
+    transaction: &Transaction<'_>,
     workspace_id: forge_domain::WorkspaceId,
     activity_id: forge_domain::ActivityId,
 ) -> Result<
@@ -764,13 +770,30 @@ fn plan_census(
 > {
     let workspace = workspace_id.into_uuid().into_bytes();
     let activity = activity_id.into_uuid().into_bytes();
-    validate_census_manifest(connection)?;
+    validate_census_manifest(transaction)?;
+    if crate::workspace_home_transfers::blocks_activity_continuation(
+        transaction,
+        workspace_id,
+        activity_id,
+    )
+    .map_err(WorkspaceStoreError::HomeTransfer)?
+    {
+        return Ok((
+            [0xED; 32],
+            Some(UnstartedActivityContinuationBlocker::PhysicalEffectPresent),
+        ));
+    }
     if let Some(blocker) =
-        classify_activity_tables(connection, workspace.as_slice(), activity.as_slice())?
+        classify_activity_tables(transaction, workspace.as_slice(), activity.as_slice())?
     {
         return Ok(([0xEE; 32], Some(blocker)));
     }
-    let goal_count: i64 = connection.query_row(
+    let (evaluation_digest, evaluation_blocker) =
+        evaluation_planning_census(transaction, workspace_id, activity_id)?;
+    if let Some(blocker) = evaluation_blocker {
+        return Ok(([0xEF; 32], Some(blocker)));
+    }
+    let goal_count: i64 = transaction.query_row(
         "SELECT COUNT(*) FROM goals WHERE workspace_id=?1 AND activity_id=?2",
         params![workspace.as_slice(), activity.as_slice()],
         |row| row.get(0),
@@ -781,14 +804,14 @@ fn plan_census(
             Some(UnstartedActivityContinuationBlocker::GoalNotActive),
         ));
     }
-    let invalid_goals: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM goals WHERE workspace_id=?1 AND activity_id=?2 AND (state != 0 OR revision != 1 OR created_at_ms != updated_at_ms OR reason_kind IS NOT NULL OR reason_text IS NOT NULL OR completion_review_id IS NOT NULL))", params![workspace.as_slice(), activity.as_slice()], |row| row.get(0))?;
+    let invalid_goals: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM goals WHERE workspace_id=?1 AND activity_id=?2 AND (state != 0 OR revision != 1 OR created_at_ms != updated_at_ms OR reason_kind IS NOT NULL OR reason_text IS NOT NULL OR completion_review_id IS NOT NULL))", params![workspace.as_slice(), activity.as_slice()], |row| row.get(0))?;
     if invalid_goals {
         return Ok((
             [1; 32],
             Some(UnstartedActivityContinuationBlocker::GoalNotActive),
         ));
     }
-    let invalid_watermark: bool = connection.query_row(
+    let invalid_watermark: bool = transaction.query_row(
         "SELECT EXISTS(SELECT 1 FROM goals g LEFT JOIN goal_creation_watermarks w ON w.workspace_id=g.workspace_id AND w.goal_id=g.goal_id WHERE g.workspace_id=?1 AND g.activity_id=?2 AND (w.goal_id IS NULL OR w.greatest_created_at_ms != g.created_at_ms))",
         params![workspace.as_slice(), activity.as_slice()], |row| row.get(0),
     )?;
@@ -798,7 +821,7 @@ fn plan_census(
             Some(UnstartedActivityContinuationBlocker::GoalNotActive),
         ));
     }
-    let invalid_dag_revision: bool = connection.query_row(
+    let invalid_dag_revision: bool = transaction.query_row(
         "SELECT EXISTS(SELECT 1 FROM goal_dag_revisions r JOIN goals g ON g.goal_id=r.goal_id WHERE g.workspace_id=?1 AND g.activity_id=?2 AND (r.dag_revision != 1 OR r.parent_dag_revision IS NOT NULL OR r.base_goal_revision != 1)) OR EXISTS(SELECT 1 FROM goal_dag_heads h JOIN goals g ON g.goal_id=h.goal_id WHERE g.workspace_id=?1 AND g.activity_id=?2 AND (h.dag_revision != 1 OR h.head_revision != 1)) OR EXISTS(SELECT 1 FROM goal_dag_node_lineage l JOIN goals g ON g.goal_id=l.goal_id WHERE g.workspace_id=?1 AND g.activity_id=?2)",
         params![workspace.as_slice(), activity.as_slice()], |row| row.get(0),
     )?;
@@ -808,41 +831,41 @@ fn plan_census(
             Some(UnstartedActivityContinuationBlocker::DagNotPendingInitial),
         ));
     }
-    let node_count: i64 = connection.query_row("SELECT COUNT(*) FROM goal_dag_nodes n JOIN goals g ON g.goal_id=n.goal_id WHERE g.workspace_id=?1 AND g.activity_id=?2", params![workspace.as_slice(), activity.as_slice()], |row| row.get(0))?;
-    let invalid_nodes: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM goal_dag_nodes n JOIN goals g ON g.goal_id=n.goal_id WHERE g.workspace_id=?1 AND g.activity_id=?2 AND (n.lifecycle_state != 0 OR n.node_revision != 1 OR n.created_at_ms != n.updated_at_ms))", params![workspace.as_slice(), activity.as_slice()], |row| row.get(0))?;
+    let node_count: i64 = transaction.query_row("SELECT COUNT(*) FROM goal_dag_nodes n JOIN goals g ON g.goal_id=n.goal_id WHERE g.workspace_id=?1 AND g.activity_id=?2", params![workspace.as_slice(), activity.as_slice()], |row| row.get(0))?;
+    let invalid_nodes: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM goal_dag_nodes n JOIN goals g ON g.goal_id=n.goal_id WHERE g.workspace_id=?1 AND g.activity_id=?2 AND (n.lifecycle_state != 0 OR n.node_revision != 1 OR n.created_at_ms != n.updated_at_ms))", params![workspace.as_slice(), activity.as_slice()], |row| row.get(0))?;
     if node_count == 0 || invalid_nodes {
         return Ok((
             [2; 32],
             Some(UnstartedActivityContinuationBlocker::DagNotPendingInitial),
         ));
     }
-    let dag_evidence: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM goal_dag_node_evidence_refs e JOIN goals g ON g.goal_id=e.goal_id WHERE g.workspace_id=?1 AND g.activity_id=?2) OR EXISTS(SELECT 1 FROM goal_evidence_refs e JOIN goals g ON g.goal_id=e.goal_id WHERE g.workspace_id=?1 AND g.activity_id=?2)", params![workspace.as_slice(), activity.as_slice()], |row| row.get(0))?;
+    let dag_evidence: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM goal_dag_node_evidence_refs e JOIN goals g ON g.goal_id=e.goal_id WHERE g.workspace_id=?1 AND g.activity_id=?2) OR EXISTS(SELECT 1 FROM goal_evidence_refs e JOIN goals g ON g.goal_id=e.goal_id WHERE g.workspace_id=?1 AND g.activity_id=?2)", params![workspace.as_slice(), activity.as_slice()], |row| row.get(0))?;
     if dag_evidence {
         return Ok((
             [3; 32],
             Some(UnstartedActivityContinuationBlocker::DagEvidencePresent),
         ));
     }
-    let assignment_count: i64 = connection.query_row(
+    let assignment_count: i64 = transaction.query_row(
         "SELECT COUNT(*) FROM agent_assignments WHERE workspace_id=?1 AND activity_id=?2",
         params![workspace.as_slice(), activity.as_slice()],
         |row| row.get(0),
     )?;
-    let invalid_assignments: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM agent_assignments WHERE workspace_id=?1 AND activity_id=?2 AND (state != 0 OR cancellation_requested != 0 OR report IS NOT NULL OR worktree_root_fingerprint IS NOT NULL OR worktree_repository_fingerprint IS NOT NULL OR worktree_baseline IS NOT NULL OR reviewed_agent_id IS NOT NULL OR reviewed_session_id IS NOT NULL OR reviewed_principal_kind IS NOT NULL OR reviewed_principal_id IS NOT NULL OR reviewed_revision IS NOT NULL))", params![workspace.as_slice(), activity.as_slice()], |row| row.get(0))?;
+    let invalid_assignments: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM agent_assignments WHERE workspace_id=?1 AND activity_id=?2 AND (state != 0 OR cancellation_requested != 0 OR report IS NOT NULL OR worktree_root_fingerprint IS NOT NULL OR worktree_repository_fingerprint IS NOT NULL OR worktree_baseline IS NOT NULL OR reviewed_agent_id IS NOT NULL OR reviewed_session_id IS NOT NULL OR reviewed_principal_kind IS NOT NULL OR reviewed_principal_id IS NOT NULL OR reviewed_revision IS NOT NULL))", params![workspace.as_slice(), activity.as_slice()], |row| row.get(0))?;
     if assignment_count == 0 || invalid_assignments {
         return Ok((
             [4; 32],
             Some(UnstartedActivityContinuationBlocker::AssignmentNotOffered),
         ));
     }
-    let assignment_sources: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM agent_assignment_sources r JOIN agent_assignments a ON a.assignment_id=r.assignment_id WHERE a.workspace_id=?1 AND a.activity_id=?2)", params![workspace.as_slice(), activity.as_slice()], |row| row.get(0))?;
+    let assignment_sources: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM agent_assignment_sources r JOIN agent_assignments a ON a.assignment_id=r.assignment_id WHERE a.workspace_id=?1 AND a.activity_id=?2)", params![workspace.as_slice(), activity.as_slice()], |row| row.get(0))?;
     if assignment_sources {
         return Ok((
             [5; 32],
             Some(UnstartedActivityContinuationBlocker::AssignmentEvidencePresent),
         ));
     }
-    let invalid_creation_history: bool = connection.query_row(
+    let invalid_creation_history: bool = transaction.query_row(
         "SELECT EXISTS(SELECT 1 FROM goal_mutation_receipts WHERE workspace_id=?1 AND activity_id=?2 AND (mutation_kind != 0 OR expected_goal_revision IS NOT NULL OR result_goal_revision != 1 OR result_status != 0 OR review_id IS NOT NULL)) OR EXISTS(SELECT 1 FROM semantic_events e JOIN goals g ON g.goal_id=e.subject_goal_id WHERE e.workspace_id=?1 AND g.activity_id=?2 AND e.event_kind NOT IN ('goal_created','dag_committed','plan_published')) OR EXISTS(SELECT 1 FROM goals g WHERE g.workspace_id=?1 AND g.activity_id=?2 AND (SELECT COUNT(*) FROM goal_mutation_receipts r WHERE r.workspace_id=g.workspace_id AND r.activity_id=g.activity_id AND r.goal_id=g.goal_id AND r.mutation_kind=0 AND r.result_goal_revision=g.revision AND r.result_status=g.state AND r.observed_at_ms=g.created_at_ms) != 1) OR EXISTS(SELECT 1 FROM goal_mutation_receipts r LEFT JOIN goals g ON g.goal_id=r.goal_id AND g.workspace_id=r.workspace_id AND g.activity_id=r.activity_id WHERE r.workspace_id=?1 AND r.activity_id=?2 AND g.goal_id IS NULL)",
         params![workspace.as_slice(), activity.as_slice()], |row| row.get(0),
     )?;
@@ -852,7 +875,7 @@ fn plan_census(
             Some(UnstartedActivityContinuationBlocker::PhysicalEffectPresent),
         ));
     }
-    let invalid_offered_fact: bool = connection.query_row(
+    let invalid_offered_fact: bool = transaction.query_row(
         "SELECT EXISTS(
              SELECT 1 FROM effect_fact_outbox_assignment_offered f
              LEFT JOIN agent_assignments a ON a.assignment_id=f.assignment_id
@@ -868,7 +891,7 @@ fn plan_census(
             Some(UnstartedActivityContinuationBlocker::AssignmentEvidencePresent),
         ));
     }
-    let invalid_semantic_counterpart: bool = connection.query_row(
+    let invalid_semantic_counterpart: bool = transaction.query_row(
         "SELECT EXISTS(SELECT 1 FROM goals g WHERE g.workspace_id=?1 AND g.activity_id=?2 AND (SELECT COUNT(*) FROM semantic_events e WHERE e.workspace_id=g.workspace_id AND e.event_kind='goal_created' AND e.subject_goal_id=g.goal_id AND e.revision=1 AND e.observed_at_ms=g.created_at_ms)!=1) OR EXISTS(SELECT 1 FROM agent_dag_plan_ledger p WHERE p.workspace_id=?1 AND p.activity_id=?2 AND ((SELECT COUNT(*) FROM semantic_events e WHERE e.workspace_id=p.workspace_id AND e.event_kind='plan_published' AND e.subject_goal_id=p.goal_id AND e.subject_dag_revision=p.committed_dag_revision AND e.observed_at_ms=p.committed_at_ms)!=1 OR (SELECT COUNT(*) FROM semantic_events e WHERE e.workspace_id=p.workspace_id AND e.event_kind='dag_committed' AND e.subject_goal_id=p.goal_id AND e.subject_dag_revision=p.committed_dag_revision AND e.observed_at_ms=p.committed_at_ms)!=1)) OR EXISTS(SELECT 1 FROM semantic_events e LEFT JOIN goals g ON g.goal_id=e.subject_goal_id AND g.workspace_id=e.workspace_id WHERE e.workspace_id=?1 AND e.event_kind IN ('goal_created','dag_committed','plan_published') AND g.goal_id IS NULL)",
         params![workspace.as_slice(), activity.as_slice()], |row| row.get(0),
     )?;
@@ -878,7 +901,7 @@ fn plan_census(
             Some(UnstartedActivityContinuationBlocker::PhysicalEffectPresent),
         ));
     }
-    let prior_continuation: bool = connection.query_row(
+    let prior_continuation: bool = transaction.query_row(
         "SELECT EXISTS(SELECT 1 FROM unstarted_activity_continuation_receipts WHERE workspace_id=?1 AND activity_id=?2)",
         params![workspace.as_slice(), activity.as_slice()], |row| row.get(0),
     )?;
@@ -888,20 +911,20 @@ fn plan_census(
             Some(UnstartedActivityContinuationBlocker::PhysicalEffectPresent),
         ));
     }
-    if started_activity_lease_resume_receipt_present(connection, activity.as_slice())? {
+    if started_activity_lease_resume_receipt_present(transaction, activity.as_slice())? {
         return Ok((
             [5; 32],
             Some(UnstartedActivityContinuationBlocker::PhysicalEffectPresent),
         ));
     }
-    let arbitrary_work: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM agent_work_updates u WHERE u.workspace_id=?1 AND u.activity_id=?2 AND (u.phase != 0 OR u.evidence_count != 0 OR NOT EXISTS(SELECT 1 FROM agent_dag_plan_ledger p WHERE p.workspace_id=u.workspace_id AND p.activity_id=u.activity_id AND p.agent_id=u.agent_id AND p.history_update_id=u.update_id))) OR EXISTS(SELECT 1 FROM agent_work_update_evidence_refs r JOIN agent_work_updates u ON u.update_id=r.update_id WHERE u.workspace_id=?1 AND u.activity_id=?2)", params![workspace.as_slice(), activity.as_slice()], |row| row.get(0))?;
+    let arbitrary_work: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM agent_work_updates u WHERE u.workspace_id=?1 AND u.activity_id=?2 AND (u.phase != 0 OR u.evidence_count != 0 OR NOT EXISTS(SELECT 1 FROM agent_dag_plan_ledger p WHERE p.workspace_id=u.workspace_id AND p.activity_id=u.activity_id AND p.agent_id=u.agent_id AND p.history_update_id=u.update_id))) OR EXISTS(SELECT 1 FROM agent_work_update_evidence_refs r JOIN agent_work_updates u ON u.update_id=r.update_id WHERE u.workspace_id=?1 AND u.activity_id=?2)", params![workspace.as_slice(), activity.as_slice()], |row| row.get(0))?;
     if arbitrary_work {
         return Ok((
             [6; 32],
             Some(UnstartedActivityContinuationBlocker::ArbitraryWorkHistory),
         ));
     }
-    let invalid_plan_counterpart: bool = connection.query_row(
+    let invalid_plan_counterpart: bool = transaction.query_row(
         "SELECT EXISTS(SELECT 1 FROM agent_dag_plan_ledger p LEFT JOIN agent_work_updates u ON u.update_id=p.history_update_id AND u.workspace_id=p.workspace_id AND u.activity_id=p.activity_id AND u.agent_id=p.agent_id LEFT JOIN goals g ON g.goal_id=p.goal_id AND g.workspace_id=p.workspace_id AND g.activity_id=p.activity_id LEFT JOIN goal_dag_revisions d ON d.goal_id=p.goal_id AND d.dag_revision=p.committed_dag_revision LEFT JOIN goal_dag_heads h ON h.goal_id=p.goal_id LEFT JOIN activity_coordinators c ON c.workspace_id=p.workspace_id AND c.activity_id=p.activity_id AND c.agent_id=p.agent_id WHERE p.workspace_id=?1 AND p.activity_id=?2 AND (u.update_id IS NULL OR u.update_sequence!=p.history_update_sequence OR u.phase!=0 OR u.evidence_count!=0 OR g.goal_id IS NULL OR p.goal_revision!=g.revision OR d.revision_id!=p.committed_dag_revision_id OR d.base_goal_revision!=p.goal_revision OR h.dag_revision!=p.committed_dag_revision OR h.head_revision!=1 OR c.agent_id IS NULL OR c.revision!=p.coordinator_revision)) OR EXISTS(SELECT 1 FROM agent_dag_plan_sessions s JOIN agent_dag_plan_ledger p ON p.request_id=s.request_id LEFT JOIN agent_instances a ON a.agent_id=p.agent_id AND a.workspace_id=p.workspace_id AND a.activity_id=p.activity_id WHERE p.workspace_id=?1 AND p.activity_id=?2 AND (a.agent_id IS NULL OR s.session_id!=a.session_id))",
         params![workspace.as_slice(), activity.as_slice()], |row| row.get(0),
     )?;
@@ -911,7 +934,7 @@ fn plan_census(
             Some(UnstartedActivityContinuationBlocker::ArbitraryWorkHistory),
         ));
     }
-    let invalid_binding: bool = connection.query_row(
+    let invalid_binding: bool = transaction.query_row(
         "SELECT EXISTS(SELECT 1 FROM agent_instances a WHERE a.workspace_id=?1 AND a.activity_id=?2 AND NOT EXISTS(SELECT 1 FROM agent_binding_reservations r JOIN agent_binding_activations x ON x.request_id=r.request_id JOIN agent_operations_delegations d ON d.migration_id=r.migration_id AND d.workspace_id=r.workspace_id WHERE r.workspace_id=a.workspace_id AND r.activity_id=a.activity_id AND r.agent_id=a.agent_id AND r.session_id=a.session_id AND r.destination_id=d.destination_id AND r.freeze_revision=d.freeze_revision AND r.principal_kind=a.principal_kind AND ((r.principal_kind=0 AND r.principal_id=zeroblob(16) AND a.principal_id IS NULL) OR r.principal_id=a.principal_id) AND x.display_name=a.display_name AND x.declared_role=a.declared_role AND x.transport_kind=a.transport_kind AND x.activated_at_ms=a.created_at_ms)) OR EXISTS(SELECT 1 FROM agent_binding_rejections j JOIN agent_instances a ON a.agent_id=j.agent_id AND a.workspace_id=j.workspace_id AND a.activity_id=j.activity_id WHERE j.workspace_id=?1 AND j.activity_id=?2)",
         params![workspace.as_slice(), activity.as_slice()], |row| row.get(0),
     )?;
@@ -921,7 +944,7 @@ fn plan_census(
             Some(UnstartedActivityContinuationBlocker::PendingActivation),
         ));
     }
-    let workspace_effect: bool = connection.query_row(
+    let workspace_effect: bool = transaction.query_row(
         "SELECT EXISTS(SELECT 1 FROM workspace_execution_stops WHERE workspace_id=?1) OR EXISTS(SELECT 1 FROM authority_stop_batches WHERE workspace_id=?1) OR EXISTS(SELECT 1 FROM leadership_work_cuts WHERE workspace_id=?1) OR EXISTS(SELECT 1 FROM recovery_runs WHERE workspace_id=?1 AND (activity_count!=0 OR execution_count!=0)) OR EXISTS(SELECT 1 FROM workspace_root_recovery_receipts WHERE workspace_id=?1) OR EXISTS(SELECT 1 FROM root_recovery_delegation_receipts WHERE workspace_id=?1) OR EXISTS(SELECT 1 FROM semantic_events_meta m WHERE m.workspace_id=?1 AND (m.high_water_seq!=(SELECT COALESCE(MAX(sequence),0) FROM semantic_events e WHERE e.workspace_id=m.workspace_id) OR m.retained_low!=0)) OR NOT EXISTS(SELECT 1 FROM semantic_events_meta m WHERE m.workspace_id=?1)",
         params![workspace.as_slice()], |row| row.get(0),
     )?;
@@ -938,15 +961,337 @@ fn plan_census(
     for (table, sql) in ALLOWED_DIGEST_QUERIES {
         hash_query_rows(
             &mut hasher,
-            connection,
+            transaction,
             table,
             sql,
             workspace.as_slice(),
             activity.as_slice(),
         )?;
     }
+    hasher.update(evaluation_digest);
     Ok((hasher.finalize().into(), None))
 }
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "The closed evaluation census keeps each scope and provenance guard explicit."
+)]
+fn evaluation_planning_census(
+    transaction: &Transaction<'_>,
+    workspace_id: forge_domain::WorkspaceId,
+    activity_id: forge_domain::ActivityId,
+) -> Result<
+    ([u8; 32], Option<UnstartedActivityContinuationBlocker>),
+    UnstartedActivityContinuationStoreError,
+> {
+    let workspace = workspace_id.into_uuid().into_bytes();
+    let activity = activity_id.into_uuid().into_bytes();
+    let unresolved_workspace_evidence: bool = transaction.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM workspace_evaluation_submission_receipts r
+             LEFT JOIN agent_assignments a
+               ON a.workspace_id=r.workspace_id AND a.assignment_id=r.assignment_id
+             LEFT JOIN workspace_evaluation_original_bindings b
+               ON b.workspace_id=r.workspace_id AND b.assignment_id=r.assignment_id
+             WHERE r.workspace_id=?1 AND a.assignment_id IS NULL AND b.assignment_id IS NULL
+         ) OR EXISTS(
+             SELECT 1 FROM workspace_evaluation_review_receipts r
+             LEFT JOIN agent_assignments a
+               ON a.workspace_id=r.workspace_id AND a.assignment_id=r.assignment_id
+             LEFT JOIN workspace_evaluation_original_bindings b
+               ON b.workspace_id=r.workspace_id AND b.assignment_id=r.assignment_id
+             WHERE r.workspace_id=?1 AND a.assignment_id IS NULL AND b.assignment_id IS NULL
+         ) OR EXISTS(
+             SELECT 1 FROM workspace_evaluation_manifest_members mm
+             LEFT JOIN workspace_evaluation_manifests m
+               ON m.workspace_id=mm.workspace_id AND m.manifest_id=mm.manifest_id
+              AND m.manifest_revision=mm.manifest_revision
+             WHERE mm.workspace_id=?1 AND m.manifest_id IS NULL
+         ) OR EXISTS(
+             SELECT 1 FROM workspace_evaluation_t1_cuts c
+             LEFT JOIN workspace_evaluation_manifests m
+               ON m.workspace_id=c.workspace_id AND m.manifest_id=c.manifest_id
+              AND m.manifest_revision=c.manifest_revision
+             WHERE c.workspace_id=?1 AND m.manifest_id IS NULL
+         ) OR EXISTS(
+             SELECT 1 FROM workspace_evaluation_review_cuts r
+             LEFT JOIN workspace_evaluation_t1_cuts c
+               ON c.workspace_id=r.workspace_id AND c.cut_id=r.t1_cut_id
+             WHERE r.workspace_id=?1 AND c.cut_id IS NULL
+         ) OR EXISTS(
+             SELECT 1 FROM workspace_evaluation_t1_cut_members cm
+             LEFT JOIN workspace_evaluation_t1_cuts c
+               ON c.workspace_id=cm.workspace_id AND c.cut_id=cm.cut_id
+             WHERE cm.workspace_id=?1 AND c.cut_id IS NULL
+         ) OR EXISTS(
+             SELECT 1 FROM workspace_evaluation_review_cut_members cm
+             LEFT JOIN workspace_evaluation_review_cuts c
+               ON c.workspace_id=cm.workspace_id AND c.review_cut_id=cm.review_cut_id
+             WHERE cm.workspace_id=?1 AND c.review_cut_id IS NULL
+         )",
+        params![workspace.as_slice()],
+        |row| row.get(0),
+    )?;
+    if unresolved_workspace_evidence {
+        return Ok((
+            [0xF0; 32],
+            Some(UnstartedActivityContinuationBlocker::EvaluationProvenanceUnknown),
+        ));
+    }
+
+    let evaluation_evidence_present: bool = transaction.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM workspace_evaluation_submission_receipts r
+             JOIN agent_assignments a
+               ON a.workspace_id=r.workspace_id AND a.assignment_id=r.assignment_id
+             WHERE r.workspace_id=?1 AND a.activity_id=?2
+         ) OR EXISTS(
+             SELECT 1 FROM workspace_evaluation_review_receipts r
+             JOIN agent_assignments a
+               ON a.workspace_id=r.workspace_id AND a.assignment_id=r.assignment_id
+             WHERE r.workspace_id=?1 AND a.activity_id=?2
+         ) OR EXISTS(
+             SELECT 1 FROM workspace_evaluation_submission_receipts r
+             JOIN workspace_evaluation_original_bindings b
+               ON b.workspace_id=r.workspace_id AND b.assignment_id=r.assignment_id
+             WHERE r.workspace_id=?1 AND b.activity_id=?2
+         ) OR EXISTS(
+             SELECT 1 FROM workspace_evaluation_review_receipts r
+             JOIN workspace_evaluation_original_bindings b
+               ON b.workspace_id=r.workspace_id AND b.assignment_id=r.assignment_id
+             WHERE r.workspace_id=?1 AND b.activity_id=?2
+         ) OR EXISTS(
+             SELECT 1 FROM workspace_evaluation_t1_cuts c
+             JOIN workspace_evaluation_manifests m
+               ON m.workspace_id=c.workspace_id AND m.manifest_id=c.manifest_id
+              AND m.manifest_revision=c.manifest_revision
+             WHERE c.workspace_id=?1 AND m.activity_id=?2
+         ) OR EXISTS(
+             SELECT 1 FROM workspace_evaluation_review_cuts r
+             JOIN workspace_evaluation_t1_cuts c
+               ON c.workspace_id=r.workspace_id AND c.cut_id=r.t1_cut_id
+             JOIN workspace_evaluation_manifests m
+               ON m.workspace_id=c.workspace_id AND m.manifest_id=c.manifest_id
+              AND m.manifest_revision=c.manifest_revision
+             WHERE r.workspace_id=?1 AND m.activity_id=?2
+         )",
+        params![workspace.as_slice(), activity.as_slice()],
+        |row| row.get(0),
+    )?;
+    if evaluation_evidence_present {
+        return Ok((
+            [0xF1; 32],
+            Some(UnstartedActivityContinuationBlocker::EvaluationEvidencePresent),
+        ));
+    }
+
+    let has_planning: bool = transaction.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM workspace_evaluation_original_bindings
+             WHERE workspace_id=?1 AND activity_id=?2
+         ) OR EXISTS(
+             SELECT 1 FROM workspace_evaluation_manifests
+             WHERE workspace_id=?1 AND activity_id=?2
+         )",
+        params![workspace.as_slice(), activity.as_slice()],
+        |row| row.get(0),
+    )?;
+    let mut hasher = Sha256::new();
+    hasher.update(DOMAIN_EVALUATION_PLAN);
+    hash_bytes(&mut hasher, workspace.as_slice());
+    hash_bytes(&mut hasher, activity.as_slice());
+    hasher.update([u8::from(has_planning)]);
+    if !has_planning {
+        return Ok((hasher.finalize().into(), None));
+    }
+
+    let unresolved_original: bool = transaction.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM workspace_evaluation_manifest_members mm
+             JOIN workspace_evaluation_manifests m
+               ON m.workspace_id=mm.workspace_id AND m.manifest_id=mm.manifest_id
+              AND m.manifest_revision=mm.manifest_revision
+             LEFT JOIN workspace_evaluation_original_bindings b
+               ON b.workspace_id=mm.workspace_id
+              AND b.assignment_id=mm.binding_assignment_id
+             LEFT JOIN agent_assignments a
+               ON a.workspace_id=mm.workspace_id AND a.assignment_id=mm.assignment_id
+             WHERE m.workspace_id=?1 AND m.activity_id=?2 AND (
+                 mm.binding_status != 0 OR mm.binding_assignment_id IS NULL
+                 OR mm.binding_assignment_id != mm.assignment_id
+                 OR b.assignment_id IS NULL OR b.activity_id != m.activity_id
+                 OR b.backend_id != m.backend_id
+                 OR b.delegation_migration_id != m.delegation_migration_id
+                 OR b.delegation_destination_id != m.delegation_destination_id
+                 OR b.delegation_freeze_revision != m.delegation_freeze_revision
+                 OR b.delegation_manifest_digest != m.delegation_manifest_digest
+                 OR b.assignment_revision != mm.assignment_revision
+                 OR b.target_agent_id != mm.target_agent_id
+                 OR b.target_session_id != mm.target_session_id
+                 OR b.work_unit_id != mm.work_unit_id
+                 OR b.obligation_id != mm.obligation_id
+                 OR b.criteria_digest != mm.criteria_digest
+                 OR b.binding_digest IS NOT mm.binding_digest
+                 OR b.binding_sequence IS NOT mm.binding_sequence
+                 OR a.assignment_id IS NULL OR a.activity_id != m.activity_id
+                 OR a.revision != mm.assignment_revision
+                 OR a.target_agent_id != mm.target_agent_id
+                 OR a.target_session_id != mm.target_session_id
+                 OR a.goal_id != b.goal_id OR a.dag_revision != b.dag_revision
+                 OR a.node_id != b.node_id OR a.node_revision != b.node_revision
+             )
+         ) OR EXISTS(
+             SELECT 1 FROM workspace_evaluation_manifests m
+             WHERE m.workspace_id=?1 AND m.activity_id=?2
+               AND NOT EXISTS(
+                   SELECT 1 FROM workspace_evaluation_manifest_members mm
+                   WHERE mm.workspace_id=m.workspace_id AND mm.manifest_id=m.manifest_id
+                     AND mm.manifest_revision=m.manifest_revision
+               )
+         ) OR EXISTS(
+             SELECT 1 FROM workspace_evaluation_original_bindings b
+             WHERE b.workspace_id=?1 AND b.activity_id=?2
+               AND NOT EXISTS(
+                   SELECT 1 FROM workspace_evaluation_manifest_members mm
+                   JOIN workspace_evaluation_manifests m
+                     ON m.workspace_id=mm.workspace_id AND m.manifest_id=mm.manifest_id
+                    AND m.manifest_revision=mm.manifest_revision
+                   WHERE m.workspace_id=b.workspace_id AND m.activity_id=b.activity_id
+                     AND mm.assignment_id=b.assignment_id AND mm.binding_status=0
+                     AND mm.obligation_id=b.obligation_id
+                     AND mm.binding_digest=b.binding_digest
+                     AND mm.binding_sequence=b.binding_sequence
+               )
+         ) OR NOT EXISTS(
+             SELECT 1 FROM workspace_evaluation_source_state s
+             WHERE s.workspace_id=?1 AND s.source_sequence >= MAX(
+                 COALESCE((SELECT MAX(m.sealed_sequence)
+                           FROM workspace_evaluation_manifests m
+                           WHERE m.workspace_id=?1 AND m.activity_id=?2), 0),
+                 COALESCE((SELECT MAX(b.binding_sequence)
+                           FROM workspace_evaluation_original_bindings b
+                           WHERE b.workspace_id=?1 AND b.activity_id=?2), 0)
+             )
+         )",
+        params![workspace.as_slice(), activity.as_slice()],
+        |row| row.get(0),
+    )?;
+    if unresolved_original {
+        return Ok((
+            [0xF2; 32],
+            Some(UnstartedActivityContinuationBlocker::EvaluationProvenanceUnknown),
+        ));
+    }
+
+    if evaluation_manifest_readback_unresolved(transaction, workspace_id, activity_id)? {
+        return Ok((
+            [0xF3; 32],
+            Some(UnstartedActivityContinuationBlocker::EvaluationProvenanceUnknown),
+        ));
+    }
+
+    for (table, sql) in EVALUATION_PLANNING_DIGEST_QUERIES {
+        hash_query_rows(
+            &mut hasher,
+            transaction,
+            table,
+            sql,
+            workspace.as_slice(),
+            activity.as_slice(),
+        )?;
+    }
+    hash_query_rows(
+        &mut hasher,
+        transaction,
+        "workspace_evaluation_source_state",
+        "SELECT * FROM workspace_evaluation_source_state WHERE workspace_id=?1 ORDER BY workspace_id",
+        workspace.as_slice(),
+        activity.as_slice(),
+    )?;
+    Ok((hasher.finalize().into(), None))
+}
+
+fn evaluation_manifest_readback_unresolved(
+    transaction: &Transaction<'_>,
+    workspace_id: forge_domain::WorkspaceId,
+    activity_id: forge_domain::ActivityId,
+) -> Result<bool, UnstartedActivityContinuationStoreError> {
+    let mut statement = transaction.prepare(
+        "SELECT manifest_id,manifest_revision,backend_id
+         FROM workspace_evaluation_manifests
+         WHERE workspace_id=?1 AND activity_id=?2
+         ORDER BY manifest_id,manifest_revision",
+    )?;
+    let mut rows = statement.query(params![
+        workspace_id.into_uuid().as_bytes(),
+        activity_id.into_uuid().as_bytes(),
+    ])?;
+    while let Some(row) = rows.next()? {
+        let manifest_id_bytes: Vec<u8> = row.get(0)?;
+        let manifest_revision: i64 = row.get(1)?;
+        let backend_id_bytes: Vec<u8> = row.get(2)?;
+        let manifest_id = Uuid::from_slice(&manifest_id_bytes).map_err(|_| {
+            UnstartedActivityContinuationStoreError::Corrupt("evaluation manifest identity")
+        })?;
+        let backend_id = Uuid::from_slice(&backend_id_bytes).map_err(|_| {
+            UnstartedActivityContinuationStoreError::Corrupt("evaluation manifest backend")
+        })?;
+        let manifest_id = forge_domain::EvaluationManifestId::new(manifest_id).map_err(|_| {
+            UnstartedActivityContinuationStoreError::Corrupt("evaluation manifest identity")
+        })?;
+        let manifest_revision =
+            forge_domain::EvaluationRevision::new(manifest_revision).map_err(|_| {
+                UnstartedActivityContinuationStoreError::Corrupt("evaluation manifest revision")
+            })?;
+        // Use the persisted backend selector only to ask the source owner to
+        // decode and validate its immutable record; this grants no authority.
+        let Some(manifest) =
+            crate::workspace_evaluation_evidence::get_registered_manifest_in_transaction(
+                transaction,
+                ForgeBackendId::from_uuid(backend_id),
+                manifest_id,
+                manifest_revision,
+            )
+            .map_err(|_| {
+                UnstartedActivityContinuationStoreError::Corrupt("evaluation manifest record")
+            })?
+        else {
+            return Ok(true);
+        };
+        if manifest.proposal().source().workspace_id() != workspace_id
+            || manifest.proposal().source().activity_id() != activity_id
+            || manifest.members().iter().any(|member| {
+                matches!(
+                    member.binding(),
+                    forge_domain::EvaluationOriginalBindingStatus::UnknownHistorical
+                )
+            })
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+const EVALUATION_PLANNING_DIGEST_QUERIES: &[(&str, &str)] = &[
+    (
+        "workspace_evaluation_original_bindings",
+        "SELECT * FROM workspace_evaluation_original_bindings WHERE workspace_id=?1 AND activity_id=?2 ORDER BY assignment_id",
+    ),
+    (
+        "workspace_evaluation_manifests",
+        "SELECT * FROM workspace_evaluation_manifests WHERE workspace_id=?1 AND activity_id=?2 ORDER BY manifest_id,manifest_revision",
+    ),
+    (
+        "workspace_evaluation_manifest_members",
+        "SELECT mm.* FROM workspace_evaluation_manifest_members mm
+         JOIN workspace_evaluation_manifests m
+           ON m.workspace_id=mm.workspace_id AND m.manifest_id=mm.manifest_id
+          AND m.manifest_revision=mm.manifest_revision
+         WHERE m.workspace_id=?1 AND m.activity_id=?2
+         ORDER BY mm.manifest_id,mm.manifest_revision,mm.assignment_id",
+    ),
+];
 
 fn started_activity_lease_resume_receipt_present(
     connection: &Connection,
@@ -985,7 +1330,7 @@ fn started_activity_lease_resume_receipt_present(
     Ok(false)
 }
 
-const CENSUS_SCHEMA_VERSION: u16 = 67;
+const CENSUS_SCHEMA_VERSION: u16 = 74;
 const CENSUS_TABLES: &[&str] = &[
     "activities",
     "activity_coordinator_recoveries",
@@ -1014,6 +1359,7 @@ const CENSUS_TABLES: &[&str] = &[
     "agent_session_reconciliations",
     "agent_work_update_evidence_refs",
     "agent_work_updates",
+    "approval_agent_provenance",
     "approval_requests",
     "assignment_continuation_acknowledgments",
     "assignment_continuation_batches",
@@ -1059,6 +1405,18 @@ const CENSUS_TABLES: &[&str] = &[
     "goal_statements",
     "goal_verification_requirements",
     "goals",
+    "home_handoff_acceptance_outcomes",
+    "home_handoff_cases",
+    "home_handoff_proposal_heads",
+    "home_handoff_proposals",
+    "home_transfer_artifact_seals",
+    "home_transfer_artifact_stages",
+    "home_transfer_reservation_retirements",
+    "home_transfer_source_activities",
+    "home_transfer_source_agents",
+    "home_transfer_source_operations",
+    "home_transfer_source_sessions",
+    "home_transfer_source_subjects",
     "leadership_work_cut_agents",
     "leadership_work_cut_effects",
     "leadership_work_cut_nodes",
@@ -1081,6 +1439,16 @@ const CENSUS_TABLES: &[&str] = &[
     "verification_requirement_links",
     "verification_runs",
     "workspace",
+    "workspace_evaluation_manifest_members",
+    "workspace_evaluation_manifests",
+    "workspace_evaluation_original_bindings",
+    "workspace_evaluation_review_cut_members",
+    "workspace_evaluation_review_cuts",
+    "workspace_evaluation_review_receipts",
+    "workspace_evaluation_source_state",
+    "workspace_evaluation_submission_receipts",
+    "workspace_evaluation_t1_cut_members",
+    "workspace_evaluation_t1_cuts",
     "workspace_execution_stop_fences",
     "workspace_execution_stop_settlement_targets",
     "workspace_execution_stop_settlements",
@@ -1129,6 +1497,12 @@ const CONDITIONAL_CENSUS_TABLES: &[&str] = &[
     "agent_binding_activations",
     "agent_binding_rejections",
     "agent_session_reconciliations",
+    "home_transfer_reservation_retirements",
+    "home_transfer_source_activities",
+    "home_transfer_source_agents",
+    "home_transfer_source_operations",
+    "home_transfer_source_sessions",
+    "home_transfer_source_subjects",
     "workspace_policy",
     "workspace_queue_settings",
     "recovery_maintenance",
@@ -1143,6 +1517,16 @@ const CONDITIONAL_CENSUS_TABLES: &[&str] = &[
     "activity_successors",
     "semantic_events_meta",
     "recovery_runs",
+    "workspace_evaluation_source_state",
+    "workspace_evaluation_original_bindings",
+    "workspace_evaluation_manifests",
+    "workspace_evaluation_manifest_members",
+    "workspace_evaluation_submission_receipts",
+    "workspace_evaluation_review_receipts",
+    "workspace_evaluation_t1_cuts",
+    "workspace_evaluation_t1_cut_members",
+    "workspace_evaluation_review_cuts",
+    "workspace_evaluation_review_cut_members",
 ];
 
 fn validate_census_manifest(
@@ -1156,12 +1540,12 @@ fn validate_census_manifest(
         .iter()
         .copied()
         .collect::<std::collections::BTreeSet<_>>();
-    if CENSUS_SCHEMA_VERSION != 67
-        || CENSUS_TABLES.len() != 104
+    if CENSUS_SCHEMA_VERSION != 74
+        || CENSUS_TABLES.len() != 127
         || unique_tables.len() != CENSUS_TABLES.len()
-        || CONDITIONAL_CENSUS_TABLES.len() != 49
+        || CONDITIONAL_CENSUS_TABLES.len() != 65
         || unique_conditional.len() != CONDITIONAL_CENSUS_TABLES.len()
-        || CENSUS_TABLES.len() - CONDITIONAL_CENSUS_TABLES.len() != 55
+        || CENSUS_TABLES.len() - CONDITIONAL_CENSUS_TABLES.len() != 62
         || CONDITIONAL_CENSUS_TABLES
             .iter()
             .any(|table| !CENSUS_TABLES.contains(table))
@@ -1171,7 +1555,7 @@ fn validate_census_manifest(
         })
     {
         return Err(UnstartedActivityContinuationStoreError::Corrupt(
-            "schema-v67 census manifest size",
+            "schema-v74 census manifest size",
         ));
     }
     let mut statement = connection.prepare(
@@ -1186,7 +1570,7 @@ fn validate_census_manifest(
             .any(|name| !CENSUS_TABLES.contains(&name.as_str()))
     {
         return Err(UnstartedActivityContinuationStoreError::Conflict(
-            "unclassified schema-v67 table",
+            "unclassified schema-v74 table",
         ));
     }
     Ok(())
@@ -1436,12 +1820,22 @@ const ALLOWED_ACTIVITY_TABLES: &[&str] = &[
     "expired_activity_recovery_agents",
     "goal_mutation_receipts",
     "goals",
+    // A retired reservation is not evidence of started work. The Home owner
+    // still checks its Prepared Activity fence separately.
+    "home_transfer_reservation_retirements",
+    "home_transfer_source_activities",
     "quiescent_activity_lease_resume_receipts",
     "started_activity_lease_resume_receipts",
     "unstarted_activity_continuation_receipts",
+    "workspace_evaluation_manifests",
+    "workspace_evaluation_original_bindings",
 ];
 
 const FORBIDDEN_ACTIVITY_TABLES: &[(&str, UnstartedActivityContinuationBlocker)] = &[
+    (
+        "home_transfer_artifact_stages",
+        UnstartedActivityContinuationBlocker::PhysicalEffectPresent,
+    ),
     (
         "activity_coordinator_recoveries",
         UnstartedActivityContinuationBlocker::PhysicalEffectPresent,

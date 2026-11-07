@@ -510,6 +510,9 @@ impl ForgeControl {
 
 fn map_verification_input_error(error: VerificationInputError) -> ControlError {
     let code = match error {
+        publication @ VerificationInputError::PublicationUnconfirmed { .. } => {
+            return ControlError::committed_with_source(publication);
+        }
         VerificationInputError::Cancelled => ControlErrorCode::RequestCancelled,
         VerificationInputError::Manifest(
             forge_domain::VerificationInputManifestError::EntryCapacity
@@ -830,6 +833,38 @@ mod tests {
             let error = map_verification_input_error(VerificationInputError::StateGate(source));
             assert_eq!(error.code(), expected);
         }
+    }
+
+    #[test]
+    fn verification_publication_uncertainty_preserves_commit_and_readback_identity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let input_id = forge_domain::VerificationInputId::from_uuid(id(0xAC01));
+        let fingerprint = forge_domain::VerificationInputFingerprint::from_bytes([7; 32]);
+        let error = map_verification_input_error(VerificationInputError::PublicationUnconfirmed {
+            id: input_id,
+            fingerprint,
+            source: Box::new(VerificationInputError::SnapshotInvalid),
+        });
+        assert!(error.is_committed());
+        assert_eq!(error.code(), ControlErrorCode::CommittedButUnconfirmed);
+        let source = std::error::Error::source(&error)
+            .and_then(|source| source.downcast_ref::<VerificationInputError>())
+            .ok_or("publication uncertainty source was lost")?;
+        let VerificationInputError::PublicationUnconfirmed {
+            id,
+            fingerprint: observed,
+            source,
+        } = source
+        else {
+            return Err("publication uncertainty source changed category".into());
+        };
+        assert_eq!(*id, input_id);
+        assert_eq!(*observed, fingerprint);
+        assert!(matches!(
+            source.as_ref(),
+            VerificationInputError::SnapshotInvalid
+        ));
+        Ok(())
     }
 
     #[test]

@@ -47,12 +47,44 @@ fn map_file_mutation_store_error(error: WorkspaceStoreError) -> ControlError {
         map_writer_lease_store_error(error)
     } else if matches!(
         &error,
+        WorkspaceStoreError::WorkCut(source)
+            if crate::error::is_home_transfer_cut_fence(source)
+    ) {
+        ControlError::with_source(ControlErrorCode::HomeTransferFenced, error)
+    } else if matches!(
+        &error,
         WorkspaceStoreError::ChangeSet(forge_persistence::ChangeSetStoreError::IdentityConflict)
             | WorkspaceStoreError::WorkCut(forge_persistence::WorkCutError::Conflict(_))
     ) {
         ControlError::with_source(ControlErrorCode::FileConflict, error)
     } else {
         map_activity_store_error(error)
+    }
+}
+
+#[cfg(test)]
+mod home_transfer_error_tests {
+    use super::map_file_mutation_store_error;
+    use crate::error::ControlErrorCode;
+    use forge_persistence::{HomeTransferStoreError, WorkCutError, WorkspaceStoreError};
+
+    #[test]
+    fn home_source_fence_is_a_file_conflict_but_corruption_is_persistence() {
+        let preparation_id = uuid::Uuid::from_u128(0xA15);
+        let fenced = map_file_mutation_store_error(WorkspaceStoreError::WorkCut(
+            WorkCutError::HomeTransfer(Box::new(HomeTransferStoreError::Fenced { preparation_id })),
+        ));
+        assert_eq!(fenced.code(), ControlErrorCode::HomeTransferFenced);
+
+        let corrupt = map_file_mutation_store_error(WorkspaceStoreError::WorkCut(
+            WorkCutError::HomeTransfer(Box::new(HomeTransferStoreError::Corrupt("test"))),
+        ));
+        assert_eq!(corrupt.code(), ControlErrorCode::PersistenceFailure);
+
+        let election = map_file_mutation_store_error(WorkspaceStoreError::WorkCut(
+            WorkCutError::Conflict("node"),
+        ));
+        assert_eq!(election.code(), ControlErrorCode::FileConflict);
     }
 }
 

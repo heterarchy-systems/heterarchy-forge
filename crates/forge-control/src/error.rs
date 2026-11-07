@@ -5,6 +5,20 @@ use forge_domain::{ActivityId, ApprovalRequestId, ExecutionId, FileEntryKind, Wr
 
 const PROJECTION_RESYNC_REQUIRED_SUMMARY: &str = "the operational projection cannot continue from its durable source cursor and requires resynchronization";
 
+/// Recognize only a real Home fence carried through a `WorkCut` boundary.
+/// Other Home failures and ordinary election-cut conflicts keep their existing
+/// persistence/conflict classification.
+pub(crate) fn is_home_transfer_cut_fence(error: &forge_persistence::WorkCutError) -> bool {
+    matches!(
+        error,
+        forge_persistence::WorkCutError::HomeTransfer(source)
+            if matches!(
+                source.as_ref(),
+                forge_persistence::HomeTransferStoreError::Fenced { .. }
+            )
+    )
+}
+
 /// Stable machine-readable application-control error category.
 ///
 /// Detailed codes and their derived guidance are remote-safe. Underlying
@@ -87,6 +101,7 @@ pub enum ControlErrorCode {
     CoordinatorNotFound = 1896,
     CoordinatorConflict = 1897,
     WorkSelectionAmbiguous = 1898,
+    HomeTransferFenced = 1899,
     AgentSessionNotFound = 1910,
     AgentSessionClosed = 1911,
     AgentSessionConflict = 1912,
@@ -169,6 +184,7 @@ impl ControlErrorCode {
             Self::CoordinatorNotFound => "CONTROL_COORDINATOR_NOT_FOUND",
             Self::CoordinatorConflict => "CONTROL_COORDINATOR_CONFLICT",
             Self::WorkSelectionAmbiguous => "CONTROL_WORK_SELECTION_AMBIGUOUS",
+            Self::HomeTransferFenced => "CONTROL_HOME_TRANSFER_FENCED",
             Self::AgentSessionNotFound => "CONTROL_AGENT_SESSION_NOT_FOUND",
             Self::AgentSessionClosed => "CONTROL_AGENT_SESSION_CLOSED",
             Self::AgentSessionConflict => "CONTROL_AGENT_SESSION_CONFLICT",
@@ -280,6 +296,9 @@ impl ControlErrorCode {
             Self::CoordinatorConflict => "the Activity planning Coordinator fence conflicts",
             Self::WorkSelectionAmbiguous => {
                 "multiple active Goal or DAG candidates are eligible for work reuse"
+            }
+            Self::HomeTransferFenced => {
+                "new work is paused while a Home-transfer preparation holds this source"
             }
             Self::Internal => "the control service encountered an internal failure",
             Self::AgentSessionNotFound => "the issued Agent session was not found",
@@ -544,7 +563,8 @@ impl ControlErrorCode {
             | Self::AgentFocusConflict
             | Self::AgentDagPlanConflict
             | Self::AgentDagReplayConflict
-            | Self::CoordinatorConflict => ControlErrorCategory::RevisionConflict,
+            | Self::CoordinatorConflict
+            | Self::HomeTransferFenced => ControlErrorCategory::RevisionConflict,
             Self::ActivityLeaseConflict
             | Self::RecoveryLeaseConflict
             | Self::WriterLeaseNotFound
@@ -640,7 +660,8 @@ impl ControlErrorCode {
             | Self::AgentDagPlanConflict
             | Self::CoordinatorNotFound
             | Self::CoordinatorConflict
-            | Self::WorkSelectionAmbiguous => ControlRecoveryAction::RefreshWork,
+            | Self::WorkSelectionAmbiguous
+            | Self::HomeTransferFenced => ControlRecoveryAction::RefreshWork,
             Self::FileNotFound
             | Self::FileConflict
             | Self::FileWholeHashConflict
@@ -863,6 +884,16 @@ impl ControlError {
         }
     }
 
+    pub(crate) fn committed_with_source<E>(source: E) -> Self
+    where
+        E: Error + Send + Sync + 'static,
+    {
+        Self {
+            source: Some(Box::new(source)),
+            ..Self::committed()
+        }
+    }
+
     pub(crate) const fn with_details(mut self, details: ControlErrorDetails) -> Self {
         self.details = details;
         self
@@ -926,6 +957,37 @@ mod tests {
         assert_eq!(view.outcome(), ControlOperationOutcome::Unknown);
         assert!(!view.retryable());
         assert_eq!(view.recovery_action(), ControlRecoveryAction::ReadSource);
+    }
+
+    #[test]
+    fn home_cut_predicate_matches_only_a_nested_fence() {
+        let fenced = forge_persistence::WorkCutError::HomeTransfer(Box::new(
+            forge_persistence::HomeTransferStoreError::Fenced {
+                preparation_id: Uuid::from_u128(1),
+            },
+        ));
+        let corrupt = forge_persistence::WorkCutError::HomeTransfer(Box::new(
+            forge_persistence::HomeTransferStoreError::Corrupt("test"),
+        ));
+        let election_conflict = forge_persistence::WorkCutError::Conflict("node");
+
+        assert!(is_home_transfer_cut_fence(&fenced));
+        assert!(!is_home_transfer_cut_fence(&corrupt));
+        assert!(!is_home_transfer_cut_fence(&election_conflict));
+    }
+
+    #[test]
+    fn home_transfer_fenced_code_has_stable_revision_conflict_guidance() {
+        let view = ControlErrorView::from_service(ControlErrorCode::HomeTransferFenced, false);
+        assert_eq!(
+            ControlErrorCode::HomeTransferFenced.as_str(),
+            "CONTROL_HOME_TRANSFER_FENCED"
+        );
+        assert_eq!(view.category(), ControlErrorCategory::RevisionConflict);
+        assert_eq!(view.recovery_action(), ControlRecoveryAction::RefreshWork);
+        assert_eq!(view.outcome(), ControlOperationOutcome::Unknown);
+        assert!(!view.retryable());
+        assert!(view.summary().contains("new work is paused"));
     }
 
     #[test]

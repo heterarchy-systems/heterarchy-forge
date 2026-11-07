@@ -1542,8 +1542,26 @@ pub(crate) fn map_activity_store_error(error: WorkspaceStoreError) -> ControlErr
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one closed error-family mapping preserves conflict, expiry and unknown-outcome distinctions"
+)]
 fn map_activity_store_code(error: WorkspaceStoreError) -> ControlError {
     let code = match &error {
+        WorkspaceStoreError::Approval(forge_persistence::ApprovalStoreError::HomeTransfer(
+            source,
+        )) if matches!(
+            source.as_ref(),
+            forge_persistence::HomeTransferStoreError::Fenced { .. }
+        ) =>
+        {
+            ControlErrorCode::HomeTransferFenced
+        }
+        WorkspaceStoreError::Execution(forge_persistence::ExecutionStoreError::WorkCut(source))
+            if crate::error::is_home_transfer_cut_fence(source.as_ref()) =>
+        {
+            ControlErrorCode::HomeTransferFenced
+        }
         WorkspaceStoreError::UnstartedActivityContinuation(
             forge_persistence::UnstartedActivityContinuationStoreError::Conflict(_),
         ) => ControlErrorCode::ActivityLeaseConflict,
@@ -1718,6 +1736,60 @@ mod tests {
             assert_eq!(error.code(), expected);
             assert!(!error.is_committed());
         }
+    }
+
+    #[test]
+    fn home_fences_map_to_the_approval_or_execution_owner() {
+        use forge_persistence::{
+            ApprovalStoreError, ExecutionStoreError, HomeTransferStoreError, WorkCutError,
+        };
+
+        let preparation_id = uuid::Uuid::from_u128(0xA11);
+        let execution_fence = WorkspaceStoreError::Execution(ExecutionStoreError::WorkCut(
+            Box::new(WorkCutError::HomeTransfer(Box::new(
+                HomeTransferStoreError::Fenced { preparation_id },
+            ))),
+        ));
+        assert_eq!(
+            map_activity_store_error(execution_fence).code(),
+            ControlErrorCode::HomeTransferFenced
+        );
+
+        let approval_execution_fence =
+            WorkspaceStoreError::Approval(ApprovalStoreError::Execution(
+                ExecutionStoreError::WorkCut(Box::new(WorkCutError::HomeTransfer(Box::new(
+                    HomeTransferStoreError::Fenced { preparation_id },
+                )))),
+            ));
+        assert_eq!(
+            map_activity_store_error(approval_execution_fence).code(),
+            ControlErrorCode::HomeTransferFenced
+        );
+
+        let approval_fence = WorkspaceStoreError::Approval(ApprovalStoreError::HomeTransfer(
+            Box::new(HomeTransferStoreError::Fenced { preparation_id }),
+        ));
+        assert_eq!(
+            map_activity_store_error(approval_fence).code(),
+            ControlErrorCode::HomeTransferFenced
+        );
+
+        let corrupt_execution =
+            WorkspaceStoreError::Execution(ExecutionStoreError::WorkCut(Box::new(
+                WorkCutError::HomeTransfer(Box::new(HomeTransferStoreError::Corrupt("test"))),
+            )));
+        assert_eq!(
+            map_activity_store_error(corrupt_execution).code(),
+            ControlErrorCode::PersistenceFailure
+        );
+
+        let corrupt_approval = WorkspaceStoreError::Approval(ApprovalStoreError::HomeTransfer(
+            Box::new(HomeTransferStoreError::Corrupt("test")),
+        ));
+        assert_eq!(
+            map_activity_store_error(corrupt_approval).code(),
+            ControlErrorCode::PersistenceFailure
+        );
     }
 
     #[test]
@@ -4201,16 +4273,34 @@ mod integration_tests {
     }
 
     #[test]
-    #[allow(clippy::too_many_lines)]
     fn bounded_auto_approval_starts_discovered_and_analyzed_shell_and_leaves_audit()
     -> Result<(), Box<dyn std::error::Error>> {
         if nested_sandbox_execution_is_unavailable() {
             return Ok(());
         }
         let fixture = fixture("auto-approval", &[0], 1)?;
+        let cleanup_root = fixture.root.clone();
+        let result = exercise_auto_approval_audit(fixture);
+        let cleanup = cleanup_test_root(cleanup_root);
+        if let Err(error) = result {
+            let mut cause = error.source();
+            for depth in 0..8 {
+                let Some(current) = cause else { break };
+                eprintln!("auto approval cause[{depth}]: {current}");
+                cause = current.source();
+            }
+            if let Err(cleanup_error) = cleanup {
+                eprintln!("auto approval fixture cleanup also failed: {cleanup_error}");
+            }
+            return Err(error);
+        }
+        cleanup
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn exercise_auto_approval_audit(fixture: Fixture) -> Result<(), Box<dyn std::error::Error>> {
         let workspace_root = fixture.workspaces[0].clone();
         let locator = locator_for(&fixture.control, fixture.location_id, "workspace-0")?;
-        let cleanup_root = fixture.root.clone();
         let location_id = fixture.location_id;
         let (client, mut worker) = ForgeControlWorker::start(fixture.control)?;
         let scope = client.resolve_workspace(
@@ -4259,10 +4349,9 @@ mod integration_tests {
         )?;
         let (attribution, authority, command_evidence, command_request) =
             prepare_discovered_command_authority(&client, &scope, activity_id, owner, &request)?;
-        let mut shell_authority = authority.clone();
         let submission = approval_client.submit_execution(
             SubmitExecutionForApproval::project_command(
-                scope.clone(),
+                scope,
                 activity_id,
                 owner,
                 command_request,
@@ -4272,29 +4361,6 @@ mod integration_tests {
             .with_agent_authority(authority),
         )?;
         assert_eq!(submission.status(), ApprovalSubmissionStatus::Started);
-
-        let analyzed = crate::shell::analyze_shell_script("printf auto-shell".to_owned())?;
-        let shell_execution_id = ExecutionId::from_uuid(id(0xEC04));
-        let shell_request = ExecutionRequest::new(
-            ExecutionAttribution::new(shell_execution_id, scope.workspace_id(), activity_id),
-            ExecutionKind::Shell {
-                script: analyzed.script().clone(),
-            },
-            None,
-            ExecutionLimits::new(
-                ExecutionTimeoutMillis::new(1_000)?,
-                ExecutionOutputLimit::new(1_024)?,
-            ),
-            analyzed.permissions(),
-        )?;
-        shell_authority.command_id = analyzed.intent_id().clone();
-        let shell_attribution = shell_authority.attribution;
-        let shell_submission = approval_client.submit_execution(
-            SubmitExecutionForApproval::analyzed_shell(scope, activity_id, owner, shell_request)?
-                .with_goal_node(shell_attribution)
-                .with_agent_authority(shell_authority),
-        )?;
-        assert_eq!(shell_submission.status(), ApprovalSubmissionStatus::Started);
         let _cancelled = approval_client.emergency_stop()?;
         let _approval_report = approval_coordinator.shutdown()?;
         let _execution_report = execution_coordinator.shutdown()?;
@@ -4303,14 +4369,8 @@ mod integration_tests {
         let layout = WorkspaceStateLayout::inspect_existing(&workspace_root)?
             .ok_or("auto approval layout missing")?;
         let store = WorkspaceStore::open_existing(&layout)?;
-        for (approval_id, execution_id) in [
-            (submission.approval_id(), execution_id),
-            (shell_submission.approval_id(), shell_execution_id),
-        ] {
-            assert_auto_approval_audit(&store, approval_id, execution_id)?;
-        }
+        assert_auto_approval_audit(&store, submission.approval_id(), execution_id)?;
         drop(store);
-        cleanup_test_root(cleanup_root)?;
         Ok(())
     }
 

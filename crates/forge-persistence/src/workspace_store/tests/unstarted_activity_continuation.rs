@@ -1,4 +1,4 @@
-//! Canonical schema-v66 SQL proof for the positive unstarted census.
+//! Canonical schema-v70 SQL proof for the positive unstarted census.
 
 use super::*;
 
@@ -771,6 +771,180 @@ fn probe_for_activity_at(
     )
 }
 
+fn seal_evaluation_manifest_for_assignment(
+    fixture: &mut FileFactFixture,
+    delegation: &crate::AgentOperationsDelegation,
+    assignment: &forge_domain::RegisteredAgentAssignment,
+    seed: u128,
+) -> Result<(ForgeBackendId, forge_domain::EvaluationManifestProposal), Box<dyn std::error::Error>>
+{
+    let workspace_id = fixture.store.workspace()?.id();
+    let backend_id = ForgeBackendId::from_uuid(Uuid::from_u128(seed + 1));
+    let source = forge_domain::EvaluationSourceIdentity::new(
+        backend_id,
+        workspace_id,
+        fixture.activity.id(),
+        delegation.migration_id(),
+        delegation.destination_id(),
+        forge_domain::EvaluationRevision::new(i64::try_from(delegation.freeze().revision())?)?,
+        forge_domain::EvaluationDigest::new(delegation.manifest_digest())?,
+    )?;
+    let plan = forge_domain::EvaluationPlanBinding::new(
+        forge_domain::EvaluationPlanId::new(Uuid::from_u128(seed + 2))?,
+        forge_domain::EvaluationRevision::new(1)?,
+        forge_domain::EvaluationDigest::new([0xE2; 32])?,
+    );
+    let member = forge_domain::EvaluationManifestMember::new(
+        forge_domain::EvaluationWorkUnitId::new(Uuid::from_u128(seed + 3))?,
+        forge_domain::EvaluationObligationId::new(Uuid::from_u128(seed + 4))?,
+        assignment.id(),
+        assignment.revision(),
+        assignment.target().agent_id(),
+        assignment.target().session_id(),
+        forge_domain::EvaluationDigest::new([0xE3; 32])?,
+    )?;
+    let proposal = forge_domain::EvaluationManifestProposal::new(
+        forge_domain::EvaluationManifestId::new(Uuid::from_u128(seed + 5))?,
+        forge_domain::EvaluationRevision::new(1)?,
+        source,
+        plan,
+        timestamp(1_000)?,
+        vec![member],
+    )?;
+    let sealed_at = timestamp(150)?;
+    let _manifest = fixture
+        .store
+        .seal_evaluation_manifest(backend_id, &proposal, || {
+            forge_domain::EvaluationClockReading::Trusted(sealed_at)
+        })?;
+    Ok((backend_id, proposal))
+}
+
+fn assignment_target(
+    store: &WorkspaceStore,
+    assignment: &forge_domain::RegisteredAgentAssignment,
+) -> Result<forge_domain::AgentAssignmentTarget, Box<dyn std::error::Error>> {
+    let agent = store
+        .get_agent(assignment.target().agent_id())?
+        .ok_or("evaluation assignment target is missing")?;
+    Ok(forge_domain::AgentAssignmentTarget::new(
+        agent.id(),
+        agent
+            .session_id()
+            .ok_or("evaluation target Session is missing")?,
+        agent.principal(),
+        agent.revision(),
+    ))
+}
+
+fn submit_evaluation_assignment(
+    fixture: &mut FileFactFixture,
+    assignment: &forge_domain::RegisteredAgentAssignment,
+    backend_id: ForgeBackendId,
+) -> Result<forge_domain::RegisteredAgentAssignment, Box<dyn std::error::Error>> {
+    let claimed_at = timestamp(220)?;
+    let target = assignment_target(&fixture.store, assignment)?;
+    let claimed = fixture.store.claim_agent_assignment(
+        &forge_domain::ClaimAgentAssignment::new(
+            assignment.id(),
+            target,
+            assignment.revision(),
+            claimed_at,
+        ),
+        claimed_at,
+    )?;
+    let observed_at = timestamp(250)?;
+    let submitted_at = timestamp(251)?;
+    let command = forge_domain::SubmitAgentAssignment::new(
+        claimed.id(),
+        assignment_target(&fixture.store, &claimed)?,
+        claimed.revision(),
+        forge_domain::AgentAssignmentResult::new("evaluation result".to_owned(), Vec::new(), None)?,
+        observed_at,
+    );
+    let submitted = fixture.store.submit_agent_assignment_with_source_clock(
+        &command,
+        submitted_at,
+        backend_id,
+        || forge_domain::EvaluationClockReading::Trusted(submitted_at),
+    )?;
+    if submitted.receipt().is_none() {
+        return Err("registered evaluation submission has no source receipt".into());
+    }
+    Ok(submitted.assignment().clone())
+}
+
+fn review_evaluation_assignment(
+    fixture: &mut FileFactFixture,
+    submitted: &forge_domain::RegisteredAgentAssignment,
+    backend_id: ForgeBackendId,
+) -> Result<forge_domain::RegisteredAgentAssignment, Box<dyn std::error::Error>> {
+    let coordinator_binding = fixture
+        .store
+        .get_activity_coordinator(submitted.activity_id())?
+        .ok_or("evaluation Activity Coordinator is missing")?;
+    let coordinator_agent = fixture
+        .store
+        .get_agent(coordinator_binding.agent_id())?
+        .ok_or("evaluation Coordinator Agent is missing")?;
+    let coordinator_session = coordinator_agent
+        .session_id()
+        .ok_or("evaluation Coordinator Session is missing")?;
+    let actor = forge_domain::ActivityCoordinatorActor::new(
+        coordinator_binding.workspace_id(),
+        coordinator_binding.activity_id(),
+        coordinator_binding.agent_id(),
+        coordinator_binding.revision(),
+        coordinator_agent.principal(),
+        coordinator_session,
+    );
+    let observed_at = timestamp(1_100)?;
+    let reviewed_at = timestamp(1_101)?;
+    let command = forge_domain::ReviewAgentAssignment::new(
+        submitted.id(),
+        actor,
+        submitted.revision(),
+        observed_at,
+    );
+    let reviewed = fixture.store.accept_agent_assignment_with_source_clock(
+        &command,
+        reviewed_at,
+        backend_id,
+        || forge_domain::EvaluationClockReading::Trusted(reviewed_at),
+    )?;
+    if reviewed.receipt().is_none() {
+        return Err("registered evaluation review has no source receipt".into());
+    }
+    Ok(reviewed.assignment().clone())
+}
+
+fn close_evaluation_t1(
+    fixture: &mut FileFactFixture,
+    backend_id: ForgeBackendId,
+    proposal: &forge_domain::EvaluationManifestProposal,
+    seed: u128,
+) -> Result<forge_domain::EvaluationCutId, Box<dyn std::error::Error>> {
+    let cut_id = forge_domain::EvaluationCutId::new(Uuid::from_u128(seed))?;
+    let request = forge_domain::EvaluationT1CloseRequest::new(
+        cut_id,
+        proposal.manifest_id(),
+        proposal.revision(),
+        proposal.digest(),
+        proposal.deadline(),
+    );
+    let closed_at = timestamp(1_001)?;
+    let outcome = fixture
+        .store
+        .close_evaluation_t1(backend_id, &request, || {
+            forge_domain::EvaluationClockReading::Trusted(closed_at)
+        })?;
+    assert!(matches!(
+        outcome,
+        crate::EvaluationT1ClosureOutcome::Closed(_)
+    ));
+    Ok(cut_id)
+}
+
 fn store_request(
     snapshot: &forge_domain::UnstartedActivityContinuationProbe,
     assignment: &forge_domain::RegisteredAgentAssignment,
@@ -818,6 +992,291 @@ fn canonical_v66_positive_census_accepts_real_goal_dag_assignment_and_team()
     let root = fixture.root.clone();
     drop(fixture);
     std::fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[test]
+fn schema_v70_empty_and_prework_evaluation_plans_remain_continuable()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (mut fixture, delegation, assignment) =
+        normal_bootstrap_fixture("unstarted-continuation-v70-evaluation-plan", 0xF820)?;
+    assert_eq!(
+        fixture.store.health()?.schema_version(),
+        super::super::CURRENT_SCHEMA_VERSION
+    );
+    for (kind, name) in crate::workspace_evaluation_evidence::schema_objects() {
+        if kind != "table" {
+            continue;
+        }
+        let row_count: i64 = fixture.store.connection.query_row(
+            &format!("SELECT COUNT(*) FROM {name}"),
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(row_count, 0, "fresh v70 table {name} must be empty");
+    }
+    let empty_plan = probe(&fixture, &assignment)?;
+    assert!(empty_plan.continuable_now(), "{:?}", empty_plan.blocker());
+
+    let (_backend_id, _proposal) =
+        seal_evaluation_manifest_for_assignment(&mut fixture, &delegation, &assignment, 0xF830)?;
+    let planned = probe(&fixture, &assignment)?;
+    assert!(planned.continuable_now(), "{:?}", planned.blocker());
+    assert_ne!(
+        planned.expectation().expected_plan_digest(),
+        empty_plan.expectation().expected_plan_digest(),
+        "pre-work evaluation plan content belongs in the continuation witness"
+    );
+    let root = fixture.root.clone();
+    drop(fixture);
+    std::fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[test]
+fn schema_v70_unknown_original_evaluation_binding_blocks_continuation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (mut fixture, delegation, assignment) =
+        normal_bootstrap_fixture("unstarted-continuation-v70-unknown-binding", 0xF840)?;
+    let (_backend_id, proposal) =
+        seal_evaluation_manifest_for_assignment(&mut fixture, &delegation, &assignment, 0xF850)?;
+    let workspace_id = fixture.store.workspace()?.id();
+    fixture.store.connection.execute(
+        "UPDATE workspace_evaluation_manifest_members
+         SET binding_status=1,binding_assignment_id=NULL,binding_digest=NULL,binding_sequence=NULL
+         WHERE workspace_id=?1 AND manifest_id=?2 AND manifest_revision=?3 AND assignment_id=?4",
+        params![
+            workspace_id.into_uuid().as_bytes(),
+            proposal.manifest_id().into_uuid().as_bytes(),
+            proposal.revision().get(),
+            assignment.id().into_uuid().as_bytes(),
+        ],
+    )?;
+    assert_eq!(
+        probe(&fixture, &assignment)?.blocker(),
+        Some(UnstartedActivityContinuationBlocker::EvaluationProvenanceUnknown)
+    );
+    let root = fixture.root.clone();
+    drop(fixture);
+    std::fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[test]
+fn schema_v70_submission_review_and_cut_evidence_block_continuation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (mut fixture, delegation, assignment) =
+        normal_bootstrap_fixture("unstarted-continuation-v70-evidence", 0xF860)?;
+    let (backend_id, proposal) =
+        seal_evaluation_manifest_for_assignment(&mut fixture, &delegation, &assignment, 0xF870)?;
+    let submitted = submit_evaluation_assignment(&mut fixture, &assignment, backend_id)?;
+    assert_eq!(
+        probe(&fixture, &assignment)?.blocker(),
+        Some(UnstartedActivityContinuationBlocker::AssignmentEvidencePresent)
+    );
+
+    let t1_cut_id = close_evaluation_t1(&mut fixture, backend_id, &proposal, 0xF880)?;
+    assert_eq!(
+        probe(&fixture, &assignment)?.blocker(),
+        Some(UnstartedActivityContinuationBlocker::AssignmentEvidencePresent)
+    );
+    let _reviewed = review_evaluation_assignment(&mut fixture, &submitted, backend_id)?;
+    let review_cut_id = forge_domain::EvaluationReviewCutId::new(Uuid::from_u128(0xF890))?;
+    let cut_at = timestamp(1_200)?;
+    let _review_cut =
+        fixture
+            .store
+            .create_evaluation_review_cut(backend_id, review_cut_id, t1_cut_id, || {
+                forge_domain::EvaluationClockReading::Trusted(cut_at)
+            })?;
+    assert_eq!(
+        probe(&fixture, &assignment)?.blocker(),
+        Some(UnstartedActivityContinuationBlocker::AssignmentEvidencePresent)
+    );
+    let root = fixture.root.clone();
+    drop(fixture);
+    std::fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[test]
+fn schema_v70_cut_on_an_offered_assignment_has_an_explicit_evaluation_blocker()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (mut fixture, delegation, assignment) =
+        normal_bootstrap_fixture("unstarted-continuation-v70-cut-only", 0xF8A8)?;
+    let (backend_id, proposal) =
+        seal_evaluation_manifest_for_assignment(&mut fixture, &delegation, &assignment, 0xF8B8)?;
+    let _cut = close_evaluation_t1(&mut fixture, backend_id, &proposal, 0xF8C8)?;
+    assert_eq!(
+        probe(&fixture, &assignment)?.blocker(),
+        Some(UnstartedActivityContinuationBlocker::EvaluationEvidencePresent)
+    );
+    let root = fixture.root.clone();
+    drop(fixture);
+    std::fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[test]
+fn schema_v70_evaluation_evidence_for_another_activity_is_scoped()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (mut fixture, second_activity, delegation, first_assignment, second_assignment) =
+        same_workspace_normal_bootstrap_fixture("unstarted-continuation-v70-scoped", 0xF8A0)?;
+    let (backend_id, _proposal) = seal_evaluation_manifest_for_assignment(
+        &mut fixture,
+        &delegation,
+        &first_assignment,
+        0xF8B0,
+    )?;
+    let _submitted = submit_evaluation_assignment(&mut fixture, &first_assignment, backend_id)?;
+    assert_eq!(
+        probe_for_activity(&fixture, fixture.activity.id(), &first_assignment)?.blocker(),
+        Some(UnstartedActivityContinuationBlocker::AssignmentEvidencePresent)
+    );
+    let unrelated = probe_for_activity(&fixture, second_activity.id(), &second_assignment)?;
+    assert!(unrelated.continuable_now(), "{:?}", unrelated.blocker());
+    let root = fixture.root.clone();
+    drop(fixture);
+    std::fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[test]
+fn schema_v70_evaluation_source_and_manifest_drift_reject_old_probes()
+-> Result<(), Box<dyn std::error::Error>> {
+    for source_drift in [true, false] {
+        let seed = if source_drift { 0xF8C0 } else { 0xF8E0 };
+        let (mut fixture, delegation, assignment) =
+            normal_bootstrap_fixture("unstarted-continuation-v70-stale-evaluation", seed)?;
+        let (_backend_id, proposal) = seal_evaluation_manifest_for_assignment(
+            &mut fixture,
+            &delegation,
+            &assignment,
+            seed + 0x10,
+        )?;
+        let snapshot = probe(&fixture, &assignment)?;
+        assert!(snapshot.continuable_now(), "{:?}", snapshot.blocker());
+        let binding = fixture.store.journal_binding()?;
+        let request = store_request(&snapshot, &assignment, &delegation, seed + 0x20)?;
+        let before_activity = fixture.store.get_activity(fixture.activity.id())?;
+        let before_maintenance = fixture.store.get_recovery_maintenance_lease()?;
+        let workspace_id = fixture.store.workspace()?.id();
+        apply_evaluation_drift(&mut fixture, &proposal, workspace_id, source_drift)?;
+        let source_state_before = evaluation_source_state(&fixture, workspace_id)?;
+        assert_stale_probe_rejected_without_mutation(
+            &mut fixture,
+            &binding,
+            &request,
+            &snapshot,
+            before_activity.as_ref(),
+            &before_maintenance,
+            source_state_before,
+        )?;
+        let root = fixture.root.clone();
+        drop(fixture);
+        std::fs::remove_dir_all(root)?;
+    }
+    Ok(())
+}
+
+fn apply_evaluation_drift(
+    fixture: &mut FileFactFixture,
+    proposal: &forge_domain::EvaluationManifestProposal,
+    workspace_id: WorkspaceId,
+    source_drift: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if source_drift {
+        fixture.store.connection.execute(
+            "UPDATE workspace_evaluation_source_state
+             SET source_sequence=source_sequence+1 WHERE workspace_id=?1",
+            params![workspace_id.into_uuid().as_bytes()],
+        )?;
+        return Ok(());
+    }
+    let drifted_proposal = forge_domain::EvaluationManifestProposal::new(
+        proposal.manifest_id(),
+        proposal.revision(),
+        proposal.source(),
+        proposal.plan(),
+        timestamp(1_002)?,
+        proposal.members().to_vec(),
+    )?;
+    fixture.store.connection.execute(
+        "UPDATE workspace_evaluation_manifests SET deadline_ms=?1,manifest_digest=?2
+         WHERE workspace_id=?3 AND manifest_id=?4 AND manifest_revision=?5",
+        params![
+            drifted_proposal.deadline().get(),
+            drifted_proposal.digest().as_bytes().as_slice(),
+            workspace_id.into_uuid().as_bytes(),
+            proposal.manifest_id().into_uuid().as_bytes(),
+            proposal.revision().get(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn evaluation_source_state(
+    fixture: &FileFactFixture,
+    workspace_id: WorkspaceId,
+) -> Result<(i64, i64, Option<i64>, Option<i64>), rusqlite::Error> {
+    fixture.store.connection.query_row(
+        "SELECT source_sequence,clock_health,last_trusted_at_ms,last_uncertainty_sequence
+         FROM workspace_evaluation_source_state WHERE workspace_id=?1",
+        params![workspace_id.into_uuid().as_bytes()],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )
+}
+
+fn assert_stale_probe_rejected_without_mutation(
+    fixture: &mut FileFactFixture,
+    binding: &crate::WorkspaceJournalBinding,
+    request: &crate::UnstartedActivityContinuationStoreRequest,
+    snapshot: &forge_domain::UnstartedActivityContinuationProbe,
+    before_activity: Option<&forge_domain::RegisteredActivity>,
+    before_maintenance: &forge_domain::RecoveryMaintenanceLease,
+    source_state_before: (i64, i64, Option<i64>, Option<i64>),
+) -> Result<(), Box<dyn std::error::Error>> {
+    assert!(
+        fixture
+            .store
+            .unstarted_activity_continuation_readback_for_request(
+                binding,
+                request.request_id,
+                request.request_digest,
+            )?
+            .is_none()
+    );
+    let result = fixture
+        .store
+        .run_unstarted_activity_continuation_with_clock(binding, request, || {
+            Ok(snapshot.observed_at())
+        });
+    assert!(
+        result.is_err(),
+        "evaluation drift must invalidate the probe"
+    );
+    assert_eq!(
+        fixture.store.get_activity(fixture.activity.id())?.as_ref(),
+        before_activity
+    );
+    assert_eq!(
+        &fixture.store.get_recovery_maintenance_lease()?,
+        before_maintenance
+    );
+    assert_eq!(
+        evaluation_source_state(fixture, fixture.store.workspace()?.id())?,
+        source_state_before
+    );
+    assert!(
+        fixture
+            .store
+            .unstarted_activity_continuation_readback_for_request(
+                binding,
+                request.request_id,
+                request.request_digest,
+            )?
+            .is_none()
+    );
     Ok(())
 }
 

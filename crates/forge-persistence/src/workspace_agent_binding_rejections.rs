@@ -103,6 +103,8 @@ pub enum AgentBindingRejectionStoreError {
     Activation(#[from] AgentBindingActivationError),
     #[error(transparent)]
     Agent(#[from] crate::workspace_agents::AgentStoreError),
+    #[error(transparent)]
+    Retirement(#[from] Box<crate::HomeTransferStoreError>),
     #[error("Agent binding rejection schema object is damaged: {0}")]
     DamagedSchema(&'static str),
     #[error("Agent binding rejection is not eligible: {0}")]
@@ -171,39 +173,7 @@ where
                 "reservation missing",
             ))?;
     validate_reservation(&reservation, request)?;
-    let current = workspace_agent_delegation::get(&transaction, request.request.workspace_id())?
-        .ok_or(AgentBindingRejectionStoreError::Conflict(
-            "delegation missing",
-        ))?;
-    if current != request.current_delegation {
-        return Err(AgentBindingRejectionStoreError::Conflict(
-            "delegation changed",
-        ));
-    }
-    if workspace_agent_binding_activation::get(&transaction, request.request.request_id())?
-        .is_some()
-    {
-        return Err(AgentBindingRejectionStoreError::Conflict(
-            "activation already exists",
-        ));
-    }
-    if crate::workspace_agents::get_in_transaction(&transaction, request.request.agent_id())?
-        .is_some()
-    {
-        return Err(AgentBindingRejectionStoreError::Conflict(
-            "Agent already exists",
-        ));
-    }
-    if workspace_agent_binding_activation::validate_transport(
-        request.request.principal(),
-        request.request.transport(),
-    )
-    .is_ok()
-    {
-        return Err(AgentBindingRejectionStoreError::Conflict(
-            "transport is valid",
-        ));
-    }
+    ensure_fresh_rejection_eligible(&transaction, request)?;
     let rejected_at = clock()?;
     if rejected_at.get() < request.request.observed_at().get() {
         return Err(AgentBindingRejectionStoreError::Conflict(
@@ -242,6 +212,56 @@ where
         .commit()
         .map_err(AgentBindingRejectionStoreError::CommitUnconfirmed)?;
     Ok(AgentBindingRejectionOperation::Recorded(receipt))
+}
+
+fn ensure_fresh_rejection_eligible(
+    connection: &Connection,
+    request: &AgentBindingRejectionStoreRequest,
+) -> Result<(), AgentBindingRejectionStoreError> {
+    if crate::workspace_home_transfers::retirements::get_for_reservation(
+        connection,
+        request.request.request_id(),
+    )
+    .map_err(|error| AgentBindingRejectionStoreError::Retirement(Box::new(error)))?
+    .is_some()
+    {
+        return Err(AgentBindingRejectionStoreError::Conflict(
+            "reservation retired",
+        ));
+    }
+    let current = workspace_agent_delegation::get(connection, request.request.workspace_id())?
+        .ok_or(AgentBindingRejectionStoreError::Conflict(
+            "delegation missing",
+        ))?;
+    if current != request.current_delegation {
+        return Err(AgentBindingRejectionStoreError::Conflict(
+            "delegation changed",
+        ));
+    }
+    if workspace_agent_binding_activation::get(connection, request.request.request_id())?.is_some()
+    {
+        return Err(AgentBindingRejectionStoreError::Conflict(
+            "activation already exists",
+        ));
+    }
+    if crate::workspace_agents::get_in_transaction(connection, request.request.agent_id())?
+        .is_some()
+    {
+        return Err(AgentBindingRejectionStoreError::Conflict(
+            "Agent already exists",
+        ));
+    }
+    if workspace_agent_binding_activation::validate_transport(
+        request.request.principal(),
+        request.request.transport(),
+    )
+    .is_ok()
+    {
+        return Err(AgentBindingRejectionStoreError::Conflict(
+            "transport is valid",
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn get(

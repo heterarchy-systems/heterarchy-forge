@@ -88,6 +88,44 @@ macro_rules! descriptor {
 pub(super) const CONDITIONAL_SEMANTIC_META_KEY: &str = "conditional:semantic_events_meta";
 
 pub(super) const FORBIDDEN_INVENTORY: &[ForbiddenInventoryDescriptor] = &[
+    // Home custody authority belongs to the predecessor Activity. It is not
+    // ordinary prework planning, and cannot be discarded by an unstarted lease
+    // continuation. Unrelated Activities retain their existing census.
+    descriptor!(
+        "home_handoff_cases",
+        ParentJoin,
+        "SELECT EXISTS(SELECT 1 FROM home_handoff_cases h JOIN agent_assignments a ON a.assignment_id=h.predecessor_assignment_id WHERE h.workspace_id=?1 AND a.activity_id=?2)",
+        "SELECT EXISTS(SELECT 1 FROM home_handoff_cases h LEFT JOIN agent_assignments a ON a.assignment_id=h.predecessor_assignment_id LEFT JOIN agent_assignments r ON r.assignment_id=h.root_assignment_id LEFT JOIN home_transfer_source_operations p ON p.preparation_id=h.preparation_id WHERE a.assignment_id IS NULL OR r.assignment_id IS NULL OR p.preparation_id IS NULL OR a.workspace_id!=h.workspace_id OR r.workspace_id!=h.workspace_id OR p.workspace_id!=h.workspace_id)"
+    ),
+    descriptor!(
+        "home_handoff_proposals",
+        ParentJoin,
+        "SELECT EXISTS(SELECT 1 FROM home_handoff_proposals p JOIN home_handoff_cases h ON h.handoff_id=p.handoff_id JOIN agent_assignments a ON a.assignment_id=h.predecessor_assignment_id WHERE h.workspace_id=?1 AND a.activity_id=?2)",
+        "SELECT EXISTS(SELECT 1 FROM home_handoff_proposals p LEFT JOIN home_handoff_cases h ON h.handoff_id=p.handoff_id WHERE h.handoff_id IS NULL OR p.preparation_id!=h.preparation_id OR p.workspace_id!=h.workspace_id OR p.predecessor_assignment_id!=h.predecessor_assignment_id OR p.root_assignment_id!=h.root_assignment_id)"
+    ),
+    descriptor!(
+        "home_handoff_proposal_heads",
+        ParentJoin,
+        "SELECT EXISTS(SELECT 1 FROM home_handoff_proposal_heads p JOIN home_handoff_cases h ON h.handoff_id=p.handoff_id JOIN agent_assignments a ON a.assignment_id=h.predecessor_assignment_id WHERE h.workspace_id=?1 AND a.activity_id=?2)",
+        "SELECT EXISTS(SELECT 1 FROM home_handoff_proposal_heads p LEFT JOIN home_handoff_cases h ON h.handoff_id=p.handoff_id LEFT JOIN home_handoff_proposals v ON v.proposal_id=p.proposal_id WHERE h.handoff_id IS NULL OR v.proposal_id IS NULL OR v.handoff_id!=p.handoff_id OR v.case_revision!=p.case_revision OR v.created_at_ms!=p.updated_at_ms)"
+    ),
+    descriptor!(
+        "home_handoff_acceptance_outcomes",
+        ParentJoin,
+        "SELECT EXISTS(SELECT 1 FROM home_handoff_acceptance_outcomes o JOIN home_handoff_cases h ON h.handoff_id=o.handoff_id JOIN agent_assignments a ON a.assignment_id=h.predecessor_assignment_id WHERE h.workspace_id=?1 AND a.activity_id=?2)",
+        "SELECT EXISTS(SELECT 1 FROM home_handoff_acceptance_outcomes o LEFT JOIN home_handoff_cases h ON h.handoff_id=o.handoff_id LEFT JOIN home_handoff_proposals p ON p.proposal_id=o.proposal_id WHERE h.handoff_id IS NULL OR p.proposal_id IS NULL OR o.preparation_id!=h.preparation_id OR o.workspace_id!=h.workspace_id OR o.predecessor_assignment_id!=h.predecessor_assignment_id OR o.root_assignment_id!=h.root_assignment_id OR p.handoff_id!=o.handoff_id OR p.case_revision!=o.case_revision)"
+    ),
+    descriptor!(
+        "home_transfer_artifact_stages",
+        Direct,
+        "SELECT EXISTS(SELECT 1 FROM home_transfer_artifact_stages WHERE workspace_id=?1 AND activity_id=?2)"
+    ),
+    descriptor!(
+        "home_transfer_artifact_seals",
+        ParentJoin,
+        "SELECT EXISTS(SELECT 1 FROM home_transfer_artifact_seals s JOIN home_transfer_artifact_stages p ON p.artifact_id=s.artifact_id WHERE p.workspace_id=?1 AND p.activity_id=?2)",
+        "SELECT EXISTS(SELECT 1 FROM home_transfer_artifact_seals s LEFT JOIN home_transfer_artifact_stages p ON p.artifact_id=s.artifact_id WHERE p.artifact_id IS NULL)"
+    ),
     descriptor!(
         "activity_coordinator_recoveries",
         Direct,
@@ -103,6 +141,12 @@ pub(super) const FORBIDDEN_INVENTORY: &[ForbiddenInventoryDescriptor] = &[
         ParentJoin,
         "SELECT EXISTS(SELECT 1 FROM agent_work_update_evidence_refs r JOIN agent_work_updates u ON u.update_id=r.update_id AND u.agent_id=r.agent_id AND u.workspace_id=r.workspace_id WHERE u.workspace_id=?1 AND u.activity_id=?2)",
         "SELECT EXISTS(SELECT 1 FROM agent_work_update_evidence_refs r LEFT JOIN agent_work_updates u ON u.update_id=r.update_id AND u.agent_id=r.agent_id AND u.workspace_id=r.workspace_id WHERE r.workspace_id=?1 AND u.update_id IS NULL)"
+    ),
+    descriptor!(
+        "approval_agent_provenance",
+        ParentJoin,
+        "SELECT EXISTS(SELECT 1 FROM approval_agent_provenance p JOIN approval_requests a ON a.approval_id=p.approval_id WHERE a.workspace_id=?1 AND a.activity_id=?2)",
+        "SELECT EXISTS(SELECT 1 FROM approval_agent_provenance p LEFT JOIN approval_requests a ON a.approval_id=p.approval_id WHERE a.approval_id IS NULL)"
     ),
     descriptor!(
         "approval_requests",
@@ -405,9 +449,16 @@ pub(super) const FORBIDDEN_INVENTORY: &[ForbiddenInventoryDescriptor] = &[
 ];
 
 pub(super) const FORBIDDEN_INVENTORY_TABLES: &[&str] = &[
+    "home_handoff_cases",
+    "home_handoff_proposals",
+    "home_handoff_proposal_heads",
+    "home_handoff_acceptance_outcomes",
+    "home_transfer_artifact_stages",
+    "home_transfer_artifact_seals",
     "activity_coordinator_recoveries",
     "agent_departure_reconciliations",
     "agent_work_update_evidence_refs",
+    "approval_agent_provenance",
     "approval_requests",
     "assignment_continuation_acknowledgments",
     "assignment_continuation_batches",
@@ -541,8 +592,8 @@ fn query_bool(
 }
 
 fn validate_registry() -> Result<(), UnstartedActivityContinuationStoreError> {
-    if FORBIDDEN_INVENTORY.len() != 55
-        || FORBIDDEN_INVENTORY_TABLES.len() != 55
+    if FORBIDDEN_INVENTORY.len() != 62
+        || FORBIDDEN_INVENTORY_TABLES.len() != 62
         || CONDITIONAL_SEMANTIC_META_KEY.is_empty()
         || CONDITIONAL_RECOVERY_RUNS_KEY.is_empty()
     {
@@ -569,7 +620,7 @@ fn validate_registry() -> Result<(), UnstartedActivityContinuationStoreError> {
             ));
         }
     }
-    if attribution_counts != [14, 36, 5] {
+    if attribution_counts != [15, 42, 5] {
         return Err(UnstartedActivityContinuationStoreError::Corrupt(
             "forbidden inventory attribution registry",
         ));

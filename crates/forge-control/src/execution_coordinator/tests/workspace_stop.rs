@@ -65,6 +65,7 @@ pub(super) fn approved_start(
             approval_id,
             request: authorization,
             agent_binding: None,
+            agent_provenance: None,
             expires_at,
         })?;
     let (_approval, grant) = workspace.client.approve_once(crate::ApprovalOnceRequest {

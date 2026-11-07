@@ -37,12 +37,14 @@ mod binding_rejection;
 mod dag_plan;
 mod diff_inventory;
 pub mod effect_facts;
+pub mod evaluation_evidence;
 pub mod execution;
 pub mod execution_evidence;
 pub mod execution_observation;
 pub mod execution_wait;
 pub mod goal_cleanup;
 mod goals;
+pub(crate) mod home_transfers;
 pub mod lease;
 pub mod location_removal;
 mod mutation;
@@ -110,6 +112,19 @@ define_command_ops! {
     WorkCutPrepare => "work_cut.prepare",
     WorkCutGet => "work_cut.get",
     WorkCutDrain => "work_cut.drain",
+    HomeTransferSourcePrepare => "home_transfer.source_prepare",
+    HomeTransferSourceAbortUnstarted => "home_transfer.source_abort_unstarted",
+    HomeTransferSourceGet => "home_transfer.source_get",
+    HomeTransferReservationRetireUnused => "home_transfer.reservation_retire_unused",
+    HomeTransferReservationRetirementGet => "home_transfer.reservation_retirement_get",
+    EvaluationManifestSeal => "evaluation.manifest.seal",
+    EvaluationManifestGet => "evaluation.manifest.get",
+    EvaluationT1Close => "evaluation.t1.close",
+    EvaluationT1Get => "evaluation.t1.get",
+    EvaluationReviewCutCreate => "evaluation.review_cut.create",
+    EvaluationReviewCutGet => "evaluation.review_cut.get",
+    EvaluationSubmissionReceiptGet => "evaluation.submission_receipt.get",
+    EvaluationReviewReceiptGet => "evaluation.review_receipt.get",
     RecoveryLeaseClaim => "recovery.lease.claim",
     RecoveryLeaseRenew => "recovery.lease.renew",
     RecoveryLeaseRelease => "recovery.lease.release",
@@ -236,7 +251,6 @@ define_command_ops! {
     AgentAssignmentGet => "agent.assignment.get",
     AgentAssignmentList => "agent.assignment.list",
     CommandSubmit => "command.submit",
-    ShellSubmit => "shell.submit",
 }
 
 impl CommandOp {
@@ -298,7 +312,6 @@ impl CommandOp {
                 | Self::AgentAssignmentGet
                 | Self::AgentAssignmentList
                 | Self::CommandSubmit
-                | Self::ShellSubmit
         )
     }
 }
@@ -398,6 +411,14 @@ pub enum Command {
     WorkCut {
         request_id: Uuid,
         request: Box<work_cuts::WorkCutCommand>,
+    },
+    HomeTransferSource {
+        request_id: Uuid,
+        request: Box<forge_control::HomeTransferSourceCommand>,
+    },
+    EvaluationEvidence {
+        request_id: Uuid,
+        request: Box<evaluation_evidence::EvaluationEvidenceCommand>,
     },
     ActivityLeases {
         request_id: Uuid,
@@ -813,10 +834,6 @@ pub enum Command {
         request_id: Uuid,
         request: Box<execution::ExecutionSubmissionCommand>,
     },
-    ShellSubmit {
-        request_id: Uuid,
-        request: Box<execution::ExecutionSubmissionCommand>,
-    },
 }
 
 impl Command {
@@ -840,6 +857,8 @@ impl Command {
             | Self::RecoveryLease { request_id, .. }
             | Self::RecoveryMaintenance { request_id, .. }
             | Self::WorkCut { request_id, .. }
+            | Self::HomeTransferSource { request_id, .. }
+            | Self::EvaluationEvidence { request_id, .. }
             | Self::ActivityLeases { request_id, .. }
             | Self::QueuePreference { request_id, .. }
             | Self::BindingLifecycle { request_id, .. }
@@ -933,8 +952,7 @@ impl Command {
             | Self::AgentAssignmentMutate { request_id, .. }
             | Self::AgentAssignmentGet { request_id, .. }
             | Self::AgentAssignmentList { request_id, .. }
-            | Self::CommandSubmit { request_id, .. }
-            | Self::ShellSubmit { request_id, .. } => *request_id,
+            | Self::CommandSubmit { request_id, .. } => *request_id,
         }
     }
 
@@ -954,6 +972,15 @@ impl Command {
     /// Durable identity retained from this validated request across a lost reply.
     #[allow(clippy::too_many_lines)]
     pub fn readback_hint(&self) -> Option<crate::error::ReadbackHint> {
+        if let Self::HomeTransferSource { request, .. } = self {
+            return home_transfers::readback_hint(request);
+        }
+        if let Self::EvaluationEvidence { request, .. } = self {
+            return request.readback_hint();
+        }
+        if let Self::AgentAssignmentMutate { request, .. } = self {
+            return assignments::readback_hint(request);
+        }
         if let Self::ActivityStartedLeaseResume { request, .. } = self {
             return request.readback_hint();
         }
@@ -1121,6 +1148,8 @@ impl Command {
             Self::RecoveryLease { request, .. } => request.op(),
             Self::RecoveryMaintenance { request, .. } => request.op(),
             Self::WorkCut { request, .. } => request.op(),
+            Self::HomeTransferSource { request, .. } => home_transfers::operation_op(request),
+            Self::EvaluationEvidence { request, .. } => request.op(),
             Self::ActivityLeases { request, .. } => request.op(),
             Self::QueuePreference { .. } => CommandOp::WorkspaceQueueSettingsReplace,
             Self::BindingLifecycle { request, .. } => request.op(),
@@ -1238,7 +1267,6 @@ impl Command {
             Self::AgentAssignmentGet { .. } => CommandOp::AgentAssignmentGet,
             Self::AgentAssignmentList { .. } => CommandOp::AgentAssignmentList,
             Self::CommandSubmit { .. } => CommandOp::CommandSubmit,
-            Self::ShellSubmit { .. } => CommandOp::ShellSubmit,
         }
     }
 }
@@ -1299,6 +1327,32 @@ pub fn parse_command(op: CommandOp, request_id: Uuid, payload: &serde_json::Valu
         | CommandOp::WorkCutDrain => Ok(Command::WorkCut {
             request_id,
             request: Box::new(work_cuts::parse(op, payload)?),
+        }),
+        CommandOp::HomeTransferSourcePrepare
+        | CommandOp::HomeTransferSourceAbortUnstarted
+        | CommandOp::HomeTransferSourceGet
+        | CommandOp::HomeTransferReservationRetireUnused
+        | CommandOp::HomeTransferReservationRetirementGet => {
+            if request_id.is_nil() {
+                return Err(ForgeError::invalid_input(
+                    "transport request identity must be non-nil",
+                ));
+            }
+            Ok(Command::HomeTransferSource {
+                request_id,
+                request: Box::new(home_transfers::parse(op, payload)?),
+            })
+        }
+        CommandOp::EvaluationManifestSeal
+        | CommandOp::EvaluationManifestGet
+        | CommandOp::EvaluationT1Close
+        | CommandOp::EvaluationT1Get
+        | CommandOp::EvaluationReviewCutCreate
+        | CommandOp::EvaluationReviewCutGet
+        | CommandOp::EvaluationSubmissionReceiptGet
+        | CommandOp::EvaluationReviewReceiptGet => Ok(Command::EvaluationEvidence {
+            request_id,
+            request: Box::new(evaluation_evidence::parse(op, payload)?),
         }),
         CommandOp::ActivityLeaseRenew
         | CommandOp::ActivityLeaseRelease
@@ -1559,13 +1613,6 @@ pub fn parse_command(op: CommandOp, request_id: Uuid, payload: &serde_json::Valu
             request: Box::new(execution::parse_submission(
                 payload,
                 execution::SubmissionKind::SealedProjectCommand,
-            )?),
-        }),
-        CommandOp::ShellSubmit => Ok(Command::ShellSubmit {
-            request_id,
-            request: Box::new(execution::parse_submission(
-                payload,
-                execution::SubmissionKind::Shell,
             )?),
         }),
     }
@@ -2078,6 +2125,12 @@ pub fn execute_on_bridge(
     if let Command::WorkCut { request, .. } = command {
         return work_cuts::execute(clients, request);
     }
+    if let Command::HomeTransferSource { request, .. } = command {
+        return home_transfers::execute(clients, request);
+    }
+    if let Command::EvaluationEvidence { request, .. } = command {
+        return evaluation_evidence::execute(clients, request);
+    }
     let BridgeClients {
         control: client,
         execution,
@@ -2132,6 +2185,12 @@ fn execute_on_bridge_inner(
         )),
         Command::WorkCut { .. } => Err(ForgeError::invalid_input(
             "work cut requires configured issuer bridge",
+        )),
+        Command::HomeTransferSource { .. } => Err(ForgeError::invalid_input(
+            "Home source operations require configured service identity",
+        )),
+        Command::EvaluationEvidence { .. } => Err(ForgeError::invalid_input(
+            "evaluation evidence requires configured service identity",
         )),
         Command::LocationRemoval { request, .. } => location_removal::execute(client, request),
         Command::RecoveryLease { request, .. } => recovery_leases::execute(client, request),
@@ -2365,7 +2424,12 @@ fn execute_on_bridge_inner(
             agents::execute_agent_publish_work(client, (**request).clone())
         }
         Command::AgentAssignmentMutate { request, .. } => {
-            assignments::execute_agent_assignment_mutate(client, (**request).clone())
+            assignments::execute_agent_assignment_mutate(
+                client,
+                backend_id,
+                destination_id,
+                (**request).clone(),
+            )
         }
         Command::AgentAssignmentGet { request, .. } => {
             assignments::execute_agent_assignment_get(client, (**request).clone())
@@ -2373,7 +2437,7 @@ fn execute_on_bridge_inner(
         Command::AgentAssignmentList { request, .. } => {
             assignments::execute_agent_assignment_list(client, (**request).clone())
         }
-        Command::CommandSubmit { request, .. } | Command::ShellSubmit { request, .. } => {
+        Command::CommandSubmit { request, .. } => {
             execution::execute_submission(client, execution, approval, runtime_instance_id, request)
         }
     }

@@ -7,7 +7,7 @@
 use rusqlite::{Connection, params};
 
 use forge_domain::{
-    ActivityId, AgentFocus, AgentInstanceId, DagNodeId, DagRevisionNumber,
+    ActivityId, AgentFocus, AgentInstanceId, AgentSessionId, DagNodeId, DagRevisionNumber,
     ExecutionAgentProvenance, GoalId, SourceWriteAuthority, WorkspaceId, WriterLeaseId,
 };
 
@@ -77,9 +77,55 @@ pub(crate) fn ensure_node_open(
     }
 }
 
-/// Fences an entire captured actor only for a Workspace-wide cut.
+/// Fences fresh bindings for a captured Session, including a new Agent ID in
+/// another Activity. Call in the binding write transaction after exact replay.
+/// Team custody remains node-scoped and does not freeze Session admission.
+pub(crate) fn ensure_session_binding_open(
+    connection: &Connection,
+    workspace_id: WorkspaceId,
+    session_id: AgentSessionId,
+) -> Result<(), WorkCutError> {
+    ensure_home(
+        crate::workspace_home_transfers::guards::ensure_session_open(
+            connection,
+            workspace_id,
+            session_id,
+        ),
+    )?;
+    let fenced = connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM leadership_work_cuts c
+              JOIN leadership_work_cut_sessions s ON s.cut_id = c.cut_id
+             WHERE c.workspace_id = ?1 AND c.state = 0 AND c.scope_kind = 0
+               AND s.session_id = ?2
+         )",
+        params![
+            workspace_id.into_uuid().as_bytes(),
+            session_id.into_uuid().as_bytes()
+        ],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if fenced {
+        Err(WorkCutError::Conflict(
+            "Session binding is fenced by a held cut",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// Fences captured actors and bindings of captured Sessions for Workspace cuts.
 /// Team custody is node-scoped; merely appearing in its roster is not a work fence.
 pub(crate) fn ensure_actor_open(
+    connection: &Connection,
+    workspace_id: WorkspaceId,
+    agent_id: AgentInstanceId,
+) -> Result<(), WorkCutError> {
+    ensure_home_actor_open(connection, workspace_id, agent_id, None)?;
+    ensure_work_cut_actor_open(connection, workspace_id, agent_id)
+}
+
+fn ensure_work_cut_actor_open(
     connection: &Connection,
     workspace_id: WorkspaceId,
     agent_id: AgentInstanceId,
@@ -89,6 +135,13 @@ pub(crate) fn ensure_actor_open(
              SELECT 1 FROM leadership_work_cuts c
               JOIN leadership_work_cut_agents a ON a.cut_id = c.cut_id
              WHERE c.workspace_id = ?1 AND c.state = 0 AND c.scope_kind = 0 AND a.agent_id = ?2
+         ) OR EXISTS(
+             SELECT 1 FROM leadership_work_cuts c
+              JOIN leadership_work_cut_sessions s ON s.cut_id = c.cut_id
+              JOIN agent_instances a ON a.workspace_id = c.workspace_id
+                                    AND a.session_id = s.session_id
+             WHERE c.workspace_id = ?1 AND c.state = 0 AND c.scope_kind = 0
+               AND a.agent_id = ?2
          )",
         params![
             workspace_id.into_uuid().as_bytes(),
@@ -203,7 +256,8 @@ pub(crate) fn ensure_source_write_open(
     workspace_id: WorkspaceId,
     authority: SourceWriteAuthority,
 ) -> Result<(), WorkCutError> {
-    ensure_actor_open(connection, workspace_id, authority.agent_id())?;
+    ensure_home_actor_open(connection, workspace_id, authority.agent_id(), None)?;
+    ensure_work_cut_actor_open(connection, workspace_id, authority.agent_id())?;
     let node = authority.attribution();
     ensure_node_open(
         connection,
@@ -226,7 +280,13 @@ pub(crate) fn ensure_execution_open(
     provenance: Option<&ExecutionAgentProvenance>,
 ) -> Result<(), WorkCutError> {
     if let Some(provenance) = provenance {
-        ensure_actor_open(connection, workspace_id, provenance.agent_id())?;
+        ensure_home_actor_open(
+            connection,
+            workspace_id,
+            provenance.agent_id(),
+            provenance.session_id(),
+        )?;
+        ensure_work_cut_actor_open(connection, workspace_id, provenance.agent_id())?;
         let attribution = provenance.attribution();
         ensure_node_open(
             connection,
@@ -237,6 +297,13 @@ pub(crate) fn ensure_execution_open(
         )?;
         return Ok(());
     }
+    ensure_home(
+        crate::workspace_home_transfers::guards::ensure_activity_open(
+            connection,
+            workspace_id,
+            activity_id,
+        ),
+    )?;
     let fenced = connection.query_row(
         "SELECT EXISTS(
              SELECT 1 FROM leadership_work_cuts c
@@ -262,4 +329,22 @@ pub(crate) fn ensure_execution_open(
     } else {
         Ok(())
     }
+}
+
+fn ensure_home_actor_open(
+    connection: &Connection,
+    workspace_id: WorkspaceId,
+    agent_id: AgentInstanceId,
+    session_id: Option<AgentSessionId>,
+) -> Result<(), WorkCutError> {
+    ensure_home(crate::workspace_home_transfers::guards::ensure_actor_open(
+        connection,
+        workspace_id,
+        agent_id,
+        session_id,
+    ))
+}
+
+fn ensure_home(result: Result<(), crate::HomeTransferStoreError>) -> Result<(), WorkCutError> {
+    result.map_err(|error| WorkCutError::HomeTransfer(Box::new(error)))
 }

@@ -84,6 +84,24 @@ pub struct ForgeError {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ReadbackHint {
+    HomeTransferSource {
+        workspace_id: Uuid,
+        preparation_id: Uuid,
+        request_digest: String,
+    },
+    HomeTransferReservationRetirement {
+        scope: crate::ops::ScopeDto,
+        issuer: Uuid,
+        backend_id: Uuid,
+        destination_id: Uuid,
+        preparation_id: Uuid,
+        reservation_request_id: Uuid,
+        request_digest: String,
+    },
+    EvaluationEvidence {
+        workspace_id: Uuid,
+        identity: EvaluationEvidenceReadbackIdentity,
+    },
     AgentOperationsFreeze {
         workspace_id: Uuid,
         migration_id: Uuid,
@@ -298,6 +316,40 @@ pub enum ReadbackHint {
     },
 }
 
+/// Closed transport identity mirroring the native evaluation mutation cases.
+/// It intentionally carries identity only; an absent T1 cut does not certify
+/// that a closure attempt had no durable clock-health effect.
+#[must_use]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EvaluationEvidenceReadbackIdentity {
+    Manifest {
+        manifest_id: Uuid,
+        revision: i64,
+        digest: String,
+    },
+    Submission {
+        assignment_id: Uuid,
+        submitted_revision: i64,
+    },
+    Review {
+        assignment_id: Uuid,
+        submitted_revision: i64,
+        review_revision: i64,
+    },
+    T1Closure {
+        cut_id: Uuid,
+        manifest_id: Uuid,
+        manifest_revision: i64,
+        manifest_digest: String,
+        deadline_ms: i64,
+    },
+    ReviewCut {
+        review_cut_id: Uuid,
+        t1_cut_id: Uuid,
+    },
+}
+
 /// Closed principal identity in immutable recovery readback guidance.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -364,6 +416,84 @@ pub struct ActivityLeaseReadbackKey {
 }
 
 impl ReadbackHint {
+    pub fn home_transfer_reservation_retirement(
+        command: &forge_control::HomeTransferSourceCommand,
+        request: &forge_domain::HomeTransferReservationRetirementRequest,
+    ) -> Option<Self> {
+        let scope = &command.scope;
+        let locator = scope.locator();
+        let relative_root = locator.relative_root().to_str()?.to_owned();
+        Some(Self::HomeTransferReservationRetirement {
+            scope: crate::ops::ScopeDto {
+                workspace_id: scope.workspace_id().into_uuid(),
+                workspace_revision: scope.workspace_revision().get(),
+                locator: crate::ops::LocatorDto {
+                    location_id: locator.location_id().into_uuid(),
+                    expected_revision: locator.expected_revision().get(),
+                    relative_root,
+                },
+            },
+            issuer: command.service.issuer.into_uuid(),
+            backend_id: command.service.backend_id.into_uuid(),
+            destination_id: command.service.destination_id,
+            preparation_id: request.preparation_id(),
+            reservation_request_id: request.reservation_request_id(),
+            request_digest: hex_digest(request.request_digest().as_bytes()),
+        })
+    }
+
+    pub fn evaluation_evidence(
+        workspace_id: Uuid,
+        identity: &forge_persistence::EvaluationEvidenceMutationIdentity,
+    ) -> Self {
+        use forge_persistence::EvaluationEvidenceMutationIdentity as Identity;
+        let identity = match identity {
+            Identity::Manifest {
+                manifest_id,
+                revision,
+                digest,
+            } => EvaluationEvidenceReadbackIdentity::Manifest {
+                manifest_id: manifest_id.into_uuid(),
+                revision: revision.get(),
+                digest: hex_digest(digest.as_bytes()),
+            },
+            Identity::Submission {
+                assignment_id,
+                submitted_revision,
+            } => EvaluationEvidenceReadbackIdentity::Submission {
+                assignment_id: assignment_id.into_uuid(),
+                submitted_revision: submitted_revision.get(),
+            },
+            Identity::Review {
+                assignment_id,
+                submitted_revision,
+                review_revision,
+            } => EvaluationEvidenceReadbackIdentity::Review {
+                assignment_id: assignment_id.into_uuid(),
+                submitted_revision: submitted_revision.get(),
+                review_revision: review_revision.get(),
+            },
+            Identity::T1Closure { request } => EvaluationEvidenceReadbackIdentity::T1Closure {
+                cut_id: request.cut_id().into_uuid(),
+                manifest_id: request.manifest_id().into_uuid(),
+                manifest_revision: request.manifest_revision().get(),
+                manifest_digest: hex_digest(request.manifest_digest().as_bytes()),
+                deadline_ms: request.deadline().get(),
+            },
+            Identity::ReviewCut {
+                review_cut_id,
+                t1_cut_id,
+            } => EvaluationEvidenceReadbackIdentity::ReviewCut {
+                review_cut_id: review_cut_id.into_uuid(),
+                t1_cut_id: t1_cut_id.into_uuid(),
+            },
+        };
+        Self::EvaluationEvidence {
+            workspace_id,
+            identity,
+        }
+    }
+
     pub fn goal_deletion(request: forge_domain::GoalDeletionRequest) -> Self {
         Self::GoalDeletion {
             workspace_id: request.workspace_id().into_uuid(),
@@ -396,6 +526,15 @@ impl ReadbackHint {
     pub const fn writer_lease(writer_lease_id: Uuid) -> Self {
         Self::WriterLease { writer_lease_id }
     }
+}
+
+fn hex_digest(bytes: &[u8; 32]) -> String {
+    use std::fmt::Write as _;
+    let mut output = String::with_capacity(64);
+    for byte in bytes {
+        let _ignored = write!(output, "{byte:02x}");
+    }
+    output
 }
 
 /// Closed wire representation of the original deletion target.
@@ -560,6 +699,7 @@ impl ForgeError {
             | ControlErrorCode::GoalEvidenceConflict
             | ControlErrorCode::AgentDagPlanConflict
             | ControlErrorCode::AgentDagReplayConflict
+            | ControlErrorCode::HomeTransferFenced
             | ControlErrorCode::CoordinatorNotFound
             | ControlErrorCode::CoordinatorConflict => ErrorCode::PlanningConflict,
             ControlErrorCode::ProjectionResyncRequired => ErrorCode::ResyncRequired,
@@ -806,6 +946,108 @@ mod tests {
         assert_eq!(wire["readback"]["workspace_id"], workspace_id.to_string());
         assert_eq!(wire["readback"]["approval_id"], approval_id.to_string());
         assert_eq!(wire["readback"]["grant_id"], grant_id.to_string());
+        Ok(())
+    }
+
+    #[test]
+    fn evaluation_t1_readback_keeps_frozen_manifest_and_deadline()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let workspace_id = Uuid::from_u128(0x101);
+        let identity = forge_persistence::EvaluationEvidenceMutationIdentity::T1Closure {
+            request: forge_domain::EvaluationT1CloseRequest::new(
+                forge_domain::EvaluationCutId::new(Uuid::from_u128(0x102))?,
+                forge_domain::EvaluationManifestId::new(Uuid::from_u128(0x103))?,
+                forge_domain::EvaluationRevision::new(4)?,
+                forge_domain::EvaluationDigest::new([0x44; 32])?,
+                forge_domain::TimestampMillis::new(900)?,
+            ),
+        };
+        let error = ForgeError::unknown_outcome(Some(ReadbackHint::evaluation_evidence(
+            workspace_id,
+            &identity,
+        )));
+        let wire = serde_json::to_value(&error)?;
+        assert_eq!(wire["readback"]["kind"], "evaluation_evidence");
+        assert_eq!(wire["readback"]["workspace_id"], workspace_id.to_string());
+        assert_eq!(wire["readback"]["identity"]["kind"], "t1_closure");
+        assert_eq!(
+            wire["readback"]["identity"]["cut_id"],
+            Uuid::from_u128(0x102).to_string()
+        );
+        assert_eq!(
+            wire["readback"]["identity"]["manifest_id"],
+            Uuid::from_u128(0x103).to_string()
+        );
+        assert_eq!(wire["readback"]["identity"]["manifest_revision"], 4);
+        assert_eq!(
+            wire["readback"]["identity"]["manifest_digest"],
+            "44".repeat(32)
+        );
+        assert_eq!(wire["readback"]["identity"]["deadline_ms"], 900);
+        assert!(wire["readback"]["no_effect"].is_null());
+        Ok(())
+    }
+
+    #[test]
+    fn retirement_unknown_outcome_carries_exact_get_scope_service_and_identity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let workspace_id = Uuid::from_u128(0x201);
+        let location_id = Uuid::from_u128(0x202);
+        let preparation_id = Uuid::from_u128(0x203);
+        let reservation_request_id = Uuid::from_u128(0x204);
+        let backend_id = Uuid::from_u128(0x205);
+        let destination_id = Uuid::from_u128(0x206);
+        let issuer = Uuid::from_u128(0x207);
+        let hint = ReadbackHint::HomeTransferReservationRetirement {
+            scope: crate::ops::ScopeDto {
+                workspace_id,
+                workspace_revision: 9,
+                locator: crate::ops::LocatorDto {
+                    location_id,
+                    expected_revision: 3,
+                    relative_root: ".".to_owned(),
+                },
+            },
+            issuer,
+            backend_id,
+            destination_id,
+            preparation_id,
+            reservation_request_id,
+            request_digest: "a5".repeat(32),
+        };
+        let wire = serde_json::to_value(ForgeError::unknown_outcome(Some(hint)))?;
+        assert_eq!(wire["code"], "UNKNOWN_OUTCOME");
+        assert_eq!(
+            wire["readback"]["kind"],
+            "home_transfer_reservation_retirement"
+        );
+        assert_eq!(
+            wire["readback"]["scope"]["workspace_id"],
+            workspace_id.to_string()
+        );
+        assert_eq!(wire["readback"]["scope"]["workspace_revision"], 9);
+        assert_eq!(
+            wire["readback"]["scope"]["locator"]["location_id"],
+            location_id.to_string()
+        );
+        assert_eq!(wire["readback"]["scope"]["locator"]["expected_revision"], 3);
+        assert_eq!(wire["readback"]["scope"]["locator"]["relative_root"], ".");
+        assert_eq!(wire["readback"]["issuer"], issuer.to_string());
+        assert_eq!(wire["readback"]["backend_id"], backend_id.to_string());
+        assert_eq!(
+            wire["readback"]["destination_id"],
+            destination_id.to_string()
+        );
+        assert_eq!(
+            wire["readback"]["preparation_id"],
+            preparation_id.to_string()
+        );
+        assert_eq!(
+            wire["readback"]["reservation_request_id"],
+            reservation_request_id.to_string()
+        );
+        assert_eq!(wire["readback"]["request_digest"], "a5".repeat(32));
+        assert!(wire["readback"].get("bearer").is_none());
         Ok(())
     }
 }

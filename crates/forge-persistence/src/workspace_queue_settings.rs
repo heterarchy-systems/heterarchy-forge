@@ -397,7 +397,8 @@ mod tests {
 
     fn drop_recovery_and_stop_fixture_tables(
         connection: &Connection,
-    ) -> Result<(), rusqlite::Error> {
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        crate::evaluation_schema_fixture::remove_empty_evaluation_schema(connection)?;
         connection.execute_batch(
             "DROP TABLE IF EXISTS unstarted_activity_continuation_receipts;
              DROP TRIGGER IF EXISTS agent_binding_activations_block_rejection;
@@ -419,7 +420,8 @@ mod tests {
              DROP TABLE authority_stop_batches;
              DROP TABLE workspace_execution_stop_targets;
              DROP TABLE workspace_execution_stops;",
-        )
+        )?;
+        Ok(())
     }
 
     #[test]
@@ -563,6 +565,9 @@ mod tests {
         let database = layout.database_path();
         let connection = Connection::open(&database)?;
         connection.pragma_update(None, "journal_mode", "DELETE")?;
+        crate::evaluation_schema_fixture::remove_empty_home_reservation_retirement_schema_objects(
+            &connection,
+        )?;
         for (kind, name) in crate::workspace_effect_fact_outbox::base_schema_objects()
             .into_iter()
             .chain(crate::workspace_effect_fact_outbox::change_set_schema_objects())
@@ -626,6 +631,7 @@ mod tests {
         {
             connection.execute_batch(&format!("DROP {kind} {name}"))?;
         }
+        drop_recovery_and_stop_fixture_tables(&connection)?;
         connection.execute_batch(
             "DROP TABLE workspace_queue_settings;
             DROP TRIGGER agent_assignment_offer_seals_no_delete;
@@ -636,7 +642,6 @@ mod tests {
             DROP TABLE goal_deletion_cleanup_journal;",
         )?;
         crate::workspace_approvals::rebuild_v55_auto_scopes_fixture(&connection)?;
-        drop_recovery_and_stop_fixture_tables(&connection)?;
         connection.pragma_update(None, "user_version", 32_i64)?;
         drop(connection);
         for suffix in ["-wal", "-shm"] {

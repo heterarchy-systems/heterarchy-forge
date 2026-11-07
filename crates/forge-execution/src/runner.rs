@@ -1158,6 +1158,19 @@ fn supervise(
             )),
         },
     };
+    if let Err(error) = &result {
+        let (detail, errno) = error.native_failure_diagnostic();
+        // Diagnostics are best-effort: a closed stderr must not replace the
+        // original completion or prevent its delivery to the supervisor.
+        let _diagnostic = writeln!(
+            std::io::stderr(),
+            "forge execution_id={} stage=completion code={:?} detail={detail} errno={errno:?} process={:?} runtime={:?}",
+            prepared.request.id(),
+            error.failure_code(),
+            prepared.process_finalization,
+            prepared.rust_ci_runtime_finalization,
+        );
+    }
     ExecutionCompletion {
         result,
         process_finalization: prepared.process_finalization,
@@ -1811,7 +1824,7 @@ fn terminate(
     let deadline = Instant::now() + TERMINATION_GRACE;
     while Instant::now() < deadline {
         if let Some(status) = child.try_wait().map_err(ExecutionError::WaitProcess)? {
-            signal_group(pid, Signal::KILL)?;
+            cleanup_process_group(pid)?;
             return Ok((status, completion));
         }
         thread::sleep(POLL_INTERVAL);
@@ -1822,20 +1835,73 @@ fn terminate(
 }
 
 fn cleanup_process_group(pid: Pid) -> Result<(), ExecutionError> {
-    match test_kill_process_group(pid) {
-        Ok(()) => signal_group(pid, Signal::KILL)?,
-        Err(source) if source == Errno::SRCH => return Ok(()),
-        Err(source) => return Err(ExecutionError::SignalProcessGroup(source)),
-    }
-    let deadline = Instant::now() + GROUP_REAP_GRACE;
-    while Instant::now() < deadline {
-        match test_kill_process_group(pid) {
-            Err(source) if source == Errno::SRCH => return Ok(()),
-            Ok(()) => thread::sleep(POLL_INTERVAL),
-            Err(source) => return Err(ExecutionError::SignalProcessGroup(source)),
+    cleanup_process_group_with(
+        || test_kill_process_group(pid),
+        || kill_process_group(pid, Signal::KILL),
+        Instant::now,
+        thread::sleep,
+    )
+}
+
+fn cleanup_process_group_with(
+    mut probe: impl FnMut() -> Result<(), Errno>,
+    mut send_kill: impl FnMut() -> Result<(), Errno>,
+    mut now: impl FnMut() -> Instant,
+    mut sleep: impl FnMut(Duration),
+) -> Result<(), ExecutionError> {
+    let deadline = now() + GROUP_REAP_GRACE;
+    let mut initial_probe = true;
+    let mut kill_sent = false;
+    let mut last_was_permission_denied = false;
+
+    loop {
+        if !initial_probe && now() >= deadline {
+            return Err(if last_was_permission_denied {
+                ExecutionError::SignalProcessGroup(Errno::PERM)
+            } else {
+                ExecutionError::ProcessGroupSurvived
+            });
         }
+        initial_probe = false;
+
+        match probe() {
+            Err(source) if source == Errno::SRCH => return Ok(()),
+            Err(source) if source == Errno::PERM => {
+                // Darwin can report EPERM while a group contains only zombies.
+                // Keep it unconfirmed until ESRCH, using this same deadline.
+                last_was_permission_denied = true;
+            }
+            Err(source) => return Err(ExecutionError::SignalProcessGroup(source)),
+            Ok(()) => {
+                last_was_permission_denied = false;
+                if !kill_sent {
+                    if now() >= deadline {
+                        return Err(ExecutionError::ProcessGroupSurvived);
+                    }
+                    match send_kill() {
+                        Ok(()) => kill_sent = true,
+                        Err(source) if source == Errno::SRCH => return Ok(()),
+                        Err(source) if source == Errno::PERM => {
+                            last_was_permission_denied = true;
+                        }
+                        Err(source) => {
+                            return Err(ExecutionError::SignalProcessGroup(source));
+                        }
+                    }
+                }
+            }
+        }
+
+        let remaining = deadline.saturating_duration_since(now());
+        if remaining.is_zero() {
+            return Err(if last_was_permission_denied {
+                ExecutionError::SignalProcessGroup(Errno::PERM)
+            } else {
+                ExecutionError::ProcessGroupSurvived
+            });
+        }
+        sleep(POLL_INTERVAL.min(remaining));
     }
-    Err(ExecutionError::ProcessGroupSurvived)
 }
 
 fn signal_group(pid: Pid, signal: Signal) -> Result<(), ExecutionError> {
@@ -1925,6 +1991,33 @@ pub enum ExecutionError {
 }
 
 impl ExecutionError {
+    // Only static categories and numeric OS errors cross this logging boundary.
+    // Error source strings may contain paths, scripts or other request payloads.
+    fn native_failure_diagnostic(&self) -> (&'static str, Option<i32>) {
+        match self {
+            Self::WaitProcess(source) => ("wait_process", source.raw_os_error()),
+            Self::SignalProcessGroup(source) => {
+                ("signal_process_group", Some(source.raw_os_error()))
+            }
+            Self::ProcessGroupSurvived => ("process_group_survived", None),
+            Self::SpawnOutputReader(source) => ("spawn_output_reader", source.raw_os_error()),
+            Self::ConfigureOutputPipe(source) => {
+                ("configure_output_pipe", Some(source.raw_os_error()))
+            }
+            Self::WriteStdin(source) => ("write_stdin", source.raw_os_error()),
+            Self::ReadOutput(source) => ("read_output", source.raw_os_error()),
+            Self::MissingPipe => ("missing_pipe", None),
+            Self::OutputLimitOverflow => ("output_limit_overflow", None),
+            Self::OutputSequence(_) => ("output_sequence", None),
+            Self::OutputChunk(_) => ("output_chunk", None),
+            Self::OutputGap(_) => ("output_gap", None),
+            Self::OutputReaderPanicked => ("output_reader_panicked", None),
+            Self::SupervisorPanicked => ("supervisor_panicked", None),
+            Self::SupervisorClosed => ("supervisor_closed", None),
+            _ => ("other", None),
+        }
+    }
+
     pub const fn failure_code(&self) -> ExecutionFailureCode {
         match self {
             Self::InvalidConcurrency { .. }
@@ -1992,7 +2085,8 @@ impl ExecutionError {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::cell::Cell;
+    use std::collections::{BTreeMap, VecDeque};
     use std::ffi::OsString;
     use std::io;
     use std::net::{TcpListener, TcpStream};
@@ -2043,6 +2137,143 @@ mod tests {
         assert!(!ProcessFinalization::NoChildSpawned.requires_rust_ci_quarantine());
         assert!(!ProcessFinalization::ProcessGroupReaped.requires_rust_ci_quarantine());
         assert!(ProcessFinalization::ReapUnconfirmed.requires_rust_ci_quarantine());
+    }
+
+    fn run_process_group_cleanup_script(
+        probes: Vec<Result<(), Errno>>,
+        kills: Vec<Result<(), Errno>>,
+    ) -> (Result<(), ExecutionError>, usize, usize, Duration) {
+        let mut probes = VecDeque::from(probes);
+        let mut kills = VecDeque::from(kills);
+        let mut last_probe = Err(Errno::PERM);
+        let mut last_kill = Err(Errno::IO);
+        let probe_count = Cell::new(0);
+        let kill_count = Cell::new(0);
+        let start = Instant::now();
+        let elapsed = Cell::new(Duration::ZERO);
+
+        let result = cleanup_process_group_with(
+            || {
+                probe_count.set(probe_count.get() + 1);
+                let result = probes.pop_front().unwrap_or(last_probe);
+                last_probe = result;
+                result
+            },
+            || {
+                kill_count.set(kill_count.get() + 1);
+                let result = kills.pop_front().unwrap_or(last_kill);
+                last_kill = result;
+                result
+            },
+            || start + elapsed.get(),
+            |duration| elapsed.set(elapsed.get() + duration),
+        );
+
+        (result, probe_count.get(), kill_count.get(), elapsed.get())
+    }
+
+    #[test]
+    fn process_group_cleanup_reprobes_permission_denial_until_absence() {
+        let (probe_denial, probe_count, kill_count, elapsed) =
+            run_process_group_cleanup_script(vec![Err(Errno::PERM), Err(Errno::SRCH)], Vec::new());
+        assert!(probe_denial.is_ok());
+        assert_eq!(probe_count, 2);
+        assert_eq!(kill_count, 0);
+        assert_eq!(elapsed, POLL_INTERVAL);
+
+        let (kill_denial, probe_count, kill_count, elapsed) = run_process_group_cleanup_script(
+            vec![Ok(()), Err(Errno::PERM), Err(Errno::SRCH)],
+            vec![Err(Errno::PERM)],
+        );
+        assert!(kill_denial.is_ok());
+        assert_eq!(probe_count, 3);
+        assert_eq!(kill_count, 1);
+        assert_eq!(elapsed, POLL_INTERVAL * 2);
+
+        let (absent_at_kill, probe_count, kill_count, elapsed) =
+            run_process_group_cleanup_script(vec![Ok(())], vec![Err(Errno::SRCH)]);
+        assert!(absent_at_kill.is_ok());
+        assert_eq!(probe_count, 1);
+        assert_eq!(kill_count, 1);
+        assert!(elapsed.is_zero());
+    }
+
+    #[test]
+    fn process_group_cleanup_keeps_persistent_denial_and_live_groups_unconfirmed() {
+        let (permission_denied, probe_count, kill_count, elapsed) =
+            run_process_group_cleanup_script(vec![Err(Errno::PERM)], Vec::new());
+        assert!(matches!(
+            permission_denied,
+            Err(ExecutionError::SignalProcessGroup(source)) if source == Errno::PERM
+        ));
+        assert_eq!(probe_count, 25);
+        assert_eq!(kill_count, 0);
+        assert_eq!(elapsed, GROUP_REAP_GRACE);
+
+        let (kill_denied, probe_count, kill_count, elapsed) =
+            run_process_group_cleanup_script(vec![Ok(())], vec![Err(Errno::PERM)]);
+        assert!(matches!(
+            kill_denied,
+            Err(ExecutionError::SignalProcessGroup(source)) if source == Errno::PERM
+        ));
+        assert_eq!(probe_count, 25);
+        assert_eq!(kill_count, 25);
+        assert_eq!(elapsed, GROUP_REAP_GRACE);
+
+        let (still_live, probe_count, kill_count, elapsed) =
+            run_process_group_cleanup_script(vec![Ok(())], vec![Ok(())]);
+        assert!(matches!(
+            still_live,
+            Err(ExecutionError::ProcessGroupSurvived)
+        ));
+        assert_eq!(probe_count, 25);
+        assert_eq!(kill_count, 1);
+        assert_eq!(elapsed, GROUP_REAP_GRACE);
+    }
+
+    #[test]
+    fn process_group_cleanup_does_not_signal_after_probe_budget_expires() {
+        let start = Instant::now();
+        let elapsed = Cell::new(Duration::ZERO);
+        let kill_count = Cell::new(0);
+        let result = cleanup_process_group_with(
+            || {
+                elapsed.set(GROUP_REAP_GRACE);
+                Ok(())
+            },
+            || {
+                kill_count.set(kill_count.get() + 1);
+                Ok(())
+            },
+            || start + elapsed.get(),
+            |duration| elapsed.set(elapsed.get() + duration),
+        );
+        assert!(matches!(result, Err(ExecutionError::ProcessGroupSurvived)));
+        assert_eq!(kill_count.get(), 0);
+        assert_eq!(elapsed.get(), GROUP_REAP_GRACE);
+    }
+
+    #[test]
+    fn process_group_cleanup_propagates_other_errors_immediately() {
+        let (probe_error, probe_count, kill_count, elapsed) =
+            run_process_group_cleanup_script(vec![Err(Errno::IO)], Vec::new());
+        assert!(matches!(
+            probe_error,
+            Err(ExecutionError::SignalProcessGroup(source)) if source == Errno::IO
+        ));
+        assert_eq!(probe_count, 1);
+        assert_eq!(kill_count, 0);
+        assert!(elapsed.is_zero());
+
+        let (kill_error, probe_count, kill_count, elapsed) =
+            run_process_group_cleanup_script(vec![Ok(())], vec![Err(Errno::IO)]);
+        assert!(matches!(
+            kill_error,
+            Err(ExecutionError::SignalProcessGroup(source)) if source == Errno::IO
+        ));
+        assert_eq!(probe_count, 1);
+        assert_eq!(kill_count, 1);
+        assert!(elapsed.is_zero());
     }
 
     #[test]

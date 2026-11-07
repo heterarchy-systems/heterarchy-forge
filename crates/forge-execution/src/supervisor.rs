@@ -1942,6 +1942,8 @@ pub enum ExecutionSupervisorError {
 
 #[cfg(test)]
 mod tests {
+    mod concurrency;
+
     use std::ffi::OsString;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -1987,11 +1989,20 @@ mod tests {
     fn package_fixture()
     -> Result<(PathBuf, ExistingWorkspaceStateLayout), Box<dyn std::error::Error>> {
         let serial = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
-        let root = PathBuf::from("/private/tmp").join(format!(
+        let configured = std::env::var_os("TMPDIR").ok_or("TMPDIR must be configured")?;
+        let configured = PathBuf::from(configured);
+        if !configured.is_absolute() {
+            return Err("TMPDIR must be absolute".into());
+        }
+        let canonical = fs::canonicalize(&configured)?;
+        if canonical != configured || !canonical.is_dir() {
+            return Err("TMPDIR must be an existing canonical directory".into());
+        }
+        let root = canonical.join(format!(
             "forge-execution-supervisor-package-{}-{serial}",
             std::process::id()
         ));
-        fs::create_dir_all(&root)?;
+        fs::create_dir(&root)?;
         WorkspaceStateLayout::initialize(&root)?;
         let layout = WorkspaceStateLayout::inspect_existing(&root)?.ok_or("layout missing")?;
         fs::write(layout.workspace_root().join(PACKAGE_V_MANIFEST_NAME), b"{}")?;

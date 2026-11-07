@@ -31,6 +31,10 @@ const RESERVATIONS_TABLE_SQL: &str = "CREATE TABLE agent_binding_reservations (r
 /// reservation.
 #[derive(Debug, Error)]
 pub enum AgentBindingReservationError {
+    #[error(transparent)]
+    WorkCut(#[from] Box<crate::WorkCutError>),
+    #[error(transparent)]
+    Retirement(#[from] Box<crate::HomeTransferStoreError>),
     #[error("Agent binding reservation request identity is nil")]
     InvalidRequestId,
     #[error("Agent binding reservation Activity identity is nil")]
@@ -316,34 +320,7 @@ pub(crate) fn reserve(
         ));
     }
 
-    if exists_agent_id(&transaction, request.agent_id())? {
-        return Err(AgentBindingReservationError::AgentIdConflict(
-            request.agent_id(),
-        ));
-    }
-    if exists_activity_session(&transaction, request.activity_id(), request.session_id())? {
-        return Err(AgentBindingReservationError::ActivitySessionConflict {
-            activity_id: request.activity_id(),
-            session_id: request.session_id(),
-        });
-    }
-    if let Some(existing_request_id) =
-        load_reservation_request_for_agent(&transaction, request.agent_id())?
-    {
-        return Err(AgentBindingReservationError::ReservationConflict(
-            existing_request_id,
-        ));
-    }
-    if let Some(existing_request_id) = load_reservation_request_for_activity_session(
-        &transaction,
-        current.migration_id(),
-        request.activity_id(),
-        request.session_id(),
-    )? {
-        return Err(AgentBindingReservationError::ReservationConflict(
-            existing_request_id,
-        ));
-    }
+    ensure_fresh_reservation_identity_available(&transaction, &current, request)?;
 
     let freeze_revision = i64::try_from(current.revision())
         .map_err(|_| AgentBindingReservationError::CorruptRecord("freeze_revision"))?;
@@ -380,6 +357,58 @@ pub(crate) fn reserve(
             source,
         })?;
     Ok(result)
+}
+
+fn ensure_fresh_reservation_identity_available(
+    connection: &Connection,
+    freeze: &AgentOperationsFreeze,
+    request: &AgentBindingReservationRequest,
+) -> Result<(), AgentBindingReservationError> {
+    crate::workspace_work_cuts::guards::ensure_session_binding_open(
+        connection,
+        freeze.workspace_id(),
+        request.session_id(),
+    )
+    .map_err(|error| AgentBindingReservationError::WorkCut(Box::new(error)))?;
+
+    crate::workspace_home_transfers::retirements::ensure_binding_identity_open(
+        connection,
+        freeze.workspace_id(),
+        request.activity_id(),
+        request.agent_id(),
+        Some(request.session_id()),
+    )
+    .map_err(|error| AgentBindingReservationError::Retirement(Box::new(error)))?;
+
+    if exists_agent_id(connection, request.agent_id())? {
+        return Err(AgentBindingReservationError::AgentIdConflict(
+            request.agent_id(),
+        ));
+    }
+    if exists_activity_session(connection, request.activity_id(), request.session_id())? {
+        return Err(AgentBindingReservationError::ActivitySessionConflict {
+            activity_id: request.activity_id(),
+            session_id: request.session_id(),
+        });
+    }
+    if let Some(existing_request_id) =
+        load_reservation_request_for_agent(connection, request.agent_id())?
+    {
+        return Err(AgentBindingReservationError::ReservationConflict(
+            existing_request_id,
+        ));
+    }
+    if let Some(existing_request_id) = load_reservation_request_for_activity_session(
+        connection,
+        freeze.migration_id(),
+        request.activity_id(),
+        request.session_id(),
+    )? {
+        return Err(AgentBindingReservationError::ReservationConflict(
+            existing_request_id,
+        ));
+    }
+    Ok(())
 }
 
 /// Read one reservation by its stable request identity. Reservations remain

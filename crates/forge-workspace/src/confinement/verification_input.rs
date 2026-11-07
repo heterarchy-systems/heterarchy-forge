@@ -1,8 +1,9 @@
 //! Descriptor-confined frozen source inputs for verification runs.
 //!
 //! Verification inputs are ephemeral Workspace artifacts.  The live source
-//! tree is only read through descriptors; the copied tree is sealed before it
-//! can be published and no `SQLite` state is involved in this boundary.
+//! tree is only read through descriptors; copied source and manifest stay sealed.
+//! On macOS the enclosing directory is resealed after atomic rename and before
+//! a validated published handle can be returned. No `SQLite` state is involved.
 
 #[cfg(test)]
 mod tests;
@@ -16,6 +17,7 @@ use std::os::fd::OwnedFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use base64::Engine as _;
@@ -80,9 +82,24 @@ pub(super) enum VerificationInputCleanupFault {
     AfterManifestUnlink,
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VerificationInputPublishFault {
+    AfterRenameSync,
+    #[cfg(target_os = "macos")]
+    Reseal,
+}
+
 /// Failure from the frozen verification-input boundary.
 #[derive(Debug, Error)]
 pub enum VerificationInputError {
+    #[error("verification input publication requires exact readback")]
+    PublicationUnconfirmed {
+        id: VerificationInputId,
+        fingerprint: VerificationInputFingerprint,
+        #[source]
+        source: Box<VerificationInputError>,
+    },
     #[error("verification input operation was cancelled")]
     Cancelled,
     #[error(transparent)]
@@ -265,6 +282,9 @@ pub struct StagedVerificationInput {
     state_identity: super::DirectoryIdentity,
     workspace_root: PathBuf,
     pending_name: OsString,
+    publication_uncertain: Mutex<bool>,
+    #[cfg(test)]
+    publish_fault: Option<VerificationInputPublishFault>,
 }
 
 impl std::fmt::Debug for StagedVerificationInput {
@@ -287,27 +307,79 @@ impl StagedVerificationInput {
         &self.manifest
     }
 
-    /// Publish the exclusively-created pending directory with no replacement.
+    /// Publish with no replacement and validate the complete sealed artifact.
+    ///
+    /// After `PublicationUnconfirmed`, use exact ID/fingerprint readback; this
+    /// stage cannot retry publication or repair a partially sealed artifact.
     pub fn publish(&self) -> Result<PublishedVerificationInput, VerificationInputError> {
+        // Serialize before validation: a second publisher must never thaw an
+        // inode that the first publisher has already returned to a consumer.
+        let mut uncertain = self
+            .publication_uncertain
+            .lock()
+            .map_err(|_| self.publication_unconfirmed(VerificationInputError::SnapshotInvalid))?;
+        if *uncertain {
+            return Err(self.publication_unconfirmed(VerificationInputError::SnapshotStale));
+        }
+        let result = self.publish_once();
+        if matches!(
+            &result,
+            Err(VerificationInputError::PublicationUnconfirmed { .. })
+        ) {
+            *uncertain = true;
+        }
+        result
+    }
+
+    fn publish_once(&self) -> Result<PublishedVerificationInput, VerificationInputError> {
         validate_stage(self)?;
         if open_directory_entry(&self.artifacts, &final_name(self.id))?.is_some() {
             return Err(VerificationInputError::Collision);
         }
-        match renameat_with(
+        self.rename_pending_entry()?;
+        self.finish_publication()
+            .map_err(|source| self.publication_unconfirmed(source))
+    }
+
+    fn rename_pending_entry(&self) -> Result<(), VerificationInputError> {
+        // macOS 15 rejects renaming a read-only directory. Only the private
+        // container gets owner-write; source and manifest remain sealed.
+        #[cfg(target_os = "macos")]
+        fchmod(&self.pending, sealed_mode(0o755) | Mode::WUSR)
+            .map_err(|source| fs_error(FilesystemOperation::SetTemporaryMode, source))?;
+        let rename = renameat_with(
             &self.artifacts,
             &self.pending_name,
             &self.artifacts,
             final_name(self.id),
             RenameFlags::NOREPLACE,
-        ) {
-            Ok(()) => {}
-            Err(Errno::EXIST) => return Err(VerificationInputError::Collision),
+        );
+        #[cfg(target_os = "macos")]
+        {
+            #[cfg(test)]
+            if self.publish_fault == Some(VerificationInputPublishFault::Reseal) {
+                return Err(self.publication_unconfirmed(VerificationInputError::SnapshotInvalid));
+            }
+            // Restore the same owned inode even when rename failed. A failed
+            // restore is uncertain even if the rename reported a collision.
+            seal_directory(&self.pending, 0o755)
+                .and_then(|()| sync_directory_fd(&self.pending))
+                .map_err(|source| self.publication_unconfirmed(source))?;
+        }
+        match rename {
+            Ok(()) => Ok(()),
+            Err(Errno::EXIST) => Err(VerificationInputError::Collision),
             Err(source) if [Errno::NOTSUP, Errno::OPNOTSUPP, Errno::NOSYS].contains(&source) => {
-                return Err(VerificationInputError::AtomicPublishUnsupported);
+                Err(VerificationInputError::AtomicPublishUnsupported)
             }
-            Err(source) => {
-                return Err(fs_error(FilesystemOperation::PublishTemporary, source));
-            }
+            Err(source) => Err(fs_error(FilesystemOperation::PublishTemporary, source)),
+        }
+    }
+
+    fn finish_publication(&self) -> Result<PublishedVerificationInput, VerificationInputError> {
+        #[cfg(test)]
+        if self.publish_fault == Some(VerificationInputPublishFault::AfterRenameSync) {
+            return Err(fs_error(FilesystemOperation::SyncParent, Errno::IO));
         }
         fsync(&self.artifacts)
             .map_err(|source| fs_error(FilesystemOperation::SyncParent, source))?;
@@ -331,6 +403,14 @@ impl StagedVerificationInput {
         })?;
         published.validate()?;
         Ok(published)
+    }
+
+    fn publication_unconfirmed(&self, source: VerificationInputError) -> VerificationInputError {
+        VerificationInputError::PublicationUnconfirmed {
+            id: self.id,
+            fingerprint: self.manifest.fingerprint(),
+            source: Box::new(source),
+        }
     }
 
     /// Abandon only the pending directory created by this stage.
@@ -830,6 +910,9 @@ fn stage_capture(
         state_identity: workspace.state_identity,
         workspace_root: workspace.workspace_root.clone(),
         pending_name,
+        publication_uncertain: Mutex::new(false),
+        #[cfg(test)]
+        publish_fault: None,
     })
 }
 

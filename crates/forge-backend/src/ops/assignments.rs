@@ -7,12 +7,13 @@
 
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::error::Error;
 use uuid::Uuid;
 
 use forge_control::{ForgeControlClient, ResolvedWorkspaceScope};
 use forge_domain::{ActivityId, AgentAssignmentId, AgentInstanceId, AgentSessionId};
 
-use crate::error::ForgeError;
+use crate::error::{ErrorCode, ForgeError, ReadbackHint};
 
 use super::{
     Command, ParseResult, PrincipalDto, ScopeDto, decode_principal, decode_scope, decode_timestamp,
@@ -321,14 +322,99 @@ fn revision_for(value: i64) -> Result<forge_domain::AgentAssignmentRevision, For
 
 pub(super) fn execute_agent_assignment_mutate(
     client: &ForgeControlClient,
+    backend_id: forge_domain::ForgeBackendId,
+    destination_id: Uuid,
     request: forge_control::AgentAssignmentMutationRequest,
 ) -> Result<Value, ForgeError> {
-    let assignment = client
-        .agent_assignment_mutate(request)
-        .map_err(|error| super::forge_error_of_client(&error))?;
+    let source_readback = readback_hint(&request);
+    let workspace_id = request.scope.workspace_id().into_uuid();
+    let requires_source_clock = matches!(
+        &request.mutation,
+        forge_control::AgentAssignmentMutation::Submit(_)
+            | forge_control::AgentAssignmentMutation::Accept(_)
+            | forge_control::AgentAssignmentMutation::Reject(_)
+    );
+    let result = if requires_source_clock {
+        client
+            .agent_assignment_mutate_with_source_clock(
+                request,
+                forge_control::EvaluationEvidenceService::new(backend_id, destination_id),
+            )
+            .map_err(|error| source_mutation_error(&error, workspace_id, source_readback))?
+    } else {
+        client
+            .agent_assignment_mutate(request)
+            .map_err(|error| super::forge_error_of_client(&error))?
+    };
     Ok(json!({
-        "assignment": assignment_record_json(&assignment),
+        "assignment": assignment_record_json(&result),
     }))
+}
+
+pub(super) fn readback_hint(
+    request: &forge_control::AgentAssignmentMutationRequest,
+) -> Option<ReadbackHint> {
+    let identity = match &request.mutation {
+        forge_control::AgentAssignmentMutation::Submit(command) => {
+            let submitted_revision = command.expected_revision().get().checked_add(1)?;
+            crate::error::EvaluationEvidenceReadbackIdentity::Submission {
+                assignment_id: command.assignment_id().into_uuid(),
+                submitted_revision,
+            }
+        }
+        forge_control::AgentAssignmentMutation::Accept(command)
+        | forge_control::AgentAssignmentMutation::Reject(command) => {
+            let review_revision = command.expected_revision().get().checked_add(1)?;
+            crate::error::EvaluationEvidenceReadbackIdentity::Review {
+                assignment_id: command.assignment_id().into_uuid(),
+                submitted_revision: command.expected_revision().get(),
+                review_revision,
+            }
+        }
+        forge_control::AgentAssignmentMutation::Offer(_)
+        | forge_control::AgentAssignmentMutation::Claim(_)
+        | forge_control::AgentAssignmentMutation::Cancel(_)
+        | forge_control::AgentAssignmentMutation::AcknowledgeCancellation(_)
+        | forge_control::AgentAssignmentMutation::Interrupt { .. } => return None,
+    };
+    Some(ReadbackHint::EvaluationEvidence {
+        workspace_id: request.scope.workspace_id().into_uuid(),
+        identity,
+    })
+}
+
+fn source_mutation_error(
+    error: &forge_control::ControlClientError,
+    workspace_id: Uuid,
+    readback: Option<ReadbackHint>,
+) -> ForgeError {
+    let mapped = super::forge_error_of_client(error);
+    if mapped.code() == ErrorCode::UnknownOutcome {
+        let readback = source_store_identity(error)
+            .map(|identity| ReadbackHint::evaluation_evidence(workspace_id, identity))
+            .or(readback);
+        mapped.with_readback(readback)
+    } else {
+        mapped
+    }
+}
+
+fn source_store_identity(
+    error: &forge_control::ControlClientError,
+) -> Option<&forge_persistence::EvaluationEvidenceMutationIdentity> {
+    let service = error.service_error()?;
+    let mut source = Error::source(service)?;
+    loop {
+        if let Some(store_error) = source.downcast_ref::<forge_persistence::WorkspaceStoreError>()
+            && let forge_persistence::WorkspaceStoreError::EvaluationEvidenceCommittedUnconfirmed {
+                identity,
+                ..
+            } = store_error
+        {
+            return Some(identity);
+        }
+        source = Error::source(source)?;
+    }
 }
 
 pub(super) fn parse_agent_assignment_get(request_id: Uuid, payload: &Value) -> ParseResult {
@@ -436,4 +522,74 @@ pub(super) fn execute_agent_assignment_list(
         "assignments": assignments,
         "assignment_count": assignments.len(),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use forge_domain::{
+        AgentAssignmentResult, AgentAssignmentRevision, AgentAssignmentTarget,
+        AuthenticatedPrincipal, LocationId, LocationRevision, TimestampMillis, WorkspaceId,
+        WorkspaceRevision,
+    };
+    use forge_workspace::WorkspaceLocator;
+
+    #[test]
+    fn source_mutation_readback_uses_assignment_identity_not_caller_observed_time()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let early = submit_request(1)?;
+        let late = submit_request(9_999)?;
+        let Some(early_hint) = readback_hint(&early) else {
+            return Err("submission recovery identity is missing".into());
+        };
+        let Some(late_hint) = readback_hint(&late) else {
+            return Err("submission recovery identity is missing".into());
+        };
+        assert_eq!(early_hint, late_hint);
+        assert!(matches!(
+            early_hint,
+            ReadbackHint::EvaluationEvidence {
+                identity: crate::error::EvaluationEvidenceReadbackIdentity::Submission {
+                    assignment_id,
+                    submitted_revision: 2,
+                },
+                ..
+            } if assignment_id == Uuid::from_u128(3)
+        ));
+        Ok(())
+    }
+
+    fn submit_request(
+        observed_at_ms: i64,
+    ) -> Result<forge_control::AgentAssignmentMutationRequest, Box<dyn std::error::Error>> {
+        let locator = WorkspaceLocator::new(
+            LocationId::from_uuid(Uuid::from_u128(1)),
+            LocationRevision::new(1)?,
+            "workspace",
+        )?;
+        let scope = ResolvedWorkspaceScope::from_observation(
+            WorkspaceId::from_uuid(Uuid::from_u128(2)),
+            WorkspaceRevision::new(1)?,
+            locator,
+        );
+        let target = AgentAssignmentTarget::new(
+            AgentInstanceId::from_uuid(Uuid::from_u128(4)),
+            AgentSessionId::from_uuid(Uuid::from_u128(5)),
+            AuthenticatedPrincipal::TrustedStdio,
+            forge_domain::AgentInstanceRevision::new(1)?,
+        );
+        let result = AgentAssignmentResult::new("result".to_owned(), Vec::new(), None)?;
+        Ok(forge_control::AgentAssignmentMutationRequest {
+            scope,
+            mutation: forge_control::AgentAssignmentMutation::Submit(
+                forge_domain::SubmitAgentAssignment::new(
+                    AgentAssignmentId::from_uuid(Uuid::from_u128(3)),
+                    target,
+                    AgentAssignmentRevision::new(1)?,
+                    result,
+                    TimestampMillis::new(observed_at_ms)?,
+                ),
+            ),
+        })
+    }
 }

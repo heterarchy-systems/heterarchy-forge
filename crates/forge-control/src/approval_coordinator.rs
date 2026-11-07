@@ -165,31 +165,6 @@ impl SubmitExecutionForApproval {
             project_command: None,
         })
     }
-
-    /// Submit one server-analyzed Agent shell script. The analyzer owns the
-    /// effective permissions; exact Agent/Goal/DAG/node authority is attached
-    /// before admission. Internal `ShellEscape` remains a separate action.
-    pub fn analyzed_shell(
-        scope: ResolvedWorkspaceScope,
-        activity_id: ActivityId,
-        runtime_instance_id: RuntimeInstanceId,
-        request: ExecutionRequest,
-    ) -> Result<Self, ForgeApprovalCoordinatorError> {
-        if !matches!(request.kind(), ExecutionKind::Shell { .. }) {
-            return Err(ForgeApprovalCoordinatorError::AttributionMismatch);
-        }
-        Ok(Self {
-            scope,
-            activity_id,
-            runtime_instance_id,
-            action: ExecutionActionClass::AnalyzedShell,
-            request,
-            goal: None,
-            approval_id: None,
-            agent_authority: None,
-            project_command: None,
-        })
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1139,12 +1114,14 @@ impl ApprovalRuntime {
             submit.action,
             RequestedExecutionPermissions::new(submit.request.permissions()),
         );
-        let agent_binding = approval_agent_binding(
-            submit.action,
+        let agent_provenance = provenance_for_submission(
             submit.agent_authority.as_ref(),
             submit.request.id(),
             submit.project_command,
         );
+        let agent_binding = agent_provenance
+            .as_ref()
+            .map(ApprovalAgentBindingDigest::from_provenance);
         if let Some(approval_id) = submit.approval_id
             && let Some(record) = self
                 .control
@@ -1199,6 +1176,7 @@ impl ApprovalRuntime {
                 approval_id,
                 request: authorization,
                 agent_binding,
+                agent_provenance,
                 expires_at,
             })?;
         self.submission_from_approval_record(submit, &record, None, authorization)
@@ -2377,25 +2355,6 @@ fn provenance_for_submission(
     })
 }
 
-fn approval_agent_binding(
-    action: ExecutionActionClass,
-    authority: Option<&AgentExecutionAuthorityRequest>,
-    execution_id: ExecutionId,
-    project_command: Option<ProjectCommandEvidence>,
-) -> Option<ApprovalAgentBindingDigest> {
-    matches!(
-        action,
-        ExecutionActionClass::DiscoveredProjectCommand
-            | ExecutionActionClass::AnalyzedShell
-            | ExecutionActionClass::GeneratedProjectCommand
-    )
-    .then(|| {
-        provenance_for_submission(authority, execution_id, project_command)
-            .map(|provenance| ApprovalAgentBindingDigest::from_provenance(&provenance))
-    })
-    .flatten()
-}
-
 fn cleanup_control_error_requires_readback(error: &ControlClientError) -> bool {
     matches!(error, ControlClientError::ResponseDropped)
         || matches!(error, ControlClientError::Service(error) if error.is_committed())
@@ -2503,8 +2462,8 @@ mod tests {
 
     use super::{
         ApprovalAgentBindingDigest, ExecutionAuthorizationRequest, ForgeApprovalCoordinatorError,
-        ForgeExecutionCoordinatorError, SubmitExecutionForApproval, approval_agent_binding,
-        execution_request_digest, pending_approval_matches_submission,
+        ForgeExecutionCoordinatorError, SubmitExecutionForApproval, execution_request_digest,
+        pending_approval_matches_submission, provenance_for_submission,
     };
     use crate::worker::ForgeControlRequest;
     use crate::{
@@ -3255,12 +3214,13 @@ mod tests {
     }
 
     fn binding(submit: &SubmitExecutionForApproval) -> Option<ApprovalAgentBindingDigest> {
-        approval_agent_binding(
-            submit.action,
+        provenance_for_submission(
             submit.agent_authority.as_ref(),
             submit.request.id(),
             submit.project_command,
         )
+        .as_ref()
+        .map(ApprovalAgentBindingDigest::from_provenance)
     }
 
     #[test]

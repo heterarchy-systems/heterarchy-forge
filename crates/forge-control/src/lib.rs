@@ -33,6 +33,7 @@ mod dag_plan_readback;
 mod diff;
 mod doctor;
 mod error;
+mod evaluation_evidence;
 mod execution;
 mod execution_coordinator;
 mod execution_journal;
@@ -43,13 +44,13 @@ mod generated_artifact;
 mod goal;
 mod goal_deletion;
 mod goal_mutation;
+mod home_transfer;
 mod queue;
 mod quiescent_activity_lease_resume;
 mod recovery;
 mod retention;
 mod semantic_projection;
 mod service;
-mod shell;
 mod source_tree;
 mod source_tree_digest;
 mod source_tree_readback;
@@ -171,12 +172,17 @@ pub use doctor::{
     WorkspaceCheckpointStoreStatus, WorkspaceDiffArtifactDoctorReport,
     WorkspaceDiffArtifactFinding, WorkspaceDiffArtifactStatus, WorkspaceDoctorAggregateOutcome,
     WorkspaceDoctorObservationConsistency, WorkspaceDoctorRequest, WorkspaceDoctorResult,
+    WorkspaceHomeArtifactDoctorReport, WorkspaceHomeArtifactFinding, WorkspaceHomeArtifactStatus,
     WorkspaceIdentityDoctorOutcome, WorkspaceIdentityDoctorReport,
     WorkspaceIdentityDuplicateFinding, WorkspaceLocationMismatchFinding,
 };
 pub use error::{
     ControlError, ControlErrorCategory, ControlErrorCode, ControlErrorDetails, ControlErrorView,
     ControlOperationOutcome, ControlRecoveryAction,
+};
+pub use evaluation_evidence::{
+    EvaluationEvidenceOperation, EvaluationEvidenceRequest, EvaluationEvidenceResponse,
+    EvaluationEvidenceService,
 };
 pub use execution_coordinator::{
     ApprovedAgentExecutionRequest, ExecutionStartDisposition, ExecutionStartResult,
@@ -214,6 +220,10 @@ pub use goal_deletion::{
     MAX_GOAL_DELETE_GROUPS_PER_CALL,
 };
 pub use heterarchy_orchestration_policy::{QueueCapacity, ServiceClass};
+pub use home_transfer::{
+    HomeTransferSourceCommand, HomeTransferSourceOperation, HomeTransferSourceResponse,
+    HomeTransferSourceService,
+};
 pub use queue::{QueueCapacitySource, QueueConfigError, QueueRuntimeError, QueueStatus};
 pub use quiescent_activity_lease_resume::{
     QuiescentActivityLeaseResumeGetRequest, QuiescentActivityLeaseResumeProbeRequest,
@@ -239,9 +249,6 @@ pub use service::{
     MAX_WORKSPACE_CATALOG_ENTRIES, OwnedActivityLease, RegisterLocationRequest,
     ResolvedWorkspaceScope, SupervisedActivityLeaseRenewRequest, WorkspaceActivityProjection,
     WorkspaceActivityProjectionRequest, WorkspaceCatalogEntry, WorkspaceDiscoveryEntry,
-};
-pub use shell::{
-    AnalyzedShellExecution, ShellAnalysisError, ShellExecutionClass, analyze_shell_script,
 };
 pub use source_tree::SourceTreeMutationRequest;
 pub use source_tree_digest::source_tree_request_digest;

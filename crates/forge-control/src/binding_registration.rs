@@ -99,6 +99,17 @@ fn map_reservation_error(error: WorkspaceStoreError) -> ControlError {
     if let WorkspaceStoreError::AgentBindingReservation(ref source) = error {
         use forge_persistence::AgentBindingReservationError as Error;
         let code = match source {
+            Error::WorkCut(source) if crate::error::is_home_transfer_cut_fence(source.as_ref()) => {
+                ControlErrorCode::HomeTransferFenced
+            }
+            Error::WorkCut(source)
+                if matches!(
+                    source.as_ref(),
+                    forge_persistence::WorkCutError::Conflict(_)
+                ) =>
+            {
+                ControlErrorCode::AgentConflict
+            }
             Error::InvalidRequestId
             | Error::InvalidActivityId
             | Error::InvalidAgentId
@@ -127,4 +138,37 @@ fn map_reservation_error(error: WorkspaceStoreError) -> ControlError {
 
 pub(crate) fn map_reservation_error_for_rejection(error: WorkspaceStoreError) -> ControlError {
     map_reservation_error(error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::map_reservation_error;
+    use crate::ControlErrorCode;
+    use forge_persistence::{
+        AgentBindingReservationError, HomeTransferStoreError, WorkCutError, WorkspaceStoreError,
+    };
+    use uuid::Uuid;
+
+    #[test]
+    fn reservation_home_fence_is_agent_conflict_but_corruption_is_persistence() {
+        let preparation_id = Uuid::from_u128(0xA16);
+        let fenced = map_reservation_error(WorkspaceStoreError::AgentBindingReservation(
+            AgentBindingReservationError::WorkCut(Box::new(WorkCutError::HomeTransfer(Box::new(
+                HomeTransferStoreError::Fenced { preparation_id },
+            )))),
+        ));
+        assert_eq!(fenced.code(), ControlErrorCode::HomeTransferFenced);
+
+        let corrupt = map_reservation_error(WorkspaceStoreError::AgentBindingReservation(
+            AgentBindingReservationError::WorkCut(Box::new(WorkCutError::HomeTransfer(Box::new(
+                HomeTransferStoreError::Corrupt("test"),
+            )))),
+        ));
+        assert_eq!(corrupt.code(), ControlErrorCode::PersistenceFailure);
+
+        let election = map_reservation_error(WorkspaceStoreError::AgentBindingReservation(
+            AgentBindingReservationError::WorkCut(Box::new(WorkCutError::Conflict("cut"))),
+        ));
+        assert_eq!(election.code(), ControlErrorCode::AgentConflict);
+    }
 }

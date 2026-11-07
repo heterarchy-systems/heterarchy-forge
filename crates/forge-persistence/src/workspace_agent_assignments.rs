@@ -12,6 +12,7 @@ use forge_domain::{
     AgentAssignmentTransitionError, AgentAssignmentWorktreeReceipt, AgentInstanceId,
     AgentInstanceRevision, AgentSessionId, AuthenticatedPrincipal, CancelAgentAssignment,
     ClaimAgentAssignment, DagHeadRevision, DagNodeId, DagNodeRevision, DagRevisionNumber,
+    EvaluationClockReading, EvaluationReviewReceipt, EvaluationSubmissionReceipt, ForgeBackendId,
     GoalEvidenceRef, GoalId, GoalRevision, InterruptAgentAssignment, MAX_AGENT_ASSIGNMENT_SOURCES,
     MAX_AGENT_ASSIGNMENTS_PER_WORKSPACE, OfferAgentAssignment, RegisteredAgentAssignment,
     ReviewAgentAssignment, SubmitAgentAssignment, TimestampMillis, WorkCreditBudget, WorkspaceId,
@@ -24,6 +25,14 @@ use crate::workspace_agents::{self, AgentStoreError};
 use crate::workspace_coordinators::{self, CoordinatorStoreError};
 use crate::workspace_dags::{self, DagStoreError};
 use crate::workspace_goals::{self, GoalStoreError};
+
+mod table_sql;
+pub(crate) use table_sql::{
+    AGENT_ASSIGNMENTS_TABLE_SQL, AGENT_ASSIGNMENTS_TABLE_SQL_V73,
+    AGENT_ASSIGNMENTS_V73_COPY_COLUMNS_SQL, CREDIT_BUDGET_COLUMN_SQL,
+};
+
+pub(crate) mod home_origin;
 
 /// Exact Goal/DAG/node read context plus the current head and active assignment
 /// observed in one Workspace `SQLite` read snapshot.
@@ -193,18 +202,12 @@ impl AgentAssignmentOfferSealSnapshot {
     }
 }
 
-/// Frozen `WorkCredit` budget column shared by the current table definition and
-/// the additive v42 `ALTER TABLE` migration (v41 databases predate it).
-pub(crate) const CREDIT_BUDGET_COLUMN_SQL: &str =
-    "credit_budget INTEGER CHECK(credit_budget IS NULL OR credit_budget IN (1,3,5))";
-
 /// Additive `v41` to `v42` migration step. `SQLite` rewrites the stored schema text
 /// by inserting this column after the last column definition, which is exactly
 /// its position in [`AGENT_ASSIGNMENTS_TABLE_SQL`], so migrated and freshly
 /// created tables share one normalized shape.
 pub(crate) const AGENT_ASSIGNMENTS_CREDIT_BUDGET_ALTER_SQL: &str = "ALTER TABLE agent_assignments ADD COLUMN credit_budget INTEGER CHECK(credit_budget IS NULL OR credit_budget IN (1,3,5))";
 
-pub(crate) const AGENT_ASSIGNMENTS_TABLE_SQL: &str = "CREATE TABLE agent_assignments (assignment_id BLOB PRIMARY KEY NOT NULL CHECK(length(assignment_id) = 16), workspace_id BLOB NOT NULL REFERENCES workspace(workspace_id) CHECK(length(workspace_id) = 16), activity_id BLOB NOT NULL REFERENCES activities(activity_id) CHECK(length(activity_id) = 16), goal_id BLOB NOT NULL REFERENCES goals(goal_id) CHECK(length(goal_id) = 16), goal_created_at_ms INTEGER NOT NULL CHECK(goal_created_at_ms >= 0), goal_revision INTEGER NOT NULL CHECK(goal_revision >= 1), dag_revision INTEGER NOT NULL CHECK(dag_revision >= 1), dag_head_revision INTEGER NOT NULL CHECK(dag_head_revision >= 1), node_id BLOB NOT NULL CHECK(length(node_id) = 16), node_revision INTEGER NOT NULL CHECK(node_revision >= 1), coordinator_agent_id BLOB NOT NULL CHECK(length(coordinator_agent_id) = 16), coordinator_session_id BLOB NOT NULL CHECK(length(coordinator_session_id) = 16), coordinator_principal_kind INTEGER NOT NULL CHECK(coordinator_principal_kind IN (0, 1, 2)), coordinator_principal_id BLOB CHECK(coordinator_principal_id IS NULL OR length(coordinator_principal_id) = 16), coordinator_revision INTEGER NOT NULL CHECK(coordinator_revision >= 1), target_agent_id BLOB NOT NULL CHECK(length(target_agent_id) = 16), target_session_id BLOB NOT NULL CHECK(length(target_session_id) = 16), target_principal_kind INTEGER NOT NULL CHECK(target_principal_kind IN (0, 1, 2)), target_principal_id BLOB CHECK(target_principal_id IS NULL OR length(target_principal_id) = 16), target_agent_revision INTEGER NOT NULL CHECK(target_agent_revision >= 1), state INTEGER NOT NULL CHECK(state IN (0, 1, 2, 3, 4, 5, 6)), cancellation_requested INTEGER NOT NULL CHECK(cancellation_requested IN (0, 1)), report TEXT CHECK(report IS NULL OR length(CAST(report AS BLOB)) BETWEEN 1 AND 32768), worktree_root_fingerprint BLOB CHECK(worktree_root_fingerprint IS NULL OR length(worktree_root_fingerprint) = 16), worktree_repository_fingerprint BLOB CHECK(worktree_repository_fingerprint IS NULL OR length(worktree_repository_fingerprint) = 16), worktree_baseline BLOB CHECK(worktree_baseline IS NULL OR length(worktree_baseline) = 20), reviewed_agent_id BLOB CHECK(reviewed_agent_id IS NULL OR length(reviewed_agent_id) = 16), reviewed_session_id BLOB CHECK(reviewed_session_id IS NULL OR length(reviewed_session_id) = 16), reviewed_principal_kind INTEGER CHECK(reviewed_principal_kind IS NULL OR reviewed_principal_kind IN (0, 1, 2)), reviewed_principal_id BLOB CHECK(reviewed_principal_id IS NULL OR length(reviewed_principal_id) = 16), reviewed_revision INTEGER CHECK(reviewed_revision IS NULL OR reviewed_revision >= 1), created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0), updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= created_at_ms), revision INTEGER NOT NULL CHECK(revision >= 1), credit_budget INTEGER CHECK(credit_budget IS NULL OR credit_budget IN (1,3,5)), FOREIGN KEY(coordinator_agent_id, workspace_id, activity_id) REFERENCES agent_instances(agent_id, workspace_id, activity_id), FOREIGN KEY(target_agent_id, workspace_id, activity_id) REFERENCES agent_instances(agent_id, workspace_id, activity_id), FOREIGN KEY(reviewed_agent_id, workspace_id, activity_id) REFERENCES agent_instances(agent_id, workspace_id, activity_id), CHECK((coordinator_principal_kind = 0 AND coordinator_principal_id IS NULL) OR (coordinator_principal_kind IN (1, 2) AND coordinator_principal_id IS NOT NULL)), CHECK((target_principal_kind = 0 AND target_principal_id IS NULL) OR (target_principal_kind IN (1, 2) AND target_principal_id IS NOT NULL)), CHECK((reviewed_principal_kind IS NULL AND reviewed_principal_id IS NULL AND reviewed_agent_id IS NULL AND reviewed_session_id IS NULL AND reviewed_revision IS NULL) OR (reviewed_principal_kind IS NOT NULL AND reviewed_principal_id IS NOT NULL OR reviewed_principal_kind = 0 AND reviewed_principal_id IS NULL) AND reviewed_agent_id IS NOT NULL AND reviewed_session_id IS NOT NULL AND reviewed_revision IS NOT NULL), CHECK((worktree_root_fingerprint IS NULL AND worktree_repository_fingerprint IS NULL AND worktree_baseline IS NULL) OR (worktree_root_fingerprint IS NOT NULL AND worktree_repository_fingerprint IS NOT NULL AND worktree_baseline IS NOT NULL)), CHECK(((state IN (2, 3, 4)) AND report IS NOT NULL) OR ((state IN (0, 1, 5, 6)) AND report IS NULL)), CHECK((state IN (3, 4) AND reviewed_agent_id IS NOT NULL) OR (state NOT IN (3, 4) AND reviewed_agent_id IS NULL)), CHECK((cancellation_requested = 0 AND state IN (0, 1, 2, 3, 4)) OR (cancellation_requested = 1 AND state IN (1, 5, 6))))";
 pub(crate) const AGENT_ASSIGNMENT_SOURCES_TABLE_SQL: &str = "CREATE TABLE agent_assignment_sources (assignment_id BLOB NOT NULL REFERENCES agent_assignments(assignment_id), ordinal INTEGER NOT NULL CHECK(ordinal BETWEEN 0 AND 31), source_kind INTEGER NOT NULL CHECK(source_kind IN (0, 1)), source_url TEXT CHECK(source_url IS NULL OR length(CAST(source_url AS BLOB)) BETWEEN 1 AND 2048), provenance_kind INTEGER CHECK(provenance_kind IS NULL OR provenance_kind IN (0, 1, 2, 3)), provenance_id BLOB CHECK(provenance_id IS NULL OR length(provenance_id) = 16), PRIMARY KEY(assignment_id, ordinal), CHECK((source_kind = 0 AND source_url IS NOT NULL AND provenance_kind IS NULL AND provenance_id IS NULL) OR (source_kind = 1 AND source_url IS NULL AND provenance_kind IS NOT NULL AND provenance_id IS NOT NULL)))";
 pub(crate) const AGENT_ASSIGNMENTS_WORKSPACE_STATE_INDEX_SQL: &str = "CREATE INDEX agent_assignments_workspace_state_idx ON agent_assignments(workspace_id, state, updated_at_ms DESC, assignment_id DESC)";
 pub(crate) const AGENT_ASSIGNMENTS_WORKSPACE_ACTIVITY_INDEX_SQL: &str = "CREATE INDEX agent_assignments_workspace_activity_idx ON agent_assignments(workspace_id, activity_id, updated_at_ms DESC, assignment_id DESC)";
@@ -213,6 +216,7 @@ pub(crate) const AGENT_ASSIGNMENTS_ACTIVE_AGENT_INDEX_SQL: &str = "CREATE UNIQUE
 pub(crate) const AGENT_ASSIGNMENT_OFFER_SEALS_TABLE_SQL: &str = "CREATE TABLE agent_assignment_offer_seals (workspace_id BLOB NOT NULL REFERENCES workspace(workspace_id) CHECK(length(workspace_id) = 16), activity_id BLOB NOT NULL REFERENCES activities(activity_id) CHECK(length(activity_id) = 16), assignment_id BLOB NOT NULL CHECK(length(assignment_id) = 16), authority_kind INTEGER NOT NULL CHECK(authority_kind IN (0, 1)), coordinator_agent_id BLOB CHECK(coordinator_agent_id IS NULL OR length(coordinator_agent_id) = 16), coordinator_session_id BLOB CHECK(coordinator_session_id IS NULL OR length(coordinator_session_id) = 16), expected_coordinator_revision INTEGER CHECK(expected_coordinator_revision IS NULL OR expected_coordinator_revision >= 1), sealed_at_ms INTEGER NOT NULL CHECK(sealed_at_ms >= 0), PRIMARY KEY(workspace_id, activity_id, assignment_id), CHECK((authority_kind = 0 AND coordinator_agent_id IS NULL AND coordinator_session_id IS NULL AND expected_coordinator_revision IS NULL) OR (authority_kind = 1 AND coordinator_agent_id IS NOT NULL AND coordinator_session_id IS NOT NULL AND expected_coordinator_revision IS NOT NULL)))";
 const AGENT_ASSIGNMENT_OFFER_SEALS_NO_UPDATE_TRIGGER_SQL: &str = "CREATE TRIGGER agent_assignment_offer_seals_no_update BEFORE UPDATE ON agent_assignment_offer_seals BEGIN SELECT RAISE(ABORT, 'assignment offer seals are immutable'); END";
 const AGENT_ASSIGNMENT_OFFER_SEALS_NO_DELETE_TRIGGER_SQL: &str = "CREATE TRIGGER agent_assignment_offer_seals_no_delete BEFORE DELETE ON agent_assignment_offer_seals BEGIN SELECT RAISE(ABORT, 'assignment offer seals are permanent'); END";
+const AGENT_ASSIGNMENTS_ORIGIN_IMMUTABLE_TRIGGER_SQL: &str = "CREATE TRIGGER agent_assignments_origin_immutable BEFORE UPDATE OF origin_kind, home_receipt_id ON agent_assignments WHEN NEW.origin_kind != OLD.origin_kind OR NEW.home_receipt_id IS NOT OLD.home_receipt_id BEGIN SELECT RAISE(ABORT, 'assignment origin is immutable'); END";
 
 const ID_BYTES: usize = 16;
 const GIT_OBJECT_BYTES: usize = 20;
@@ -223,11 +227,63 @@ const MAX_LIST_RESULTS: u32 = 256;
 pub(crate) fn create_schema(connection: &Connection) -> Result<(), AgentAssignmentStoreError> {
     connection.execute_batch(AGENT_ASSIGNMENTS_TABLE_SQL)?;
     connection.execute_batch(AGENT_ASSIGNMENT_SOURCES_TABLE_SQL)?;
+    create_assignment_indexes_and_origin_guard(connection)
+}
+
+/// Intermediate historical migrations must not install v74 origin authority
+/// before the terminal ledger and the v73-to-v74 rebuild are installed.
+pub(crate) fn create_schema_pre_home_handoff(
+    connection: &Connection,
+) -> Result<(), AgentAssignmentStoreError> {
+    connection.execute_batch(AGENT_ASSIGNMENTS_TABLE_SQL_V73)?;
+    connection.execute_batch(AGENT_ASSIGNMENT_SOURCES_TABLE_SQL)?;
+    create_assignment_indexes(connection)
+}
+
+fn create_assignment_indexes_and_origin_guard(
+    connection: &Connection,
+) -> Result<(), AgentAssignmentStoreError> {
+    connection.execute_batch(AGENT_ASSIGNMENTS_ORIGIN_IMMUTABLE_TRIGGER_SQL)?;
+    create_assignment_indexes(connection)
+}
+
+fn create_assignment_indexes(connection: &Connection) -> Result<(), AgentAssignmentStoreError> {
     connection.execute_batch(AGENT_ASSIGNMENTS_WORKSPACE_STATE_INDEX_SQL)?;
     connection.execute_batch(AGENT_ASSIGNMENTS_WORKSPACE_ACTIVITY_INDEX_SQL)?;
     connection.execute_batch(AGENT_ASSIGNMENTS_ACTIVE_NODE_INDEX_SQL)?;
     connection.execute_batch(AGENT_ASSIGNMENTS_ACTIVE_AGENT_INDEX_SQL)?;
     Ok(())
+}
+
+/// Rebuild only the assignment table from exact v73 DDL while the root owner
+/// holds its existing migration transaction and has disabled foreign keys.
+/// The caller owns schema-version/journal changes and final FK validation.
+pub(crate) fn rebuild_home_origin_table_in_transaction(
+    transaction: &Transaction<'_>,
+) -> Result<(), AgentAssignmentStoreError> {
+    validate_schema_pre_home_handoff(transaction)?;
+    const STAGING_TABLE: &str = "agent_assignments_v74_migration";
+    const CREATE_TABLE_PREFIX: &str = "CREATE TABLE agent_assignments (";
+    const STAGING_TABLE_PREFIX: &str = "CREATE TABLE agent_assignments_v74_migration (";
+    let create_sql =
+        AGENT_ASSIGNMENTS_TABLE_SQL.replacen(CREATE_TABLE_PREFIX, STAGING_TABLE_PREFIX, 1);
+    if create_sql == AGENT_ASSIGNMENTS_TABLE_SQL {
+        return Err(AgentAssignmentStoreError::DamagedSchema(
+            "agent_assignments_v74_create_authority",
+        ));
+    }
+    transaction.execute_batch(&create_sql)?;
+    let copy_sql = format!(
+        "INSERT INTO agent_assignments_v74_migration (
+            {AGENT_ASSIGNMENTS_V73_COPY_COLUMNS_SQL},origin_kind,home_receipt_id
+         ) SELECT {AGENT_ASSIGNMENTS_V73_COPY_COLUMNS_SQL},0,NULL FROM agent_assignments"
+    );
+    transaction.execute(&copy_sql, [])?;
+    transaction.execute_batch("DROP TABLE agent_assignments")?;
+    transaction.execute_batch(&format!(
+        "ALTER TABLE {STAGING_TABLE} RENAME TO agent_assignments"
+    ))?;
+    create_assignment_indexes_and_origin_guard(transaction)
 }
 
 pub(crate) fn create_offer_seal_schema(
@@ -239,7 +295,23 @@ pub(crate) fn create_offer_seal_schema(
     Ok(())
 }
 
-pub(crate) const fn schema_objects() -> [(&'static str, &'static str); 9] {
+pub(crate) const fn schema_objects() -> [(&'static str, &'static str); 10] {
+    [
+        ("table", "agent_assignments"),
+        ("table", "agent_assignment_sources"),
+        ("index", "agent_assignments_workspace_state_idx"),
+        ("index", "agent_assignments_workspace_activity_idx"),
+        ("index", "agent_assignments_active_node_idx"),
+        ("index", "agent_assignments_active_agent_idx"),
+        ("table", "agent_assignment_offer_seals"),
+        ("trigger", "agent_assignment_offer_seals_no_update"),
+        ("trigger", "agent_assignment_offer_seals_no_delete"),
+        ("trigger", "agent_assignments_origin_immutable"),
+    ]
+}
+
+/// Exact v73 object set before the assignment-origin guard trigger was added.
+pub(crate) const fn schema_objects_v73() -> [(&'static str, &'static str); 9] {
     [
         ("table", "agent_assignments"),
         ("table", "agent_assignment_sources"),
@@ -283,9 +355,10 @@ pub(crate) fn validate_schema(connection: &Connection) -> Result<(), AgentAssign
 pub(crate) fn validate_schema_pre_offer_seals(
     connection: &Connection,
 ) -> Result<(), AgentAssignmentStoreError> {
-    validate_schema_objects(connection)?;
-    validate_schema_columns(connection)?;
-    validate_schema_foreign_keys(connection)
+    let expected_table_sql = assignment_table_sql_v73();
+    validate_schema_objects_with(connection, &expected_table_sql, false)?;
+    validate_schema_columns_pre_home_handoff(connection)?;
+    validate_schema_foreign_keys_pre_home_handoff(connection)
 }
 
 /// Exact v34..v41 shape: the assignment table predates the `WorkCredit` budget
@@ -294,11 +367,28 @@ pub(crate) fn validate_schema_pre_offer_seals(
 pub(crate) fn validate_schema_pre_work_credit(
     connection: &Connection,
 ) -> Result<(), AgentAssignmentStoreError> {
-    let fragment = format!(", {CREDIT_BUDGET_COLUMN_SQL}");
-    let expected_table_sql = AGENT_ASSIGNMENTS_TABLE_SQL.replace(&fragment, "");
-    validate_schema_objects_with(connection, &expected_table_sql)?;
+    let expected_table_sql =
+        assignment_table_sql_v73().replace(&format!(", {CREDIT_BUDGET_COLUMN_SQL}"), "");
+    validate_schema_objects_with(connection, &expected_table_sql, false)?;
     validate_schema_columns_pre_work_credit(connection)?;
-    validate_schema_foreign_keys(connection)
+    validate_schema_foreign_keys_pre_home_handoff(connection)
+}
+
+/// Validate the exact schema-73 assignment shape before the v74 migration.
+pub(crate) fn validate_schema_pre_home_handoff(
+    connection: &Connection,
+) -> Result<(), AgentAssignmentStoreError> {
+    let expected_table_sql = assignment_table_sql_v73();
+    validate_schema_objects_with(connection, &expected_table_sql, false)?;
+    validate_schema_columns_pre_home_handoff(connection)?;
+    validate_schema_foreign_keys_pre_home_handoff(connection)?;
+    validate_offer_seal_schema(connection)
+}
+
+/// Return the canonical schema-73 assignment DDL derived from the shared
+/// column/constraint fragments used by fresh schema creation.
+pub(crate) fn assignment_table_sql_v73() -> String {
+    AGENT_ASSIGNMENTS_TABLE_SQL_V73.to_owned()
 }
 
 /// One additive v41 -> v42 migration step; see
@@ -311,12 +401,13 @@ pub(crate) fn add_credit_budget_column(
 }
 
 fn validate_schema_objects(connection: &Connection) -> Result<(), AgentAssignmentStoreError> {
-    validate_schema_objects_with(connection, AGENT_ASSIGNMENTS_TABLE_SQL)
+    validate_schema_objects_with(connection, AGENT_ASSIGNMENTS_TABLE_SQL, true)
 }
 
 fn validate_schema_objects_with(
     connection: &Connection,
     expected_table_sql: &str,
+    include_origin_guard: bool,
 ) -> Result<(), AgentAssignmentStoreError> {
     for (kind, name, expected) in [
         ("table", "agent_assignments", expected_table_sql),
@@ -357,9 +448,52 @@ fn validate_schema_objects_with(
             return Err(AgentAssignmentStoreError::DamagedSchema(name));
         };
         validate_sql_length(name, &actual)?;
-        if !schema_sql_matches(&actual, expected) {
+        // SQLite quotes the destination table name after a canonical rebuild.
+        // Accept only this exact identifier spelling, preserving every column,
+        // constraint and literal comparison in the normal schema check.
+        let renamed_assignment_matches = name == "agent_assignments"
+            && schema_sql_matches(
+                &actual,
+                &expected.replacen(
+                    "CREATE TABLE agent_assignments (",
+                    "CREATE TABLE \"agent_assignments\" (",
+                    1,
+                ),
+            );
+        if !schema_sql_matches(&actual, expected) && !renamed_assignment_matches {
             return Err(AgentAssignmentStoreError::DamagedSchema(name));
         }
+    }
+    if include_origin_guard {
+        validate_sql_object(
+            connection,
+            "trigger",
+            "agent_assignments_origin_immutable",
+            AGENT_ASSIGNMENTS_ORIGIN_IMMUTABLE_TRIGGER_SQL,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_sql_object(
+    connection: &Connection,
+    kind: &str,
+    name: &'static str,
+    expected: &str,
+) -> Result<(), AgentAssignmentStoreError> {
+    let actual: Option<String> = connection
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE type = ?1 AND name = ?2",
+            params![kind, name],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(actual) = actual else {
+        return Err(AgentAssignmentStoreError::DamagedSchema(name));
+    };
+    validate_sql_length(name, &actual)?;
+    if !schema_sql_matches(&actual, expected) {
+        return Err(AgentAssignmentStoreError::DamagedSchema(name));
     }
     Ok(())
 }
@@ -404,6 +538,8 @@ fn validate_schema_columns(connection: &Connection) -> Result<(), AgentAssignmen
             ("updated_at_ms", "INTEGER", 1, 0),
             ("revision", "INTEGER", 1, 0),
             ("credit_budget", "INTEGER", 0, 0),
+            ("origin_kind", "INTEGER", 1, 0),
+            ("home_receipt_id", "BLOB", 0, 0),
         ],
     )?;
     validate_columns(
@@ -465,7 +601,78 @@ fn validate_schema_columns_pre_work_credit(
     )
 }
 
+fn validate_schema_columns_pre_home_handoff(
+    connection: &Connection,
+) -> Result<(), AgentAssignmentStoreError> {
+    validate_columns(
+        connection,
+        "agent_assignments",
+        &[
+            ("assignment_id", "BLOB", 1, 1),
+            ("workspace_id", "BLOB", 1, 0),
+            ("activity_id", "BLOB", 1, 0),
+            ("goal_id", "BLOB", 1, 0),
+            ("goal_created_at_ms", "INTEGER", 1, 0),
+            ("goal_revision", "INTEGER", 1, 0),
+            ("dag_revision", "INTEGER", 1, 0),
+            ("dag_head_revision", "INTEGER", 1, 0),
+            ("node_id", "BLOB", 1, 0),
+            ("node_revision", "INTEGER", 1, 0),
+            ("coordinator_agent_id", "BLOB", 1, 0),
+            ("coordinator_session_id", "BLOB", 1, 0),
+            ("coordinator_principal_kind", "INTEGER", 1, 0),
+            ("coordinator_principal_id", "BLOB", 0, 0),
+            ("coordinator_revision", "INTEGER", 1, 0),
+            ("target_agent_id", "BLOB", 1, 0),
+            ("target_session_id", "BLOB", 1, 0),
+            ("target_principal_kind", "INTEGER", 1, 0),
+            ("target_principal_id", "BLOB", 0, 0),
+            ("target_agent_revision", "INTEGER", 1, 0),
+            ("state", "INTEGER", 1, 0),
+            ("cancellation_requested", "INTEGER", 1, 0),
+            ("report", "TEXT", 0, 0),
+            ("worktree_root_fingerprint", "BLOB", 0, 0),
+            ("worktree_repository_fingerprint", "BLOB", 0, 0),
+            ("worktree_baseline", "BLOB", 0, 0),
+            ("reviewed_agent_id", "BLOB", 0, 0),
+            ("reviewed_session_id", "BLOB", 0, 0),
+            ("reviewed_principal_kind", "INTEGER", 0, 0),
+            ("reviewed_principal_id", "BLOB", 0, 0),
+            ("reviewed_revision", "INTEGER", 0, 0),
+            ("created_at_ms", "INTEGER", 1, 0),
+            ("updated_at_ms", "INTEGER", 1, 0),
+            ("revision", "INTEGER", 1, 0),
+            ("credit_budget", "INTEGER", 0, 0),
+        ],
+    )
+}
+
 fn validate_schema_foreign_keys(connection: &Connection) -> Result<(), AgentAssignmentStoreError> {
+    validate_foreign_keys(
+        connection,
+        "agent_assignments",
+        &[
+            ("workspace", "workspace_id"),
+            ("activities", "activity_id"),
+            ("goals", "goal_id"),
+            ("agent_instances", "coordinator_agent_id"),
+            ("agent_instances", "target_agent_id"),
+            ("agent_instances", "reviewed_agent_id"),
+            ("home_handoff_acceptance_outcomes", "home_receipt_id"),
+            ("home_handoff_acceptance_outcomes", "origin_kind"),
+        ],
+    )?;
+    validate_foreign_keys(
+        connection,
+        "agent_assignment_sources",
+        &[("agent_assignments", "assignment_id")],
+    )?;
+    Ok(())
+}
+
+fn validate_schema_foreign_keys_pre_home_handoff(
+    connection: &Connection,
+) -> Result<(), AgentAssignmentStoreError> {
     validate_foreign_keys(
         connection,
         "agent_assignments",
@@ -482,8 +689,7 @@ fn validate_schema_foreign_keys(connection: &Connection) -> Result<(), AgentAssi
         connection,
         "agent_assignment_sources",
         &[("agent_assignments", "assignment_id")],
-    )?;
-    Ok(())
+    )
 }
 
 fn validate_sql_length(name: &'static str, sql: &str) -> Result<(), AgentAssignmentStoreError> {
@@ -649,7 +855,7 @@ const ASSIGNMENT_QUERY: &str = "SELECT assignment_id, workspace_id, activity_id,
        cancellation_requested, report, worktree_root_fingerprint,
        worktree_repository_fingerprint, worktree_baseline, reviewed_agent_id,
        reviewed_session_id, reviewed_principal_kind, reviewed_principal_id, reviewed_revision,
-       created_at_ms, updated_at_ms, revision, credit_budget
+       created_at_ms, updated_at_ms, revision, credit_budget, origin_kind, home_receipt_id
 FROM agent_assignments
 WHERE assignment_id = ?1";
 
@@ -660,7 +866,7 @@ const ACTIVE_ASSIGNMENT_FOR_NODE_SUMMARY_QUERY: &str =
        report IS NOT NULL,
        (SELECT COUNT(*) FROM agent_assignment_sources AS s
         WHERE s.assignment_id = a.assignment_id),
-       created_at_ms, updated_at_ms, revision, goal_created_at_ms
+       created_at_ms, updated_at_ms, revision, goal_created_at_ms, origin_kind, home_receipt_id
 FROM agent_assignments AS a
 WHERE workspace_id = ?1 AND goal_id = ?2 AND dag_revision = ?3 AND node_id = ?4
   AND state IN (0, 1, 2)";
@@ -708,6 +914,8 @@ struct RawAssignment {
     updated_at_ms: i64,
     revision: i64,
     credit_budget: Option<i64>,
+    origin_kind: i64,
+    home_receipt_id: Option<Vec<u8>>,
 }
 
 pub(crate) fn get(
@@ -780,7 +988,7 @@ pub(crate) fn active_for_node(
     if decode_timestamp("assignment.goal_created_at_ms", row.get(18)?)? != goal_created_at {
         return Err(AgentAssignmentStoreError::GoalConflict);
     }
-    decode_summary(row, workspace_id).map(Some)
+    decode_summary(connection, row, workspace_id, 19, 20).map(Some)
 }
 
 fn list_summaries(
@@ -798,7 +1006,7 @@ fn list_summaries(
                 report IS NOT NULL,
                 (SELECT COUNT(*) FROM agent_assignment_sources AS s
                  WHERE s.assignment_id = a.assignment_id),
-                created_at_ms, updated_at_ms, revision
+                created_at_ms, updated_at_ms, revision, origin_kind, home_receipt_id
          FROM agent_assignments AS a
          WHERE workspace_id = ?1
            AND (?2 IS NULL OR activity_id = ?2)
@@ -817,14 +1025,17 @@ fn list_summaries(
     ])?;
     let mut result = Vec::new();
     while let Some(row) = rows.next()? {
-        result.push(decode_summary(row, workspace_id)?);
+        result.push(decode_summary(connection, row, workspace_id, 18, 19)?);
     }
     Ok(result)
 }
 
 fn decode_summary(
+    connection: &Connection,
     row: &Row<'_>,
     expected_workspace_id: WorkspaceId,
+    origin_kind_index: usize,
+    receipt_id_index: usize,
 ) -> Result<AgentAssignmentSummary, AgentAssignmentStoreError> {
     let assignment_id = AgentAssignmentId::from_uuid(decode_uuid(
         "assignment.assignment_id",
@@ -847,6 +1058,12 @@ fn decode_summary(
     )?);
     let source_count = u8::try_from(row.get::<_, i64>(14)?)
         .map_err(|_| AgentAssignmentStoreError::TooManySources)?;
+    let origin = home_origin::decode_origin(
+        connection,
+        assignment_id,
+        row.get(origin_kind_index)?,
+        row.get::<_, Option<Vec<u8>>>(receipt_id_index)?.as_deref(),
+    )?;
     Ok(AgentAssignmentSummary::new_for_persistence(
         assignment_id,
         workspace_id,
@@ -875,7 +1092,7 @@ fn decode_summary(
         decode_timestamp("assignment.created_at_ms", row.get(15)?)?,
         decode_timestamp("assignment.updated_at_ms", row.get(16)?)?,
         decode_assignment_revision(row.get(17)?)?,
-        forge_domain::AgentAssignmentOrigin::CoordinatorOffer,
+        origin,
     ))
 }
 
@@ -916,6 +1133,8 @@ fn decode_raw(row: &Row<'_>) -> rusqlite::Result<RawAssignment> {
         updated_at_ms: row.get(32)?,
         revision: row.get(33)?,
         credit_budget: row.get(34)?,
+        origin_kind: row.get(35)?,
+        home_receipt_id: row.get(36)?,
     })
 }
 
@@ -944,6 +1163,12 @@ fn decode_assignment(
         raw.worktree_repository_fingerprint,
         raw.worktree_baseline,
     )?;
+    let origin = home_origin::decode_origin(
+        connection,
+        assignment_id,
+        raw.origin_kind,
+        raw.home_receipt_id.as_deref(),
+    )?;
     RegisteredAgentAssignment::from_parts(
         assignment_id,
         workspace_id,
@@ -968,7 +1193,7 @@ fn decode_assignment(
         decode_timestamp("assignment.created_at_ms", raw.created_at_ms)?,
         decode_timestamp("assignment.updated_at_ms", raw.updated_at_ms)?,
         decode_assignment_revision(raw.revision)?,
-        forge_domain::AgentAssignmentOrigin::CoordinatorOffer,
+        origin,
     )
     .map_err(AgentAssignmentStoreError::Transition)
 }
@@ -1547,6 +1772,13 @@ pub(crate) fn claim(
         current.dag_revision(),
         current.node_id(),
     )?;
+    crate::workspace_home_transfers::guards::ensure_actor_open(
+        &transaction,
+        current.workspace_id(),
+        command.target().agent_id(),
+        Some(command.target().session_id()),
+    )
+    .map_err(|error| AgentAssignmentStoreError::HomeTransfer(Box::new(error)))?;
     start_claimed_node_and_focus(&transaction, &current, command, &agent)?;
     let updated = current.claim(
         command.target(),
@@ -1664,11 +1896,81 @@ fn start_claimed_node_and_focus(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy)]
+enum AssignmentCommitRecovery {
+    Existing,
+    EvaluationEvidence,
+}
+
 pub(crate) fn submit(
     connection: &mut Connection,
     command: &SubmitAgentAssignment,
     admitted_at: TimestampMillis,
 ) -> Result<RegisteredAgentAssignment, AgentAssignmentStoreError> {
+    submit_with_evidence(
+        connection,
+        command,
+        admitted_at,
+        |_transaction, _previous, _updated| Ok(None),
+        AssignmentCommitRecovery::Existing,
+    )
+    .map(|(assignment, _receipt)| assignment)
+}
+
+pub(crate) fn submit_with_source_clock<C>(
+    connection: &mut Connection,
+    command: &SubmitAgentAssignment,
+    admitted_at: TimestampMillis,
+    actual_backend: ForgeBackendId,
+    sample_clock: C,
+) -> Result<
+    (
+        RegisteredAgentAssignment,
+        Option<EvaluationSubmissionReceipt>,
+    ),
+    AgentAssignmentStoreError,
+>
+where
+    C: FnOnce() -> EvaluationClockReading,
+{
+    submit_with_evidence(
+        connection,
+        command,
+        admitted_at,
+        move |transaction, previous, updated| {
+            crate::workspace_evaluation_evidence::record_submission_in_transaction(
+                transaction,
+                actual_backend,
+                previous,
+                updated,
+                sample_clock,
+            )
+            .map_err(|error| AgentAssignmentStoreError::EvaluationEvidence(Box::new(error)))
+        },
+        AssignmentCommitRecovery::EvaluationEvidence,
+    )
+}
+
+fn submit_with_evidence<F>(
+    connection: &mut Connection,
+    command: &SubmitAgentAssignment,
+    admitted_at: TimestampMillis,
+    record_evidence: F,
+    commit_recovery: AssignmentCommitRecovery,
+) -> Result<
+    (
+        RegisteredAgentAssignment,
+        Option<EvaluationSubmissionReceipt>,
+    ),
+    AgentAssignmentStoreError,
+>
+where
+    F: FnOnce(
+        &Transaction<'_>,
+        &RegisteredAgentAssignment,
+        &RegisteredAgentAssignment,
+    ) -> Result<Option<EvaluationSubmissionReceipt>, AgentAssignmentStoreError>,
+{
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let current = get_in_transaction(&transaction, command.assignment_id())?.ok_or(
         AgentAssignmentStoreError::AssignmentNotFound(command.assignment_id()),
@@ -1689,12 +1991,16 @@ pub(crate) fn submit(
         command.target().principal(),
         Some(command.target().agent_revision()),
     )?;
+    require_evaluation_source_clock(&transaction, &current, commit_recovery)?;
     let updated = current.submit(
         command.target(),
         command.expected_revision(),
         command.result().clone(),
         command.observed_at(),
     )?;
+    // Sample the trusted source clock only after the exact assignment transition
+    // has validated and immediately before the mutation is persisted.
+    let receipt = record_evidence(&transaction, &current, &updated)?;
     update_assignment(&transaction, &current, &updated)?;
     insert_sources(
         &transaction,
@@ -1709,8 +2015,23 @@ pub(crate) fn submit(
     // the assignment CAS and its source rows. A fact failure must roll back
     // the complete submit so a retry cannot observe a partial lifecycle.
     crate::workspace_effect_fact_outbox::append_assignment_submitted(&transaction, &result)?;
-    transaction.commit()?;
-    Ok(result)
+    transaction.commit().map_err(|source| {
+        if matches!(
+            commit_recovery,
+            AssignmentCommitRecovery::EvaluationEvidence
+        ) {
+            AgentAssignmentStoreError::EvaluationEvidenceCommitUnconfirmed {
+                identity: crate::EvaluationEvidenceMutationIdentity::Submission {
+                    assignment_id: result.id(),
+                    submitted_revision: result.revision(),
+                },
+                source: Box::new(source),
+            }
+        } else {
+            AgentAssignmentStoreError::Sqlite(source)
+        }
+    })?;
+    Ok((result, receipt))
 }
 
 pub(crate) fn accept(
@@ -1718,7 +2039,44 @@ pub(crate) fn accept(
     command: &ReviewAgentAssignment,
     admitted_at: TimestampMillis,
 ) -> Result<RegisteredAgentAssignment, AgentAssignmentStoreError> {
-    review(connection, command, true, admitted_at)
+    review_with_evidence(
+        connection,
+        command,
+        true,
+        admitted_at,
+        |_transaction, _previous, _updated| Ok(None),
+        AssignmentCommitRecovery::Existing,
+    )
+    .map(|(assignment, _receipt)| assignment)
+}
+
+pub(crate) fn accept_with_source_clock<C>(
+    connection: &mut Connection,
+    command: &ReviewAgentAssignment,
+    admitted_at: TimestampMillis,
+    actual_backend: ForgeBackendId,
+    sample_clock: C,
+) -> Result<(RegisteredAgentAssignment, Option<EvaluationReviewReceipt>), AgentAssignmentStoreError>
+where
+    C: FnOnce() -> EvaluationClockReading,
+{
+    review_with_evidence(
+        connection,
+        command,
+        true,
+        admitted_at,
+        move |transaction, previous, updated| {
+            crate::workspace_evaluation_evidence::record_review_in_transaction(
+                transaction,
+                actual_backend,
+                previous,
+                updated,
+                sample_clock,
+            )
+            .map_err(|error| AgentAssignmentStoreError::EvaluationEvidence(Box::new(error)))
+        },
+        AssignmentCommitRecovery::EvaluationEvidence,
+    )
 }
 
 pub(crate) fn reject(
@@ -1726,20 +2084,67 @@ pub(crate) fn reject(
     command: &ReviewAgentAssignment,
     admitted_at: TimestampMillis,
 ) -> Result<RegisteredAgentAssignment, AgentAssignmentStoreError> {
-    review(connection, command, false, admitted_at)
+    review_with_evidence(
+        connection,
+        command,
+        false,
+        admitted_at,
+        |_transaction, _previous, _updated| Ok(None),
+        AssignmentCommitRecovery::Existing,
+    )
+    .map(|(assignment, _receipt)| assignment)
 }
 
-fn review(
+pub(crate) fn reject_with_source_clock<C>(
+    connection: &mut Connection,
+    command: &ReviewAgentAssignment,
+    admitted_at: TimestampMillis,
+    actual_backend: ForgeBackendId,
+    sample_clock: C,
+) -> Result<(RegisteredAgentAssignment, Option<EvaluationReviewReceipt>), AgentAssignmentStoreError>
+where
+    C: FnOnce() -> EvaluationClockReading,
+{
+    review_with_evidence(
+        connection,
+        command,
+        false,
+        admitted_at,
+        move |transaction, previous, updated| {
+            crate::workspace_evaluation_evidence::record_review_in_transaction(
+                transaction,
+                actual_backend,
+                previous,
+                updated,
+                sample_clock,
+            )
+            .map_err(|error| AgentAssignmentStoreError::EvaluationEvidence(Box::new(error)))
+        },
+        AssignmentCommitRecovery::EvaluationEvidence,
+    )
+}
+
+fn review_with_evidence<F>(
     connection: &mut Connection,
     command: &ReviewAgentAssignment,
     accepted: bool,
     admitted_at: TimestampMillis,
-) -> Result<RegisteredAgentAssignment, AgentAssignmentStoreError> {
+    record_evidence: F,
+    commit_recovery: AssignmentCommitRecovery,
+) -> Result<(RegisteredAgentAssignment, Option<EvaluationReviewReceipt>), AgentAssignmentStoreError>
+where
+    F: FnOnce(
+        &Transaction<'_>,
+        &RegisteredAgentAssignment,
+        &RegisteredAgentAssignment,
+    ) -> Result<Option<EvaluationReviewReceipt>, AgentAssignmentStoreError>,
+{
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let current = get_in_transaction(&transaction, command.assignment_id())?.ok_or(
         AgentAssignmentStoreError::AssignmentNotFound(command.assignment_id()),
     )?;
     validate_current_coordinator_live(&transaction, command.coordinator(), admitted_at)?;
+    require_evaluation_source_clock(&transaction, &current, commit_recovery)?;
     let updated = if accepted {
         current.accept(
             command.coordinator(),
@@ -1753,6 +2158,9 @@ fn review(
             command.observed_at(),
         )?
     };
+    // The source receipt binds this exact post-review version before any row is
+    // stored; a later SQL failure rolls the receipt back with the CAS.
+    let receipt = record_evidence(&transaction, &current, &updated)?;
     update_assignment(&transaction, &current, &updated)?;
     let result = get_in_transaction(&transaction, updated.id())?.ok_or(
         AgentAssignmentStoreError::CorruptRecord("assignment.reviewed"),
@@ -1760,8 +2168,47 @@ fn review(
     // The durable review fact belongs to the same caller transaction as the
     // state CAS above; a fact failure rolls the review back with it.
     crate::workspace_effect_fact_outbox::append_assignment_reviewed(&transaction, &result)?;
-    transaction.commit()?;
-    Ok(result)
+    transaction.commit().map_err(|source| {
+        if matches!(
+            commit_recovery,
+            AssignmentCommitRecovery::EvaluationEvidence
+        ) {
+            AgentAssignmentStoreError::EvaluationEvidenceCommitUnconfirmed {
+                identity: crate::EvaluationEvidenceMutationIdentity::Review {
+                    assignment_id: result.id(),
+                    submitted_revision: command.expected_revision(),
+                    review_revision: result.revision(),
+                },
+                source: Box::new(source),
+            }
+        } else {
+            AgentAssignmentStoreError::Sqlite(source)
+        }
+    })?;
+    Ok((result, receipt))
+}
+
+fn require_evaluation_source_clock(
+    transaction: &Transaction<'_>,
+    current: &RegisteredAgentAssignment,
+    commit_recovery: AssignmentCommitRecovery,
+) -> Result<(), AgentAssignmentStoreError> {
+    if matches!(commit_recovery, AssignmentCommitRecovery::Existing)
+        && crate::workspace_evaluation_evidence::assignment_requires_source_clock_in_transaction(
+            transaction,
+            current.workspace_id(),
+            current.id(),
+        )
+        .map_err(|error| AgentAssignmentStoreError::EvaluationEvidence(Box::new(error)))?
+    {
+        return Err(
+            AgentAssignmentStoreError::EvaluationEvidenceObservationRequired {
+                workspace_id: current.workspace_id(),
+                assignment_id: current.id(),
+            },
+        );
+    }
+    Ok(())
 }
 
 pub(crate) fn cancel(
@@ -1967,6 +2414,27 @@ fn insert_assignment(
     assignment: &RegisteredAgentAssignment,
 ) -> Result<(), AgentAssignmentStoreError> {
     ensure_ordinary_origin(assignment)?;
+    insert_assignment_row(transaction, assignment, None)
+}
+
+fn insert_assignment_row(
+    transaction: &Transaction<'_>,
+    assignment: &RegisteredAgentAssignment,
+    home_receipt_id: Option<Uuid>,
+) -> Result<(), AgentAssignmentStoreError> {
+    let origin_kind = match (assignment.origin(), home_receipt_id) {
+        (forge_domain::AgentAssignmentOrigin::CoordinatorOffer, None) => 0_i64,
+        (forge_domain::AgentAssignmentOrigin::HomeHandoff(_), Some(receipt_id))
+            if !receipt_id.is_nil() =>
+        {
+            1_i64
+        }
+        _ => {
+            return Err(AgentAssignmentStoreError::CorruptRecord(
+                "assignment.insert_origin_pair",
+            ));
+        }
+    };
     let assignment_id = assignment.id().into_uuid().into_bytes();
     let workspace_id = assignment.workspace_id().into_uuid().into_bytes();
     let activity_id = assignment.activity_id().into_uuid().into_bytes();
@@ -2020,11 +2488,11 @@ fn insert_assignment(
             cancellation_requested, report, worktree_root_fingerprint,
             worktree_repository_fingerprint, worktree_baseline, reviewed_agent_id,
             reviewed_session_id, reviewed_principal_kind, reviewed_principal_id, reviewed_revision,
-            created_at_ms, updated_at_ms, revision, credit_budget
+            created_at_ms, updated_at_ms, revision, credit_budget, origin_kind, home_receipt_id
          ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
             ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28,
-            ?29, ?30, ?31, ?32, ?33, ?34, ?35
+            ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37
          )",
         params![
             assignment_id.as_slice(),
@@ -2062,6 +2530,8 @@ fn insert_assignment(
             assignment.updated_at().get(),
             assignment.revision().get(),
             assignment.credit_budget().map(WorkCreditBudget::value),
+            origin_kind,
+            home_receipt_id.map(|id| id.into_bytes().to_vec()),
         ],
     )?;
     Ok(())
@@ -2081,8 +2551,20 @@ fn update_assignment(
     current: &RegisteredAgentAssignment,
     updated: &RegisteredAgentAssignment,
 ) -> Result<(), AgentAssignmentStoreError> {
-    ensure_ordinary_origin(current)?;
-    ensure_ordinary_origin(updated)?;
+    if matches!(
+        current.origin(),
+        forge_domain::AgentAssignmentOrigin::CutContinuation(_)
+    ) || matches!(
+        updated.origin(),
+        forge_domain::AgentAssignmentOrigin::CutContinuation(_)
+    ) {
+        return Err(AgentAssignmentTransitionError::ContinuationAuthorityRequired.into());
+    }
+    if current.id() != updated.id() || current.origin() != updated.origin() {
+        return Err(AgentAssignmentStoreError::CorruptRecord(
+            "assignment.origin_changed_during_lifecycle",
+        ));
+    }
     let (coordinator_kind, coordinator_principal) =
         encode_principal(updated.coordinator().principal());
     let (target_kind, target_principal) = encode_principal(updated.target().principal());
@@ -2140,6 +2622,103 @@ fn update_assignment(
         target_kind,
         target_principal,
     );
+    Ok(())
+}
+
+/// Persist the exact assignment half of a prevalidated Home transition in the
+/// caller's write transaction. The owning take operation must complete its
+/// live actor, closure, Node/focus, evidence, terminal-ledger and commit checks
+/// in that same transaction. This seam never appends an ordinary offer fact.
+pub(crate) fn persist_home_handoff_transition_in_transaction(
+    transaction: &Transaction<'_>,
+    before: &RegisteredAgentAssignment,
+    transition: &forge_domain::AgentAssignmentHomeHandoffTransition,
+    acceptance_id: Uuid,
+) -> Result<(), AgentAssignmentStoreError> {
+    if acceptance_id.is_nil() {
+        return Err(AgentAssignmentStoreError::CorruptRecord(
+            "assignment.home_acceptance_id",
+        ));
+    }
+    let current = get_in_transaction(transaction, before.id())?
+        .ok_or(AgentAssignmentStoreError::AssignmentNotFound(before.id()))?;
+    if current != *before {
+        return Err(AgentAssignmentStoreError::RevisionConflict);
+    }
+    validate_home_handoff_assignment_transition(before, transition)?;
+    update_assignment(transaction, before, transition.predecessor())?;
+    insert_assignment_row(transaction, transition.successor(), Some(acceptance_id))
+}
+
+fn validate_home_handoff_assignment_transition(
+    before: &RegisteredAgentAssignment,
+    transition: &forge_domain::AgentAssignmentHomeHandoffTransition,
+) -> Result<(), AgentAssignmentStoreError> {
+    use forge_domain::{AgentAssignmentOrigin, AgentAssignmentState};
+
+    let root_assignment_id = match before.origin() {
+        AgentAssignmentOrigin::CoordinatorOffer => before.id(),
+        AgentAssignmentOrigin::HomeHandoff(origin) => origin.root_assignment_id(),
+        AgentAssignmentOrigin::CutContinuation(_) => {
+            return Err(AgentAssignmentTransitionError::HomeHandoffLineageUnsupported.into());
+        }
+    };
+    let predecessor = transition.predecessor();
+    let successor = transition.successor();
+    let expected_disposition = match before.state() {
+        AgentAssignmentState::Offered => AgentAssignmentState::Cancelled,
+        AgentAssignmentState::Running => AgentAssignmentState::Interrupted,
+        _ => return Err(AgentAssignmentTransitionError::InvalidState.into()),
+    };
+    let expected_revision = before
+        .revision()
+        .checked_next()
+        .map_err(|_| AgentAssignmentStoreError::RevisionConflict)?;
+    let origin = match successor.origin() {
+        AgentAssignmentOrigin::HomeHandoff(origin) => origin,
+        AgentAssignmentOrigin::CoordinatorOffer | AgentAssignmentOrigin::CutContinuation(_) => {
+            return Err(AgentAssignmentStoreError::CorruptRecord(
+                "assignment.home_successor_origin",
+            ));
+        }
+    };
+
+    if before.cancellation_requested()
+        || predecessor.id() != before.id()
+        || predecessor.origin() != before.origin()
+        || predecessor.state() != expected_disposition
+        || !predecessor.cancellation_requested()
+        || predecessor.revision() != expected_revision
+        || predecessor.updated_at() != successor.created_at()
+        || successor.id() == before.id()
+        || successor.id() == root_assignment_id
+        || origin.predecessor_id() != before.id()
+        || origin.root_assignment_id() != root_assignment_id
+        || origin.handoff_id().is_nil()
+        || origin.preparation_id().is_nil()
+        || successor.state() != AgentAssignmentState::Running
+        || successor.cancellation_requested()
+        || successor.result().is_some()
+        || successor.reviewed_by().is_some()
+        || successor.revision() != AgentAssignmentRevision::INITIAL
+        || successor.updated_at() != successor.created_at()
+        || successor.workspace_id() != before.workspace_id()
+        || successor.activity_id() != before.activity_id()
+        || successor.goal_id() != before.goal_id()
+        || successor.goal_created_at() != before.goal_created_at()
+        || successor.goal_revision() != before.goal_revision()
+        || successor.dag_revision() != before.dag_revision()
+        || successor.dag_head_revision() != before.dag_head_revision()
+        || successor.node_id() != before.node_id()
+        || successor.node_revision().get() < before.node_revision().get()
+        || successor.target().agent_id() == before.target().agent_id()
+        || successor.target().session_id() == before.target().session_id()
+        || successor.credit_budget() != before.credit_budget()
+    {
+        return Err(AgentAssignmentStoreError::CorruptRecord(
+            "assignment.home_transition_pins",
+        ));
+    }
     Ok(())
 }
 
@@ -2380,6 +2959,8 @@ fn decode_dag_node_revision(value: i64) -> Result<DagNodeRevision, AgentAssignme
 #[derive(Debug, Error)]
 pub enum AgentAssignmentStoreError {
     #[error(transparent)]
+    HomeTransfer(#[from] Box<crate::HomeTransferStoreError>),
+    #[error(transparent)]
     WorkCut(#[from] Box<crate::WorkCutError>),
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
@@ -2401,6 +2982,23 @@ pub enum AgentAssignmentStoreError {
     Focus(#[from] forge_domain::AgentFocusError),
     #[error(transparent)]
     EffectFact(#[from] crate::EffectFactOutboxError),
+    #[error("evaluation source evidence persistence failed")]
+    EvaluationEvidence(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
+    #[error(
+        "evaluation-bound Workspace {workspace_id} assignment {assignment_id} requires trusted source observation"
+    )]
+    EvaluationEvidenceObservationRequired {
+        workspace_id: WorkspaceId,
+        assignment_id: AgentAssignmentId,
+    },
+    #[error(
+        "evaluation assignment mutation {identity:?} may have committed; exact readback is required"
+    )]
+    EvaluationEvidenceCommitUnconfirmed {
+        identity: crate::EvaluationEvidenceMutationIdentity,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    },
     #[error("Agent assignment {0} was not found")]
     AssignmentNotFound(AgentAssignmentId),
     #[error("Agent assignment identity conflicts with durable state")]
@@ -2494,6 +3092,8 @@ impl From<crate::WorkCutError> for AgentAssignmentStoreError {
 
 #[cfg(test)]
 mod tests {
+    mod evaluation_evidence;
+
     use std::fs;
     use std::path::PathBuf;
 

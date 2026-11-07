@@ -55,9 +55,13 @@ use uuid::Uuid;
 
 mod agent_dag_readback;
 mod approval_cleanup;
+mod evaluation_evidence;
 mod execution_evidence;
 mod execution_stop;
 mod expired_activity_recovery;
+mod home_artifact;
+mod home_handoff;
+mod home_transfer;
 mod quiescent_activity_lease_resume;
 mod recovery_maintenance;
 mod recovery_run;
@@ -65,6 +69,10 @@ mod relocation;
 mod root_recovery;
 mod started_activity_lease_resume;
 mod unstarted_activity_continuation;
+pub use evaluation_evidence::{
+    EvaluationAssignmentReview, EvaluationAssignmentSubmission, EvaluationEvidenceMutationIdentity,
+    EvaluationT1ClosureOutcome,
+};
 pub use execution_stop::OwnedWorkspaceStopCapture;
 pub use expired_activity_recovery::{
     ExpiredActivityRecoveryOperation, ExpiredActivityRecoveryReadback,
@@ -135,7 +143,13 @@ use crate::workspace_writer_leases::{self, WriterLeaseStoreError};
 /// This is deliberately different from the Global Registry marker.
 pub const WORKSPACE_APPLICATION_ID: i64 = 0x4846_5753;
 
-pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 69;
+/// Current version of the Workspace-local `SQLite` schema.
+pub const CURRENT_SCHEMA_VERSION: i64 = 74;
+const PREVIOUS_HOME_HANDOFF_SCHEMA_VERSION: i64 = 73;
+const PREVIOUS_HOME_ARTIFACT_SCHEMA_VERSION: i64 = 72;
+const PREVIOUS_HOME_TRANSFER_RESERVATION_RETIREMENT_SCHEMA_VERSION: i64 = 71;
+const PREVIOUS_HOME_TRANSFER_SOURCE_SCHEMA_VERSION: i64 = 70;
+const PREVIOUS_EVALUATION_EVIDENCE_SCHEMA_VERSION: i64 = 69;
 const PREVIOUS_QUIESCENT_ACTIVITY_LEASE_RESUME_SCHEMA_VERSION: i64 = 68;
 const PREVIOUS_ADMISSION_IDENTITY_SCHEMA_VERSION: i64 = 67;
 const PREVIOUS_STARTED_ACTIVITY_LEASE_RESUME_SCHEMA_VERSION: i64 = 66;
@@ -347,6 +361,7 @@ pub struct WorkspaceDoctorReport {
     stale_executions: WorkspaceDoctorCount,
     stale_checkpoint_restores: WorkspaceDoctorCount,
     checkpoint_references: CheckpointDoctorReport,
+    home_artifact_references: crate::HomeArtifactDoctorReport,
     dag_semantics: DagDoctorReport,
     diff_references: DiffDoctorReport,
     outcome: WorkspaceDoctorOutcome,
@@ -374,6 +389,7 @@ struct WorkspaceDoctorObservations {
     stale_executions: WorkspaceDoctorCount,
     stale_checkpoint_restores: WorkspaceDoctorCount,
     checkpoint_references: CheckpointDoctorReport,
+    home_artifact_references: crate::HomeArtifactDoctorReport,
     dag_semantics: DagDoctorReport,
     diff_references: DiffDoctorReport,
 }
@@ -386,6 +402,7 @@ impl WorkspaceDoctorReport {
             stale_executions,
             stale_checkpoint_restores,
             checkpoint_references,
+            home_artifact_references,
             dag_semantics,
             diff_references,
         } = observations;
@@ -399,7 +416,11 @@ impl WorkspaceDoctorReport {
             || stale_executions.truncated()
             || !stale_checkpoint_restores.is_empty()
             || stale_checkpoint_restores.truncated()
-            || starting_checkpoint;
+            || starting_checkpoint
+            || home_artifact_references
+                .references()
+                .iter()
+                .any(|reference| reference.expected_commit().is_none());
         let outcome = if damaged {
             WorkspaceDoctorOutcome::Damaged
         } else if recovery_required {
@@ -418,6 +439,7 @@ impl WorkspaceDoctorReport {
             stale_executions,
             stale_checkpoint_restores,
             checkpoint_references,
+            home_artifact_references,
             dag_semantics,
             diff_references,
             outcome,
@@ -462,6 +484,11 @@ impl WorkspaceDoctorReport {
 
     pub const fn checkpoint_references(&self) -> &CheckpointDoctorReport {
         &self.checkpoint_references
+    }
+
+    /// SQL identities only; retained Git bytes are verified by the artifact owner.
+    pub const fn home_artifact_references(&self) -> &crate::HomeArtifactDoctorReport {
+        &self.home_artifact_references
     }
 
     pub const fn dag_semantics(&self) -> &DagDoctorReport {
@@ -1276,6 +1303,7 @@ impl WorkspaceJournalBinding {
 /// operation never infers that a foreign process has exited.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkspaceStateRemovalBlocker {
+    RetainedHomeArtifact,
     PendingExecutionStop,
     OpenActivity,
     ActiveExecution,
@@ -1398,6 +1426,10 @@ impl WorkspaceStore {
         gate.ensure_root_binding(layout.workspace_root(), root_fingerprint)
             .map_err(WorkspaceStoreError::StateGate)?;
 
+        // The exclusive root gate excludes live Source writers. Preserve
+        // published Home refs even if their journal is missing or damaged;
+        // an unmatched ref is unresolved custody, not disposable debris.
+        ensure_no_retained_home_artifact_refs(layout)?;
         let path = layout.database_path();
         let database = inspect_regular_file(&path, true)?;
         if database.is_none() {
@@ -1673,6 +1705,12 @@ impl WorkspaceStore {
         )?;
         let checkpoint_references =
             workspace_checkpoints::doctor_references(&database.connection, workspace.id())?;
+        let home_artifact_references =
+            crate::workspace_home_transfers::artifacts::doctor_references(
+                &database.connection,
+                workspace.id(),
+            )
+            .map_err(|error| WorkspaceStoreError::HomeArtifact(Box::new(error)))?;
         let dag_semantics = workspace_dags::doctor_current(&database.connection, workspace.id())?;
         let diff_references = workspace_diffs::doctor_references(&database.connection)?;
         let report = WorkspaceDoctorReport::new(
@@ -1689,6 +1727,7 @@ impl WorkspaceStore {
                 stale_executions,
                 stale_checkpoint_restores,
                 checkpoint_references,
+                home_artifact_references,
                 dag_semantics,
                 diff_references,
             },
@@ -1985,14 +2024,23 @@ fn state_removal_blocker_for_connection(
     connection: &Connection,
     workspace_id: WorkspaceId,
 ) -> Result<Option<WorkspaceStateRemovalBlocker>, WorkspaceStoreError> {
+    let blocker = state_removal_blocker_rows(connection, workspace_id)?;
+    if blocker == Some(WorkspaceStateRemovalBlocker::RetainedHomeArtifact) {
+        return Ok(blocker);
+    }
     workspace_agent_migration::ensure_legacy_writes(connection)?;
-    state_removal_blocker_rows(connection, workspace_id)
+    Ok(blocker)
 }
 
 fn state_removal_blocker_rows(
     connection: &Connection,
     workspace_id: WorkspaceId,
 ) -> Result<Option<WorkspaceStateRemovalBlocker>, WorkspaceStoreError> {
+    if crate::workspace_home_transfers::artifacts::blocks_state_removal(connection, workspace_id)
+        .map_err(|error| WorkspaceStoreError::HomeArtifact(Box::new(error)))?
+    {
+        return Ok(Some(WorkspaceStateRemovalBlocker::RetainedHomeArtifact));
+    }
     let workspace = workspace_id.into_uuid().into_bytes();
     let pending_stop: bool = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM workspace_execution_stops WHERE workspace_id = ?1)",
@@ -2042,6 +2090,49 @@ fn state_removal_blocker_rows(
         |row| row.get(0),
     )?;
     Ok(maintenance_owned.then_some(WorkspaceStateRemovalBlocker::RecoveryMaintenanceLease))
+}
+
+fn ensure_no_retained_home_artifact_refs(
+    layout: &ExistingWorkspaceStateLayout,
+) -> Result<(), WorkspaceStoreError> {
+    let store = forge_workspace::GitCheckpointStore::inspect_existing_read_only(layout)
+        .map_err(|error| WorkspaceStoreError::HomeArtifactObjectStore(Box::new(error.into())))?;
+    if let Some(store) = store {
+        let inventory = forge_workspace::HomeArtifactStore::new(&store)
+            .inventory_refs_read_only(forge_workspace::HomeArtifactRefInventoryLimit::DEFAULT)
+            .map_err(|error| WorkspaceStoreError::HomeArtifactObjectStore(Box::new(error)))?;
+        if !inventory.entries().is_empty() || inventory.truncated() {
+            return Err(WorkspaceStoreError::StateRemovalBlocked(
+                WorkspaceStateRemovalBlocker::RetainedHomeArtifact,
+            ));
+        }
+    } else {
+        // A Workspace whose user Git metadata disappeared can still contain
+        // the owned archive store. Absence of an inspectable repository must
+        // not turn those uninspected objects into a deletion authorization.
+        let store_path = layout.checkpoints().join("store.git");
+        match fs::symlink_metadata(&store_path) {
+            Ok(_) => {
+                return Err(WorkspaceStoreError::StateRemovalBlocked(
+                    WorkspaceStateRemovalBlocker::RetainedHomeArtifact,
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(WorkspaceStoreError::HomeArtifactObjectStore(Box::new(
+                    forge_workspace::HomeArtifactStoreError::Git(
+                        forge_workspace::GitSafetyError::Filesystem {
+                            operation: "inspect retained Home artifact store before removal"
+                                .to_owned(),
+                            path: store_path,
+                            source,
+                        },
+                    ),
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 impl WorkspaceStore {
@@ -5824,11 +5915,25 @@ impl WorkspaceStore {
         request: &RegisteredApprovalRequest,
         goal: Option<GoalWorkAttribution>,
     ) -> Result<RegisteredApprovalRequest, WorkspaceStoreError> {
+        self.insert_pending_approval_for_goal_with_provenance(request, goal, None)
+    }
+
+    /// Persist the exact Agent preimage with a fresh approval in one transaction.
+    pub fn insert_pending_approval_for_goal_with_provenance(
+        &mut self,
+        request: &RegisteredApprovalRequest,
+        goal: Option<GoalWorkAttribution>,
+        provenance: Option<&forge_domain::ExecutionAgentProvenance>,
+    ) -> Result<RegisteredApprovalRequest, WorkspaceStoreError> {
         self.ensure_live_binding()?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let result = workspace_approvals::insert_pending_in_transaction(&transaction, request)?;
+        let result = workspace_approvals::insert_pending_with_provenance_in_transaction(
+            &transaction,
+            request,
+            provenance,
+        )?;
         associate_work_evidence(
             &transaction,
             goal,
@@ -5853,12 +5958,25 @@ impl WorkspaceStore {
         request: &RegisteredApprovalRequest,
         goal: Option<GoalWorkAttribution>,
     ) -> Result<RegisteredApprovalRequest, WorkspaceStoreError> {
+        self.insert_approval_audit_for_goal_with_provenance(request, goal, None)
+    }
+
+    /// Persist an audit and its supplied Agent preimage without inventing legacy provenance.
+    pub fn insert_approval_audit_for_goal_with_provenance(
+        &mut self,
+        request: &RegisteredApprovalRequest,
+        goal: Option<GoalWorkAttribution>,
+        provenance: Option<&forge_domain::ExecutionAgentProvenance>,
+    ) -> Result<RegisteredApprovalRequest, WorkspaceStoreError> {
         self.ensure_live_binding()?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let result =
-            workspace_approvals::insert_approval_audit_in_transaction(&transaction, request)?;
+        let result = workspace_approvals::insert_approval_audit_with_provenance_in_transaction(
+            &transaction,
+            request,
+            provenance,
+        )?;
         associate_work_evidence(
             &transaction,
             goal,
@@ -7541,9 +7659,34 @@ fn compatible_read_only_shape(
     match ownership {
         DatabaseOwnership::Current => Ok(WorkspaceSchemaShape::Current),
         DatabaseOwnership::Outdated { version }
+            if version == PREVIOUS_HOME_ARTIFACT_SCHEMA_VERSION =>
+        {
+            Ok(WorkspaceSchemaShape::V72)
+        }
+        DatabaseOwnership::Outdated { version }
+            if version == PREVIOUS_HOME_HANDOFF_SCHEMA_VERSION =>
+        {
+            Ok(WorkspaceSchemaShape::V73)
+        }
+        DatabaseOwnership::Outdated { version }
+            if version == PREVIOUS_HOME_TRANSFER_RESERVATION_RETIREMENT_SCHEMA_VERSION =>
+        {
+            Ok(WorkspaceSchemaShape::V71)
+        }
+        DatabaseOwnership::Outdated { version }
             if version == PREVIOUS_QUIESCENT_ACTIVITY_LEASE_RESUME_SCHEMA_VERSION =>
         {
             Ok(WorkspaceSchemaShape::V68)
+        }
+        DatabaseOwnership::Outdated { version }
+            if version == PREVIOUS_EVALUATION_EVIDENCE_SCHEMA_VERSION =>
+        {
+            Ok(WorkspaceSchemaShape::V69)
+        }
+        DatabaseOwnership::Outdated { version }
+            if version == PREVIOUS_HOME_TRANSFER_SOURCE_SCHEMA_VERSION =>
+        {
+            Ok(WorkspaceSchemaShape::V70)
         }
         DatabaseOwnership::Outdated { version }
             if version == PREVIOUS_DELEGATED_ROOT_RECOVERY_SCHEMA_VERSION =>
@@ -7653,6 +7796,20 @@ fn prepare_database(
                 == PREVIOUS_QUIESCENT_ACTIVITY_LEASE_RESUME_SCHEMA_VERSION
             {
                 migrate_quiescent_activity_lease_resume_schema(connection, busy_timeout)?;
+            }
+            if schema_version(connection)? == PREVIOUS_HOME_TRANSFER_SOURCE_SCHEMA_VERSION {
+                migrate_home_transfer_source_schema(connection, busy_timeout)?;
+            }
+            if schema_version(connection)?
+                == PREVIOUS_HOME_TRANSFER_RESERVATION_RETIREMENT_SCHEMA_VERSION
+            {
+                migrate_home_reservation_retirement_schema(connection, busy_timeout)?;
+            }
+            if schema_version(connection)? == PREVIOUS_HOME_ARTIFACT_SCHEMA_VERSION {
+                migrate_home_artifact_schema(connection, busy_timeout)?;
+            }
+            if schema_version(connection)? == PREVIOUS_HOME_HANDOFF_SCHEMA_VERSION {
+                migrate_home_handoff_schema(connection, busy_timeout)?;
             }
         }
         DatabaseOwnership::Current => configure_connection(connection, busy_timeout)?,
@@ -8007,6 +8164,160 @@ fn migrate_quiescent_activity_lease_resume_schema(
             detail: error.to_string(),
         },
     )?;
+    crate::workspace_evaluation_evidence::create_schema(&transaction)
+        .map_err(|error| WorkspaceStoreError::EvaluationEvidence(Box::new(error)))?;
+    transaction.pragma_update(
+        None,
+        "user_version",
+        PREVIOUS_HOME_TRANSFER_SOURCE_SCHEMA_VERSION,
+    )?;
+    validate_schema_shape_for_version(&transaction, WorkspaceSchemaShape::V70)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_evaluation_evidence_schema(
+    connection: &mut Connection,
+    busy_timeout: Duration,
+) -> Result<(), WorkspaceStoreError> {
+    validate_schema_shape_for_version(connection, WorkspaceSchemaShape::V69)?;
+    configure_connection(connection, busy_timeout)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if schema_version(&transaction)? != PREVIOUS_EVALUATION_EVIDENCE_SCHEMA_VERSION {
+        return Err(WorkspaceStoreError::DamagedSchema {
+            detail: "evaluation-evidence migration source changed".to_owned(),
+        });
+    }
+    crate::workspace_evaluation_evidence::create_schema(&transaction)
+        .map_err(|error| WorkspaceStoreError::EvaluationEvidence(Box::new(error)))?;
+    transaction.pragma_update(
+        None,
+        "user_version",
+        PREVIOUS_HOME_TRANSFER_SOURCE_SCHEMA_VERSION,
+    )?;
+    validate_schema_shape_for_version(&transaction, WorkspaceSchemaShape::V70)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_home_transfer_source_schema(
+    connection: &mut Connection,
+    busy_timeout: Duration,
+) -> Result<(), WorkspaceStoreError> {
+    validate_schema_shape_for_version(connection, WorkspaceSchemaShape::V70)?;
+    configure_connection(connection, busy_timeout)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if schema_version(&transaction)? != PREVIOUS_HOME_TRANSFER_SOURCE_SCHEMA_VERSION {
+        return Err(WorkspaceStoreError::DamagedSchema {
+            detail: "Home-transfer source migration source changed".to_owned(),
+        });
+    }
+    crate::workspace_home_transfers::schema::create_schema(&transaction)?;
+    crate::workspace_approvals::agent_provenance::schema::create_schema(&transaction)?;
+    transaction.pragma_update(
+        None,
+        "user_version",
+        PREVIOUS_HOME_TRANSFER_RESERVATION_RETIREMENT_SCHEMA_VERSION,
+    )?;
+    validate_schema_shape_for_version(&transaction, WorkspaceSchemaShape::V71)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_home_reservation_retirement_schema(
+    connection: &mut Connection,
+    busy_timeout: Duration,
+) -> Result<(), WorkspaceStoreError> {
+    validate_schema_shape_for_version(connection, WorkspaceSchemaShape::V71)?;
+    configure_connection(connection, busy_timeout)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if schema_version(&transaction)? != PREVIOUS_HOME_TRANSFER_RESERVATION_RETIREMENT_SCHEMA_VERSION
+    {
+        return Err(WorkspaceStoreError::DamagedSchema {
+            detail: "Home reservation retirement migration source changed".to_owned(),
+        });
+    }
+    crate::workspace_home_transfers::retirements::schema::create_schema(&transaction)?;
+    transaction.pragma_update(None, "user_version", PREVIOUS_HOME_ARTIFACT_SCHEMA_VERSION)?;
+    validate_schema_shape_for_version(&transaction, WorkspaceSchemaShape::V72)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_home_artifact_schema(
+    connection: &mut Connection,
+    busy_timeout: Duration,
+) -> Result<(), WorkspaceStoreError> {
+    validate_schema_shape_for_version(connection, WorkspaceSchemaShape::V72)?;
+    configure_connection(connection, busy_timeout)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if schema_version(&transaction)? != PREVIOUS_HOME_ARTIFACT_SCHEMA_VERSION {
+        return Err(WorkspaceStoreError::DamagedSchema {
+            detail: "Home artifact migration source changed".to_owned(),
+        });
+    }
+    crate::workspace_home_transfers::artifacts::schema::create_schema(&transaction)
+        .map_err(|error| WorkspaceStoreError::HomeArtifact(Box::new(error)))?;
+    transaction.pragma_update(None, "user_version", PREVIOUS_HOME_HANDOFF_SCHEMA_VERSION)?;
+    validate_schema_shape_for_version(&transaction, WorkspaceSchemaShape::V73)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+/// Rebuild the Assignment origin columns from the exact v73 schema while
+/// preserving every pre-existing assignment as a Coordinator offer.
+pub(super) fn migrate_home_handoff_schema(
+    connection: &mut Connection,
+    busy_timeout: Duration,
+) -> Result<(), WorkspaceStoreError> {
+    validate_schema_shape_for_version(connection, WorkspaceSchemaShape::V73)?;
+    configure_connection(connection, busy_timeout)?;
+    let previous_legacy_alter_table: i64 =
+        connection.pragma_query_value(None, "legacy_alter_table", |row| row.get(0))?;
+    // The Assignment parent is referenced by several durable child tables.
+    // SQLite requires foreign-key enforcement to be disabled before BEGIN for
+    // this parent rebuild. Legacy rename semantics keep external trigger SQL
+    // byte-for-byte stable while the staging parent takes the canonical name.
+    // The transaction verifies all rows before advancing the schema version.
+    let migrated = (|| {
+        connection.pragma_update(None, "foreign_keys", false)?;
+        connection.pragma_update(None, "legacy_alter_table", true)?;
+        commit_home_handoff_schema(connection)
+    })();
+    let restore_legacy_alter_table = connection
+        .pragma_update(None, "legacy_alter_table", previous_legacy_alter_table)
+        .map_err(WorkspaceStoreError::from);
+    let restore_foreign_keys = connection
+        .pragma_update(None, "foreign_keys", true)
+        .map_err(WorkspaceStoreError::from);
+    migrated
+        .and(restore_legacy_alter_table)
+        .and(restore_foreign_keys)?;
+    validate_schema_shape(connection)
+}
+
+fn commit_home_handoff_schema(connection: &mut Connection) -> Result<(), WorkspaceStoreError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if schema_version(&transaction)? != PREVIOUS_HOME_HANDOFF_SCHEMA_VERSION {
+        return Err(WorkspaceStoreError::DamagedSchema {
+            detail: "Home handoff migration source changed".to_owned(),
+        });
+    }
+    validate_schema_shape_for_version(&transaction, WorkspaceSchemaShape::V73)?;
+    crate::workspace_home_transfers::handoffs::create_schema(&transaction)
+        .map_err(|error| WorkspaceStoreError::HomeHandoffProposal(Box::new(error)))?;
+    crate::workspace_home_transfers::create_home_handoff_application_schema(&transaction)
+        .map_err(|error| WorkspaceStoreError::HomeHandoffApplication(Box::new(error)))?;
+    workspace_agent_assignments::rebuild_home_origin_table_in_transaction(&transaction)?;
+
+    let violation = transaction
+        .query_row("PRAGMA foreign_key_check", [], |_| Ok(()))
+        .optional()?;
+    if violation.is_some() {
+        return Err(WorkspaceStoreError::DamagedSchema {
+            detail: "Home handoff migration foreign key mismatch".to_owned(),
+        });
+    }
     transaction.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)?;
     validate_schema_shape_for_version(&transaction, WorkspaceSchemaShape::Current)?;
     transaction.commit()?;
@@ -8064,8 +8375,23 @@ fn migrate_outdated_schema(
     version: i64,
 ) -> Result<(), WorkspaceStoreError> {
     match version {
+        PREVIOUS_HOME_HANDOFF_SCHEMA_VERSION => {
+            migrate_home_handoff_schema(connection, busy_timeout)
+        }
+        PREVIOUS_HOME_ARTIFACT_SCHEMA_VERSION => {
+            migrate_home_artifact_schema(connection, busy_timeout)
+        }
+        PREVIOUS_HOME_TRANSFER_RESERVATION_RETIREMENT_SCHEMA_VERSION => {
+            migrate_home_reservation_retirement_schema(connection, busy_timeout)
+        }
         PREVIOUS_QUIESCENT_ACTIVITY_LEASE_RESUME_SCHEMA_VERSION => {
             migrate_quiescent_activity_lease_resume_schema(connection, busy_timeout)
+        }
+        PREVIOUS_EVALUATION_EVIDENCE_SCHEMA_VERSION => {
+            migrate_evaluation_evidence_schema(connection, busy_timeout)
+        }
+        PREVIOUS_HOME_TRANSFER_SOURCE_SCHEMA_VERSION => {
+            migrate_home_transfer_source_schema(connection, busy_timeout)
         }
         PREVIOUS_ADMISSION_IDENTITY_SCHEMA_VERSION => {
             migrate_admission_identity_schema(connection, busy_timeout)
@@ -8140,7 +8466,7 @@ fn migrate_outdated_schema(
             configure_connection(connection, busy_timeout)?;
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            create_assignment_deletion_schema(&transaction)?;
+            create_pre_home_assignment_deletion_schema(&transaction)?;
             workspace_agent_migration::create_schema(&transaction)?;
             workspace_agent_binding_reservations::create_schema(&transaction)?;
             create_delegated_effect_schema(&transaction)?;
@@ -8341,6 +8667,17 @@ fn commit_fresh_current_schema_migration(
             detail: error.to_string(),
         },
     )?;
+    crate::workspace_evaluation_evidence::create_schema(&transaction)
+        .map_err(|error| WorkspaceStoreError::EvaluationEvidence(Box::new(error)))?;
+    crate::workspace_home_transfers::schema::create_schema(&transaction)?;
+    crate::workspace_approvals::agent_provenance::schema::create_schema(&transaction)?;
+    crate::workspace_home_transfers::retirements::schema::create_schema(&transaction)?;
+    crate::workspace_home_transfers::artifacts::schema::create_schema(&transaction)
+        .map_err(|error| WorkspaceStoreError::HomeArtifact(Box::new(error)))?;
+    crate::workspace_home_transfers::handoffs::create_schema(&transaction)
+        .map_err(|error| WorkspaceStoreError::HomeHandoffProposal(Box::new(error)))?;
+    crate::workspace_home_transfers::create_home_handoff_application_schema(&transaction)
+        .map_err(|error| WorkspaceStoreError::HomeHandoffApplication(Box::new(error)))?;
     workspace_admission_envelopes::migrate_identity_schema(&transaction)?;
     commit_schema_53_migration(transaction, CURRENT_SCHEMA_VERSION)
 }
@@ -8662,6 +8999,14 @@ fn create_assignment_deletion_schema(connection: &Connection) -> Result<(), Work
     Ok(())
 }
 
+fn create_pre_home_assignment_deletion_schema(
+    connection: &Connection,
+) -> Result<(), WorkspaceStoreError> {
+    workspace_agent_assignments::create_schema_pre_home_handoff(connection)?;
+    workspace_goal_deletion::create_schema(connection)?;
+    Ok(())
+}
+
 fn create_delegated_effect_schema(connection: &Connection) -> Result<(), WorkspaceStoreError> {
     workspace_agent_effect_outbox::create_schema(connection)?;
     workspace_effect_fact_outbox::create_schema(connection)?;
@@ -8681,7 +9026,7 @@ fn migrate_previous_schema(connection: &mut Connection) -> Result<(), WorkspaceS
     workspace_verification::migrate_to_v31(&transaction)?;
     workspace_activity_successors::create_schema(&transaction)?;
     workspace_queue_settings::create_schema(&transaction)?;
-    create_assignment_deletion_schema(&transaction)?;
+    create_pre_home_assignment_deletion_schema(&transaction)?;
     workspace_agent_migration::create_schema(&transaction)?;
     workspace_agent_binding_reservations::create_schema(&transaction)?;
     create_delegated_effect_schema(&transaction)?;
@@ -8695,7 +9040,7 @@ fn migrate_current_schema(connection: &mut Connection) -> Result<(), WorkspaceSt
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     workspace_activity_successors::create_schema(&transaction)?;
     workspace_queue_settings::create_schema(&transaction)?;
-    create_assignment_deletion_schema(&transaction)?;
+    create_pre_home_assignment_deletion_schema(&transaction)?;
     workspace_agent_migration::create_schema(&transaction)?;
     workspace_agent_binding_reservations::create_schema(&transaction)?;
     create_delegated_effect_schema(&transaction)?;
@@ -8710,7 +9055,7 @@ fn migrate_previous_queue_settings_schema(
 ) -> Result<(), WorkspaceStoreError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     workspace_queue_settings::create_schema(&transaction)?;
-    create_assignment_deletion_schema(&transaction)?;
+    create_pre_home_assignment_deletion_schema(&transaction)?;
     workspace_agent_migration::create_schema(&transaction)?;
     workspace_agent_binding_reservations::create_schema(&transaction)?;
     create_delegated_effect_schema(&transaction)?;
@@ -8927,6 +9272,11 @@ enum WorkspaceSchemaShape {
     V66,
     V67,
     V68,
+    V69,
+    V70,
+    V71,
+    V72,
+    V73,
     Current,
 }
 
@@ -8975,6 +9325,11 @@ impl WorkspaceSchemaShape {
             Self::V66 => 66,
             Self::V67 => 67,
             Self::V68 => 68,
+            Self::V69 => 69,
+            Self::V70 => 70,
+            Self::V71 => 71,
+            Self::V72 => 72,
+            Self::V73 => 73,
             Self::Current => CURRENT_SCHEMA_VERSION,
         }
     }
@@ -9099,7 +9454,25 @@ impl WorkspaceSchemaShape {
         self.version() >= PREVIOUS_ADMISSION_IDENTITY_SCHEMA_VERSION
     }
     const fn includes_quiescent_activity_lease_resume(self) -> bool {
-        self.version() >= CURRENT_SCHEMA_VERSION
+        self.version() >= PREVIOUS_EVALUATION_EVIDENCE_SCHEMA_VERSION
+    }
+    const fn includes_evaluation_evidence(self) -> bool {
+        self.version() >= PREVIOUS_HOME_TRANSFER_SOURCE_SCHEMA_VERSION
+    }
+    const fn includes_home_transfer_source(self) -> bool {
+        self.version() > PREVIOUS_HOME_TRANSFER_SOURCE_SCHEMA_VERSION
+    }
+    const fn includes_home_artifacts(self) -> bool {
+        self.version() > PREVIOUS_HOME_ARTIFACT_SCHEMA_VERSION
+    }
+    const fn includes_home_handoffs(self) -> bool {
+        self.version() > PREVIOUS_HOME_HANDOFF_SCHEMA_VERSION
+    }
+    const fn includes_home_reservation_retirement(self) -> bool {
+        self.version() > PREVIOUS_HOME_TRANSFER_RESERVATION_RETIREMENT_SCHEMA_VERSION
+    }
+    const fn includes_approval_agent_provenance(self) -> bool {
+        self.version() > PREVIOUS_HOME_TRANSFER_SOURCE_SCHEMA_VERSION
     }
 }
 /// Map one inspected database to the schema shape its version must exhibit.
@@ -9108,7 +9481,20 @@ fn read_only_schema_shape(
 ) -> Result<WorkspaceSchemaShape, WorkspaceStoreError> {
     match ownership {
         DatabaseOwnership::Current => Ok(WorkspaceSchemaShape::Current),
+        DatabaseOwnership::Outdated { version }
+            if version == PREVIOUS_HOME_ARTIFACT_SCHEMA_VERSION =>
+        {
+            Ok(WorkspaceSchemaShape::V72)
+        }
+        DatabaseOwnership::Outdated { version }
+            if version == PREVIOUS_HOME_HANDOFF_SCHEMA_VERSION =>
+        {
+            Ok(WorkspaceSchemaShape::V73)
+        }
         DatabaseOwnership::Outdated { version } => match version {
+            PREVIOUS_HOME_TRANSFER_RESERVATION_RETIREMENT_SCHEMA_VERSION => {
+                Ok(WorkspaceSchemaShape::V71)
+            }
             PREVIOUS_DELEGATED_ROOT_RECOVERY_SCHEMA_VERSION => Ok(WorkspaceSchemaShape::V62),
             PREVIOUS_EXPIRED_ACTIVITY_RECOVERY_SCHEMA_VERSION => Ok(WorkspaceSchemaShape::V63),
             PREVIOUS_BINDING_REJECTION_SCHEMA_VERSION => Ok(WorkspaceSchemaShape::V64),
@@ -9120,6 +9506,8 @@ fn read_only_schema_shape(
             PREVIOUS_QUIESCENT_ACTIVITY_LEASE_RESUME_SCHEMA_VERSION => {
                 Ok(WorkspaceSchemaShape::V68)
             }
+            PREVIOUS_EVALUATION_EVIDENCE_SCHEMA_VERSION => Ok(WorkspaceSchemaShape::V69),
+            PREVIOUS_HOME_TRANSFER_SOURCE_SCHEMA_VERSION => Ok(WorkspaceSchemaShape::V70),
             PREVIOUS_ROOT_RECOVERY_SCHEMA_VERSION => Ok(WorkspaceSchemaShape::V61),
             PREVIOUS_RECOVERY_RUNS_SCHEMA_VERSION => Ok(WorkspaceSchemaShape::V60),
             PREVIOUS_STOP_SETTLEMENT_SCHEMA_VERSION => Ok(WorkspaceSchemaShape::V59),
@@ -9229,6 +9617,29 @@ fn validate_schema_shape_for_version(
             detail: error.to_string(),
         }
     })?;
+    if shape.includes_evaluation_evidence() {
+        crate::workspace_evaluation_evidence::validate_schema(connection)
+            .map_err(|error| WorkspaceStoreError::EvaluationEvidence(Box::new(error)))?;
+    }
+    if shape.includes_home_transfer_source() {
+        crate::workspace_home_transfers::schema::validate_schema(connection)?;
+    }
+    if shape.includes_home_reservation_retirement() {
+        crate::workspace_home_transfers::retirements::schema::validate_schema(connection)?;
+    }
+    if shape.includes_home_artifacts() {
+        crate::workspace_home_transfers::artifacts::schema::validate_schema(connection)
+            .map_err(|error| WorkspaceStoreError::HomeArtifact(Box::new(error)))?;
+    }
+    if shape.includes_home_handoffs() {
+        crate::workspace_home_transfers::handoffs::validate_schema(connection)
+            .map_err(|error| WorkspaceStoreError::HomeHandoffProposal(Box::new(error)))?;
+        crate::workspace_home_transfers::validate_home_handoff_application_schema(connection)
+            .map_err(|error| WorkspaceStoreError::HomeHandoffApplication(Box::new(error)))?;
+    }
+    if shape.includes_approval_agent_provenance() {
+        workspace_approvals::agent_provenance::schema::validate_schema(connection)?;
+    }
     if shape.includes_stop_authority() {
         workspace_approvals::cleanup::stop_receipts::validate_schema(connection)?;
     }
@@ -9286,7 +9697,11 @@ fn validate_schema_shape_for_version(
     if shape.includes_assignments_and_deletion() {
         if shape.includes_work_credit() {
             if shape.includes_offer_seals() {
-                workspace_agent_assignments::validate_schema(connection)?;
+                if shape.includes_home_handoffs() {
+                    workspace_agent_assignments::validate_schema(connection)?;
+                } else {
+                    workspace_agent_assignments::validate_schema_pre_home_handoff(connection)?;
+                }
             } else {
                 workspace_agent_assignments::validate_schema_pre_offer_seals(connection)?;
             }
@@ -9571,7 +9986,11 @@ fn validate_schema_objects(
     ]);
     if shape.includes_assignments_and_deletion() {
         if shape.includes_offer_seals() {
-            expected.extend(workspace_agent_assignments::schema_objects());
+            if shape.includes_home_handoffs() {
+                expected.extend(workspace_agent_assignments::schema_objects());
+            } else {
+                expected.extend(workspace_agent_assignments::schema_objects_v73());
+            }
         } else {
             expected.extend(workspace_agent_assignments::schema_objects_pre_offer_seals());
         }
@@ -9732,6 +10151,29 @@ fn validate_schema_objects(
     }
     if shape.includes_quiescent_activity_lease_resume() {
         expected.extend(crate::workspace_quiescent_activity_lease_resumes::schema_objects());
+    }
+    if shape.includes_evaluation_evidence() {
+        expected.extend(crate::workspace_evaluation_evidence::schema_objects());
+    }
+    if shape.includes_home_transfer_source() {
+        expected.extend(crate::workspace_home_transfers::schema::schema_objects());
+    }
+    if shape.includes_home_reservation_retirement() {
+        expected.extend(crate::workspace_home_transfers::retirements::schema::schema_objects());
+    }
+    if shape.includes_home_artifacts() {
+        expected.extend(crate::workspace_home_transfers::artifacts::schema::schema_objects());
+    }
+    if shape.includes_home_handoffs() {
+        expected.extend(crate::workspace_home_transfers::handoffs::schema_objects());
+        expected.extend(crate::workspace_home_transfers::home_handoff_application_schema_objects());
+    }
+    if shape.includes_approval_agent_provenance() {
+        expected.extend(
+            workspace_approvals::agent_provenance::schema::schema_objects()
+                .into_iter()
+                .map(|(kind, name, _)| (kind, name)),
+        );
     }
     validate_schema_objects_for(connection, &expected)
 }
@@ -10655,6 +11097,52 @@ pub enum WorkspaceStoreError {
         #[source]
         source: Box<WorkspaceStoreError>,
     },
+    #[error("evaluation source mutation {identity:?} may have committed; exact readback is required")]
+    EvaluationEvidenceCommittedUnconfirmed {
+        identity: EvaluationEvidenceMutationIdentity,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    },
+    #[error("evaluation source evidence persistence failed")]
+    EvaluationEvidence(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
+    #[error(transparent)]
+    HomeTransfer(#[from] crate::HomeTransferStoreError),
+    #[error(transparent)]
+    HomeHandoffProposal(#[from] Box<crate::HomeHandoffProposalStoreError>),
+    #[error(transparent)]
+    HomeHandoffApplication(#[from] Box<crate::HomeHandoffApplicationStoreError>),
+    #[error(
+        "Home handoff proposal {proposal_id} for handoff {handoff_id} committed, but its live binding could not be confirmed; exact readback is required"
+    )]
+    HomeHandoffProposalReadbackRequired {
+        handoff_id: Uuid,
+        proposal_id: Uuid,
+        #[source]
+        source: Box<WorkspaceStoreError>,
+    },
+    #[error("Home handoff acceptance {acceptance_id} requires exact durable readback")]
+    HomeHandoffAcceptanceReadbackRequired {
+        acceptance_id: Uuid,
+        #[source]
+        source: Box<WorkspaceStoreError>,
+    },
+    #[error(transparent)]
+    HomeArtifact(#[from] Box<crate::workspace_home_transfers::artifacts::HomeArtifactJournalError>),
+    #[error(transparent)]
+    HomeArtifactObjectStore(#[from] Box<forge_workspace::HomeArtifactStoreError>),
+    #[error("Home-transfer source preparation {preparation_id} requires durable readback")]
+    HomeTransferReadbackRequired {
+        preparation_id: Uuid,
+        #[source]
+        source: Box<WorkspaceStoreError>,
+    },
+    #[error("Home reservation {reservation_request_id} retirement under preparation {preparation_id} requires durable readback")]
+    HomeReservationRetirementReadbackRequired {
+        preparation_id: Uuid,
+        reservation_request_id: Uuid,
+        #[source]
+        source: Box<WorkspaceStoreError>,
+    },
     #[error(transparent)]
     AgentAssignment(#[from] crate::AgentAssignmentStoreError),
     #[error(transparent)]
@@ -11084,8 +11572,16 @@ mod tests {
     mod admission_identity;
     mod assignment_continuation;
     mod binding_rejection;
+    mod evaluation_evidence_migration;
     mod execution_stop;
     mod expired_successor_recovery;
+    mod home_artifact;
+    mod home_artifact_retention;
+    mod home_handoff_migration;
+    mod home_handoff_proposals;
+    mod home_source_continuation;
+    mod home_source_migration;
+    mod home_source_owner;
     mod native_closure;
     mod owned_stop_authority;
     mod quiescent_activity_lease_resume;
@@ -11143,7 +11639,8 @@ mod tests {
     /// deliberately downgrades an otherwise current database.
     pub(super) fn downgrade_admission_identity(
         connection: &Connection,
-    ) -> Result<(), rusqlite::Error> {
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        crate::evaluation_schema_fixture::remove_empty_evaluation_schema(connection)?;
         let exists: bool = connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='execution_admission_consumptions')", [], |row| row.get(0)
         )?;
@@ -11167,13 +11664,15 @@ mod tests {
         BUSY_TIMEOUT, CURRENT_SCHEMA_VERSION, EXPECTED_ACTIVITIES_TABLE_SQL,
         MAX_DOCTOR_SNAPSHOT_BYTES, PREVIOUS_ASSIGNMENT_OFFER_SEALS_SCHEMA_VERSION,
         PREVIOUS_ASSIGNMENT_SUBMITTED_SCHEMA_VERSION, PREVIOUS_COORDINATOR_RECOVERY_SCHEMA_VERSION,
+        PREVIOUS_EVALUATION_EVIDENCE_SCHEMA_VERSION,
         PREVIOUS_GOAL_CREATION_WATERMARK_SCHEMA_VERSION,
-        PREVIOUS_GOAL_MUTATION_RECEIPTS_SCHEMA_VERSION, PREVIOUS_MODERN_SCHEMA_VERSION,
+        PREVIOUS_GOAL_MUTATION_RECEIPTS_SCHEMA_VERSION,
+        PREVIOUS_HOME_TRANSFER_SOURCE_SCHEMA_VERSION, PREVIOUS_MODERN_SCHEMA_VERSION,
         PREVIOUS_SCHEMA_VERSION, PREVIOUS_SOURCE_REFS_SCHEMA_VERSION,
         PREVIOUS_WORK_CUT_CONTINUATIONS_SCHEMA_VERSION, PREVIOUS_WORK_CUTS_SCHEMA_VERSION,
         WORKSPACE_APPLICATION_ID, WorkspaceDoctorIntegrity, WorkspaceDoctorOutcome,
-        WorkspaceStateRemovalBlocker, WorkspaceStore, WorkspaceStoreError,
-        validate_doctor_snapshot_size,
+        WorkspaceSchemaShape, WorkspaceStateRemovalBlocker, WorkspaceStore, WorkspaceStoreError,
+        validate_doctor_snapshot_size, validate_schema_shape_for_version,
     };
     use crate::workspace_executions;
     use crate::workspace_goals;
@@ -13495,7 +13994,9 @@ mod tests {
         Ok(())
     }
 
-    fn remove_operations_migration_schema(connection: &Connection) -> Result<(), rusqlite::Error> {
+    fn remove_operations_migration_schema(
+        connection: &Connection,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         remove_delegated_effect_schema(connection)?;
         connection.execute_batch("DROP TABLE IF EXISTS agent_binding_reservations")?;
         // Names come only from the canonical closed schema object inventory.
@@ -13508,7 +14009,7 @@ mod tests {
         Ok(())
     }
 
-    fn remove_work_cut_schema(connection: &Connection) -> Result<(), rusqlite::Error> {
+    fn remove_work_cut_schema(connection: &Connection) -> Result<(), Box<dyn std::error::Error>> {
         remove_continuation_schema(connection)?;
         for (kind, name) in crate::workspace_work_cuts::schema_objects()
             .into_iter()
@@ -13568,7 +14069,9 @@ mod tests {
         Ok(())
     }
 
-    fn remove_continuation_schema(connection: &Connection) -> Result<(), rusqlite::Error> {
+    fn remove_continuation_schema(
+        connection: &Connection,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         remove_execution_stop_schema(connection)?;
         crate::workspace_approvals::rebuild_v55_auto_scopes_fixture(connection)?;
         for (kind, name) in crate::workspace_work_cuts::continuation_schema_objects()
@@ -13598,7 +14101,9 @@ mod tests {
         result
     }
 
-    fn remove_execution_stop_schema(connection: &Connection) -> Result<(), rusqlite::Error> {
+    fn remove_execution_stop_schema(
+        connection: &Connection,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         remove_recovery_runs_schema(connection)?;
         connection.execute_batch(
             "DROP TABLE IF EXISTS workspace_execution_stop_settlement_targets;
@@ -13609,10 +14114,13 @@ mod tests {
              DROP TABLE IF EXISTS authority_stop_batches;
              DROP TABLE IF EXISTS workspace_execution_stop_targets;
              DROP TABLE IF EXISTS workspace_execution_stops;",
-        )
+        )?;
+        Ok(())
     }
 
-    fn remove_recovery_runs_schema(connection: &Connection) -> Result<(), rusqlite::Error> {
+    fn remove_recovery_runs_schema(
+        connection: &Connection,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         downgrade_admission_identity(connection)?;
         connection.execute_batch(
             "DROP TABLE IF EXISTS unstarted_activity_continuation_receipts;
@@ -13627,12 +14135,13 @@ mod tests {
             DROP TABLE IF EXISTS recovery_runs;
             DROP TABLE IF EXISTS root_recovery_delegation_receipts;
             DROP TABLE IF EXISTS workspace_root_recovery_receipts;",
-        )
+        )?;
+        Ok(())
     }
 
     fn remove_assignment_offer_seal_and_work_cut_schema(
         connection: &Connection,
-    ) -> Result<(), rusqlite::Error> {
+    ) -> Result<(), Box<dyn std::error::Error>> {
         remove_work_cut_schema(connection)?;
         for (kind, name) in crate::workspace_agent_assignments::offer_seal_schema_objects()
             .into_iter()
@@ -13645,7 +14154,7 @@ mod tests {
 
     fn remove_goal_creation_watermark_schema(
         connection: &Connection,
-    ) -> Result<(), rusqlite::Error> {
+    ) -> Result<(), Box<dyn std::error::Error>> {
         remove_assignment_offer_seal_and_work_cut_schema(connection)?;
         for (kind, name) in crate::workspace_goal_creation_watermarks::schema_objects()
             .into_iter()
@@ -13760,7 +14269,7 @@ mod tests {
 
     fn remove_goal_mutation_receipts_schema(
         connection: &Connection,
-    ) -> Result<(), rusqlite::Error> {
+    ) -> Result<(), Box<dyn std::error::Error>> {
         remove_goal_creation_watermark_schema(connection)?;
         for (kind, name) in crate::workspace_coordinator_recovery::schema_objects() {
             connection.execute_batch(&format!("DROP {kind} {name}"))?;
@@ -13774,7 +14283,9 @@ mod tests {
         Ok(())
     }
 
-    fn remove_delegated_effect_schema(connection: &Connection) -> Result<(), rusqlite::Error> {
+    fn remove_delegated_effect_schema(
+        connection: &Connection,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         remove_goal_mutation_receipts_schema(connection)?;
         for (kind, name) in crate::workspace_effect_fact_outbox::base_schema_objects()
             .into_iter()

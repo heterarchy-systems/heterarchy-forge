@@ -16,24 +16,27 @@ use std::time::{Duration, Instant};
 use super::{
     DoctorRetention, DoctorSandbox, MAX_DOCTOR_OUTPUT_BYTES, MSRV_TOOLCHAIN,
     REQUIRED_CARGO_AUDIT_VERSION, REQUIRED_CARGO_DENY_VERSION, capture_process_with_env, cargo,
-    cargo_target_directory, command, require_nonempty_file, require_tool_version, rules,
-    unique_suffix, workspace_root,
+    cargo_target_directory, command_in, require_nonempty_file, require_tool_version, rules,
+    unique_suffix,
 };
 
-pub(super) fn doctor() -> Result<(), String> {
-    let root = workspace_root();
+pub(super) fn doctor(root: &Path) -> Result<(), String> {
     let mut sandbox = DoctorSandbox::create()?;
-    rules()?;
-    command("rustc", &["--version"])?;
-    command("cargo", &["--version"])?;
-    command("cargo", &["fmt", "--version"])?;
-    command("cargo", &["clippy", "--version"])?;
-    command("rustup", &["run", MSRV_TOOLCHAIN, "rustc", "--version"])?;
-    require_tool_version("cargo-deny", REQUIRED_CARGO_DENY_VERSION, &root)?;
-    require_tool_version("cargo-audit", REQUIRED_CARGO_AUDIT_VERSION, &root)?;
+    rules(root)?;
+    command_in("rustc", &["--version"], root)?;
+    command_in("cargo", &["--version"], root)?;
+    command_in("cargo", &["fmt", "--version"], root)?;
+    command_in("cargo", &["clippy", "--version"], root)?;
+    command_in(
+        "rustup",
+        &["run", MSRV_TOOLCHAIN, "rustc", "--version"],
+        root,
+    )?;
+    require_tool_version("cargo-deny", REQUIRED_CARGO_DENY_VERSION, root)?;
+    require_tool_version("cargo-audit", REQUIRED_CARGO_AUDIT_VERSION, root)?;
     require_nonempty_file(&root.join("Cargo.lock"), "Cargo lockfile")?;
-    cargo(&["build", "--locked", "-p", "forge-backend"])?;
-    run_backend_doctor(&root, &mut sandbox)?;
+    cargo(root, &["build", "--locked", "-p", "forge-backend"])?;
+    run_backend_doctor(root, &mut sandbox)?;
     if !sandbox.registry_path().exists() {
         return Err(format!(
             "backend doctor did not create the durable sandbox registry {}",

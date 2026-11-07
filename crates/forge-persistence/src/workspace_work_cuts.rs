@@ -41,6 +41,8 @@ const MAX_WORK_CUT_EFFECTS: usize = 1024;
 #[derive(Debug, Error)]
 pub enum WorkCutError {
     #[error(transparent)]
+    HomeTransfer(#[from] Box<crate::HomeTransferStoreError>),
+    #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]
     Inventory(#[from] Box<crate::WorkInventoryError>),

@@ -10,7 +10,7 @@ use super::*;
 
 use forge_control::{
     AgentExecutionAuthorityRequest, AgentOperationsDelegationReadRequest,
-    EffectFactOutboxReadRequest, FileActivityScope, ProjectCommandId, ProjectCommandListRequest,
+    EffectFactOutboxReadRequest,
 };
 use forge_domain::{
     ExecutionCommandId, ExecutionId, ExecutionListLimit, ExecutionObservationSelection,
@@ -58,11 +58,12 @@ async fn run_research_package_fixture_variant(
         std::path::PathBuf::from,
     );
     let orchestration_binary = required_binary("FORGE_ORCHESTRATION_BACKEND_BIN")?;
+    let temp_base = package_fixture_temp_base()?;
     let mut fixture = prepare_fixture()?;
     let fixture_root = fixture.root.clone();
     let retain_failure = env::var_os("FORGE_PACKAGE_V_KEEP_FAILURE").is_some();
     if retain_failure {
-        eprintln!("PackageV temp_dir={}", std::env::temp_dir().display());
+        eprintln!("PackageV temp_dir={}", temp_base.display());
     }
     let result = run_package_flow(
         &mut fixture,
@@ -75,7 +76,7 @@ async fn run_research_package_fixture_variant(
         if let Err(error) = diagnose_published_inputs(&fixture) {
             eprintln!("PackageV published-input diagnosis failed: {error}");
         }
-        let diagnostic_root = std::env::temp_dir().join(format!(
+        let diagnostic_root = temp_base.join(format!(
             "forge-package-v-diagnostic-{}-{}",
             std::process::id(),
             Uuid::now_v7()
@@ -141,39 +142,6 @@ fn diagnose_published_inputs(fixture: &Fixture) -> Result<(), Box<dyn std::error
             result_json["checkedClaims"],
             result_json["checkedCitations"],
         );
-        let command_id = ProjectCommandId::new(PACKAGE_COMMAND_ID.to_owned())?;
-        let snapshot = fixture
-            .client
-            .project_command_list(ProjectCommandListRequest {
-                scope: fixture.scope.clone(),
-                activity: FileActivityScope {
-                    activity_id: fixture.activity_id,
-                    runtime_instance_id: fixture.runtime_instance_id,
-                    observed_at: timestamp_now()?,
-                },
-            })?;
-        let resolved = fixture.client.project_command_execution_request_fenced(
-            ProjectCommandListRequest {
-                scope: fixture.scope.clone(),
-                activity: FileActivityScope {
-                    activity_id: fixture.activity_id,
-                    runtime_instance_id: fixture.runtime_instance_id,
-                    observed_at: timestamp_now()?,
-                },
-            },
-            command_id,
-            snapshot.fingerprint(),
-            forge_domain::ExecutionId::from_uuid(id),
-        )?;
-        let runner = forge_execution::ExecutionRunner::new(1)?;
-        match runner.spawn_package_verification(&layout, resolved.request().clone(), input) {
-            Ok(running) => {
-                eprintln!("PackageV diagnostic runner accepted native spawn; cancelling probe");
-                let _ignored = running.cancel();
-                let _ignored = running.wait();
-            }
-            Err(error) => eprintln!("PackageV diagnostic runner error: {error:?}"),
-        }
     }
     let capability = forge_execution::PackageVExecutableCapability::prepare_current()?;
     capability.revalidate()?;

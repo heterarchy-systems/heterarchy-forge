@@ -69,6 +69,7 @@ Repository-local source and tests are the final implementation authority. The ha
 - Dependencies and build scripts are part of the trusted product surface. Keep `Cargo.lock` and use locked/reviewed dependency gates once scaffolded.
 - Do not claim a check passed unless it was actually executed.
 - Run focused tests first, then canonical `cargo xtask ci`; use `cargo xtask supply-chain` for configured extended/release verification.
+- Public `make ci` must run without `.agents`. For local agent work, read the existing ignored Harness and run strict `make harness`; never add `.agents` to source commits, CI inputs, or release artifacts.
 - Commit or push only when the user explicitly requests it.
 
 ## Codex subagent routing

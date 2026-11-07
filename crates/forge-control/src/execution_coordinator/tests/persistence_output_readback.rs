@@ -250,6 +250,11 @@ fn sqlite_busy_output_write_reads_back_absent_then_retries_exact_events_and_acks
         .get(&fixture.execution_id)
         .map(|active| active.running.clone());
 
+    // A response acknowledges the write, not the handler's final SQLite
+    // close. Join before reopening so sidecar removal cannot race this read.
+    let handler_result = journal_handler
+        .join()
+        .map_err(|_| "busy output journal handler panicked")?;
     let (durable_record, output) = read_wait_fixture_store(&fixture)?;
     let all_stdout = output.events().iter().all(|event| match event {
         ExecutionOutputEvent::Chunk(chunk) => chunk.stream() == ExecutionOutputStream::Stdout,
@@ -267,9 +272,6 @@ fn sqlite_busy_output_write_reads_back_absent_then_retries_exact_events_and_acks
         .collect::<Vec<_>>();
 
     let runtime_cleanup = stop_runtime(&mut runtime);
-    let handler_result = journal_handler
-        .join()
-        .map_err(|_| "busy output journal handler panicked")?;
     let fixture_cleanup = fixture.finish();
     runtime_cleanup?;
     handler_result.map_err(std::io::Error::other)?;

@@ -59,7 +59,10 @@ pub(crate) fn run(root: &Path) -> Result<(), String> {
         )
     })?;
 
-    super::cargo(&["build", "--locked", "--release", "-p", BACKEND_PACKAGE])?;
+    super::cargo(
+        root,
+        &["build", "--locked", "--release", "-p", BACKEND_PACKAGE],
+    )?;
     let release_binary = super::cargo_target_directory(root)?
         .join("release")
         .join(BACKEND_PACKAGE);

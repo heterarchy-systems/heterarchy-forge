@@ -416,8 +416,7 @@ pub(crate) fn semantic_events_after(
     if limit == 0 || limit > MAX_PAGE_SIZE {
         return Err(SemanticEventError::InvalidLimit { limit });
     }
-    let high_water = high_water_seq(connection, workspace_id)?;
-    let retained_low = retained_low(connection, workspace_id)?;
+    let (high_water, retained_low) = cursor_metadata(connection, workspace_id)?;
     let after = i64::try_from(after).map_err(|_| SemanticEventError::InvalidCursor)?;
     let mut statement = connection.prepare(
         "SELECT sequence, event_kind, subject_goal_id, subject_dag_revision, subject_node_id,
@@ -547,22 +546,25 @@ fn high_water_seq(
     }
 }
 
-fn retained_low(
+fn cursor_metadata(
     connection: &Connection,
     workspace_id: WorkspaceId,
-) -> Result<u64, SemanticEventError> {
-    let retained: Option<i64> = connection
+) -> Result<(u64, u64), SemanticEventError> {
+    let metadata: Option<(i64, i64)> = connection
         .query_row(
-            "SELECT retained_low FROM semantic_events_meta WHERE workspace_id = ?1",
+            "SELECT high_water_seq, retained_low FROM semantic_events_meta WHERE workspace_id = ?1",
             params![workspace_id.into_uuid().as_bytes()],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
-    match retained {
-        None => Ok(0),
-        Some(value) => u64::try_from(value)
-            .map_err(|_| SemanticEventError::CorruptRecord("semantic_events_meta.retained_low")),
-    }
+    let Some((high_water, retained_low)) = metadata else {
+        return Ok((0, 0));
+    };
+    let high_water = u64::try_from(high_water)
+        .map_err(|_| SemanticEventError::CorruptRecord("semantic_events_meta.high_water_seq"))?;
+    let retained_low = u64::try_from(retained_low)
+        .map_err(|_| SemanticEventError::CorruptRecord("semantic_events_meta.retained_low"))?;
+    Ok((high_water, retained_low))
 }
 
 fn decode_optional_id(
@@ -875,6 +877,94 @@ mod tests {
     }
 
     #[test]
+    fn cursor_metadata_is_scoped_and_rejects_corrupt_values()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let connection = snapshot_fixture()?;
+        let transaction = connection.unchecked_transaction()?;
+        append_semantic_event(
+            &transaction,
+            &sample_event(SemanticEventKind::GoalCreated, 1)?,
+        )?;
+        transaction.commit()?;
+        let other = WorkspaceId::from_uuid(Uuid::from_u128(0x5E09));
+        assert_eq!(
+            semantic_events_after(&connection, other, 0, 1)?.high_water(),
+            0
+        );
+        assert_eq!(
+            workspace_semantic_snapshot(&connection, other, 1)?.retained_low(),
+            0
+        );
+
+        // Deliberately bypass only CHECK constraints to exercise fail-closed row decoding.
+        connection.execute_batch("PRAGMA ignore_check_constraints=ON")?;
+        for (column, field) in [
+            ("high_water_seq", "semantic_events_meta.high_water_seq"),
+            ("retained_low", "semantic_events_meta.retained_low"),
+        ] {
+            // Identifiers come only from the code-owned pair above, never user input.
+            connection.execute(
+                &format!("UPDATE semantic_events_meta SET {column}=-1 WHERE workspace_id=?1"),
+                params![workspace().into_uuid().as_bytes()],
+            )?;
+            assert!(matches!(
+                semantic_events_after(&connection, workspace(), 0, 1),
+                Err(SemanticEventError::CorruptRecord(actual)) if actual == field
+            ));
+            assert!(matches!(
+                workspace_semantic_snapshot(&connection, workspace(), 1),
+                Err(SemanticEventError::CorruptRecord(actual)) if actual == field
+            ));
+            let value = i64::from(column == "high_water_seq");
+            connection.execute(
+                &format!("UPDATE semantic_events_meta SET {column}=?1 WHERE workspace_id=?2"),
+                params![value, workspace().into_uuid().as_bytes()],
+            )?;
+        }
+        let page = semantic_events_after(&connection, workspace(), 0, 1)?;
+        let snapshot = workspace_semantic_snapshot(&connection, workspace(), 1)?;
+        assert_eq!((page.high_water(), page.retained_low()), (1, 0));
+        assert_eq!((snapshot.watermark_seq(), snapshot.retained_low()), (1, 0));
+        assert!(matches!(
+            semantic_events_after(&connection, workspace(), u64::MAX, 1),
+            Err(SemanticEventError::InvalidCursor)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "local informational event-page microbenchmark; no service latency claim"]
+    fn measure_event_page_reads() -> Result<(), Box<dyn std::error::Error>> {
+        for event_count in [0, 64] {
+            let connection = event_stream_fixture()?;
+            let transaction = connection.unchecked_transaction()?;
+            for revision in 1..=event_count {
+                append_semantic_event(
+                    &transaction,
+                    &sample_event(SemanticEventKind::GoalUpdated, revision)?,
+                )?;
+            }
+            transaction.commit()?;
+            for readers in [1_u32, 16, 64] {
+                let polls = readers * 250;
+                let started = std::time::Instant::now();
+                for _ in 0..polls {
+                    let page = semantic_events_after(&connection, workspace(), 0, 64)?;
+                    assert_eq!(page.high_water(), u64::try_from(event_count)?);
+                    assert_eq!(page.events().len(), usize::try_from(event_count)?);
+                    drop(std::hint::black_box(page));
+                }
+                println!(
+                    "event_page rows={event_count} sequential_readers={readers} polls={polls} elapsed_us={} ns_per_page={}",
+                    started.elapsed().as_micros(),
+                    started.elapsed().as_nanos() / u128::from(polls)
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn snapshot_limit_reports_truncation_without_torn_cursor_metadata()
     -> Result<(), Box<dyn std::error::Error>> {
         let connection = snapshot_fixture()?;
@@ -1017,8 +1107,7 @@ pub(crate) fn workspace_semantic_snapshot(
     let query_limit = i64::try_from(goal_limit + 1)
         .map_err(|_| SemanticEventError::InvalidLimit { limit: u32::MAX })?;
     let transaction = connection.unchecked_transaction()?;
-    let watermark_seq = high_water_seq(&transaction, workspace_id)?;
-    let retained_low = retained_low(&transaction, workspace_id)?;
+    let (watermark_seq, retained_low) = cursor_metadata(&transaction, workspace_id)?;
     let mut statement = transaction.prepare(
         "SELECT goal_id, activity_id, revision, state
          FROM goals WHERE workspace_id = ?1

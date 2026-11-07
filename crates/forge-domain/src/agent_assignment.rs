@@ -12,9 +12,15 @@ use thiserror::Error;
 use uuid::Uuid;
 
 mod continuation;
+mod home_handoff;
 mod origin;
 pub use continuation::{AgentAssignmentContinuationError, AgentAssignmentContinuationPlan};
-pub use origin::{AgentAssignmentContinuationOrigin, AgentAssignmentOrigin};
+pub use home_handoff::{
+    AgentAssignmentHomeHandoffAcceptance, AgentAssignmentHomeHandoffTransition,
+};
+pub use origin::{
+    AgentAssignmentContinuationOrigin, AgentAssignmentHomeHandoffOrigin, AgentAssignmentOrigin,
+};
 
 use crate::{
     ActivityCoordinatorActor, ActivityCoordinatorRevision, AgentInstanceId, AgentInstanceRevision,
@@ -368,6 +374,17 @@ impl AgentAssignmentTarget {
             principal,
             agent_revision,
         }
+    }
+
+    /// Compare the stable Agent, Session, and principal identity only.
+    ///
+    /// This does not authorize an operation or establish a current binding.
+    /// Owners that require freshness must independently compare
+    /// `agent_revision` with their current Agent readback.
+    pub fn has_same_identity(self, other: Self) -> bool {
+        self.agent_id == other.agent_id
+            && self.session_id == other.session_id
+            && self.principal == other.principal
     }
 
     pub const fn agent_id(self) -> AgentInstanceId {
@@ -1074,6 +1091,16 @@ impl RegisteredAgentAssignment {
         {
             return Err(AgentAssignmentTransitionError::InvalidContinuationOrigin);
         }
+        if let AgentAssignmentOrigin::HomeHandoff(origin) = self.origin
+            && (origin.preparation_id().is_nil()
+                || origin.handoff_id().is_nil()
+                || origin.predecessor_id().into_uuid().is_nil()
+                || origin.root_assignment_id().into_uuid().is_nil()
+                || origin.predecessor_id() == self.id
+                || origin.root_assignment_id() == self.id)
+        {
+            return Err(AgentAssignmentTransitionError::InvalidHomeHandoffOrigin);
+        }
         if self.state == AgentAssignmentState::Offered
             && (self.revision != AgentAssignmentRevision::INITIAL
                 || self.result.is_some()
@@ -1403,6 +1430,18 @@ impl RegisteredAgentAssignment {
 pub enum AgentAssignmentTransitionError {
     #[error("Agent assignment continuation lineage is invalid")]
     InvalidContinuationOrigin,
+    #[error("Agent assignment Home handoff origin is invalid")]
+    InvalidHomeHandoffOrigin,
+    #[error("Home handoff cannot derive root lineage from a cut continuation")]
+    HomeHandoffLineageUnsupported,
+    #[error("Home handoff successor must differ from its predecessor and root assignment")]
+    HomeHandoffIdentityConflict,
+    #[error("Home handoff Coordinator scope conflicts with the predecessor")]
+    HomeHandoffCoordinatorScopeConflict,
+    #[error("Home handoff recipient must use a different Agent and Session")]
+    HomeHandoffRecipientConflict,
+    #[error("Home handoff Node revision moved backwards")]
+    HomeHandoffNodeRevisionConflict,
     #[error("Agent assignment requires exact cut-continuation authority")]
     ContinuationAuthorityRequired,
     #[error("Agent assignment revision conflicts")]
@@ -1552,5 +1591,53 @@ mod tests {
         assert!(AgentAssignmentSourceUrl::new("https://example.test/ref".to_owned()).is_ok());
         assert!(AgentAssignmentResult::new("report".to_owned(), Vec::new(), None,).is_ok());
         assert!(AgentAssignmentResult::new(String::new(), Vec::new(), None,).is_err());
+    }
+
+    #[test]
+    fn target_identity_ignores_revision_but_includes_agent_session_and_principal()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_, _, _, _, agent_id, session_id, other_agent_id, other_session_id) = ids();
+        let principal = AuthenticatedPrincipal::TrustedStdio;
+        let proposal_target = AgentAssignmentTarget::new(
+            agent_id,
+            session_id,
+            principal,
+            AgentInstanceRevision::INITIAL,
+        );
+        let take_target = AgentAssignmentTarget::new(
+            agent_id,
+            session_id,
+            principal,
+            AgentInstanceRevision::INITIAL.checked_next()?,
+        );
+
+        assert!(proposal_target.has_same_identity(take_target));
+        assert!(
+            !proposal_target.has_same_identity(AgentAssignmentTarget::new(
+                other_agent_id,
+                session_id,
+                principal,
+                take_target.agent_revision(),
+            ))
+        );
+        assert!(
+            !proposal_target.has_same_identity(AgentAssignmentTarget::new(
+                agent_id,
+                other_session_id,
+                principal,
+                take_target.agent_revision(),
+            ))
+        );
+        assert!(
+            !proposal_target.has_same_identity(AgentAssignmentTarget::new(
+                agent_id,
+                session_id,
+                AuthenticatedPrincipal::OAuthGrant(crate::OAuthGrantId::from_uuid(
+                    Uuid::from_u128(10,)
+                )),
+                take_target.agent_revision(),
+            ))
+        );
+        Ok(())
     }
 }

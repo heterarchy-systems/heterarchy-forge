@@ -473,7 +473,10 @@ async fn start_composition(shared: &Shared) -> Result<Composition, Box<dyn std::
             SECRET,
             forge_domain::ForgeBackendId::from_uuid(Uuid::from_u128(0xE001)),
             forge_domain::OrchestrationIssuerId::from_uuid(Uuid::from_u128(0xE002)),
-        )?,
+        )?
+        // Match the SSE contract fixtures' short cadence, leaving more poll
+        // opportunities within the unchanged bounded flow-test read budget.
+        .with_sse_poll_interval(Duration::from_millis(50)),
         forge_backend::http::BackendClients {
             control: &client,
             execution: &execution_client,
@@ -628,7 +631,7 @@ async fn read_until(
     budget: Duration,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let mut wire = Vec::new();
-    tokio::time::timeout(budget, async {
+    let read_result = tokio::time::timeout(budget, async {
         let mut chunk = [0_u8; 4096];
         loop {
             match stream.read(&mut chunk).await {
@@ -642,8 +645,16 @@ async fn read_until(
             }
         }
     })
-    .await
-    .map_err(|_| "stream read exceeded its budget")?;
+    .await;
+    if read_result.is_err() {
+        let diagnostic_start = wire.len().saturating_sub(4096);
+        return Err(format!(
+            "stream read exceeded its budget; received {} bytes; wire tail: {:?}",
+            wire.len(),
+            String::from_utf8_lossy(&wire[diagnostic_start..])
+        )
+        .into());
+    }
     Ok(String::from_utf8_lossy(&wire).into_owned())
 }
 
@@ -714,8 +725,10 @@ async fn exercise_writer_lease(
 /// Stage 5: publish one real planning write and prove the live tail
 /// observes it after its cursor.
 async fn observe_write_on_tail(
+    address: SocketAddr,
     shared: &Shared,
     tail: &mut tokio::net::TcpStream,
+    after: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let goal = RegisteredGoal::create(
         GoalId::from_uuid(Uuid::now_v7()),
@@ -731,13 +744,31 @@ async fn observe_write_on_tail(
         )?,
         add_millis(timestamp_now()?, 1)?,
     );
+    let goal_id = goal.id().into_uuid();
     publish_goal_through_control_worker(shared, goal, "publish observed goal")?;
     let observed = read_until(
         tail,
         |wire| wire.matches("\nid: ").count() >= 1,
         STREAM_READ_BUDGET,
     )
-    .await?;
+    .await;
+    let observed = match observed {
+        Ok(wire) => wire,
+        Err(error) => {
+            let durable = tokio::time::timeout(
+                HTTP_ROUNDTRIP_TIMEOUT,
+                get_json(
+                    address,
+                    &format!("/api/v1/events?{}&after={after}", scope_query(shared)),
+                ),
+            )
+            .await;
+            return Err(format!(
+                "SSE observation for goal {goal_id} after {after} failed: {error}; durable readback: {durable:?}"
+            )
+            .into());
+        }
+    };
     assert!(
         observed.contains("\nid: "),
         "tail observed the write: {observed}"
@@ -901,7 +932,7 @@ async fn headless_flow_serves_observes_shuts_down_and_recovers()
 
     // ── 5. a real planning write observed on the SSE tail ──────────────────
     let pre_publish_watermark = watermark;
-    observe_write_on_tail(&shared, &mut tail).await?;
+    observe_write_on_tail(first.address, &shared, &mut tail, watermark).await?;
     println!("stage-5 sse-observation: new frames after watermark {pre_publish_watermark}");
 
     // ── 6. graceful shutdown: drain + one terminal frame ───────────────────

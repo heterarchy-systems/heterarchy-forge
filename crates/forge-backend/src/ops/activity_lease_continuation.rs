@@ -588,6 +588,8 @@ fn blocker_json(value: forge_domain::UnstartedActivityContinuationBlocker) -> &'
         Blocker::PendingActivation => "pending_activation",
         Blocker::OrphanRecord => "orphan_record",
         Blocker::UnclassifiedSchemaObject => "unclassified_schema_object",
+        Blocker::EvaluationEvidencePresent => "evaluation_evidence_present",
+        Blocker::EvaluationProvenanceUnknown => "evaluation_provenance_unknown",
     }
 }
 

@@ -535,6 +535,17 @@ fn map_reservation_error(error: WorkspaceStoreError) -> ControlError {
     if let WorkspaceStoreError::AgentBindingReservation(ref source) = error {
         use forge_persistence::AgentBindingReservationError as Error;
         let code = match source {
+            Error::WorkCut(source) if crate::error::is_home_transfer_cut_fence(source.as_ref()) => {
+                ControlErrorCode::HomeTransferFenced
+            }
+            Error::WorkCut(source)
+                if matches!(
+                    source.as_ref(),
+                    forge_persistence::WorkCutError::Conflict(_)
+                ) =>
+            {
+                ControlErrorCode::AgentConflict
+            }
             Error::InvalidRequestId
             | Error::InvalidActivityId
             | Error::InvalidAgentId
@@ -572,6 +583,19 @@ fn map_activation_error(error: WorkspaceStoreError) -> ControlError {
     if let WorkspaceStoreError::AgentBindingActivation(ref source) = error {
         use forge_persistence::AgentBindingActivationError as Error;
         let code = match source {
+            Error::Agent(forge_persistence::AgentStoreError::WorkCut(source))
+                if crate::error::is_home_transfer_cut_fence(source.as_ref()) =>
+            {
+                ControlErrorCode::HomeTransferFenced
+            }
+            Error::Agent(forge_persistence::AgentStoreError::WorkCut(source))
+                if matches!(
+                    source.as_ref(),
+                    forge_persistence::WorkCutError::Conflict(_)
+                ) =>
+            {
+                ControlErrorCode::AgentConflict
+            }
             Error::InvalidRequestId
             | Error::ZeroMembershipDigest
             | Error::InvalidMetadata { .. }
@@ -615,6 +639,19 @@ fn map_reconciliation_error(error: WorkspaceStoreError) -> ControlError {
     if let WorkspaceStoreError::AgentSessionReconciliation(ref source) = error {
         use forge_persistence::AgentSessionReconciliationError as Error;
         let code = match source {
+            Error::Agent(forge_persistence::AgentStoreError::WorkCut(source))
+                if crate::error::is_home_transfer_cut_fence(source.as_ref()) =>
+            {
+                ControlErrorCode::HomeTransferFenced
+            }
+            Error::Agent(forge_persistence::AgentStoreError::WorkCut(source))
+                if !matches!(
+                    source.as_ref(),
+                    forge_persistence::WorkCutError::Conflict(_)
+                ) =>
+            {
+                ControlErrorCode::PersistenceFailure
+            }
             Error::InvalidRequestId => ControlErrorCode::InvalidInput,
             Error::Agent(forge_persistence::AgentStoreError::AgentNotFound(_)) => {
                 ControlErrorCode::AgentNotFound
@@ -703,4 +740,59 @@ fn map_outbox_error(error: WorkspaceStoreError) -> ControlError {
         return ControlError::with_source(code, error);
     }
     crate::service::map_store_error(error)
+}
+
+#[cfg(test)]
+mod home_transfer_mapper_tests {
+    use super::{map_activation_error, map_reconciliation_error, map_reservation_error};
+    use crate::ControlErrorCode;
+    use forge_persistence::{
+        AgentBindingActivationError, AgentBindingReservationError, AgentSessionReconciliationError,
+        AgentStoreError, HomeTransferStoreError, WorkCutError, WorkspaceStoreError,
+    };
+    use uuid::Uuid;
+
+    fn work_cut(error: HomeTransferStoreError) -> WorkCutError {
+        WorkCutError::HomeTransfer(Box::new(error))
+    }
+
+    #[test]
+    fn binding_home_fence_mappers_preserve_conflict_and_storage_failure_classes() {
+        let preparation_id = Uuid::from_u128(0xA17);
+        let reservation = map_reservation_error(WorkspaceStoreError::AgentBindingReservation(
+            AgentBindingReservationError::WorkCut(
+                work_cut(HomeTransferStoreError::Fenced { preparation_id }).into(),
+            ),
+        ));
+        assert_eq!(reservation.code(), ControlErrorCode::HomeTransferFenced);
+
+        let activation = map_activation_error(WorkspaceStoreError::AgentBindingActivation(
+            AgentBindingActivationError::Agent(AgentStoreError::WorkCut(
+                work_cut(HomeTransferStoreError::Fenced { preparation_id }).into(),
+            )),
+        ));
+        assert_eq!(activation.code(), ControlErrorCode::HomeTransferFenced);
+
+        let election = map_activation_error(WorkspaceStoreError::AgentBindingActivation(
+            AgentBindingActivationError::Agent(AgentStoreError::WorkCut(Box::new(
+                WorkCutError::Conflict("election"),
+            ))),
+        ));
+        assert_eq!(election.code(), ControlErrorCode::AgentConflict);
+
+        let reconciliation =
+            map_reconciliation_error(WorkspaceStoreError::AgentSessionReconciliation(
+                AgentSessionReconciliationError::Agent(AgentStoreError::WorkCut(
+                    work_cut(HomeTransferStoreError::Fenced { preparation_id }).into(),
+                )),
+            ));
+        assert_eq!(reconciliation.code(), ControlErrorCode::HomeTransferFenced);
+
+        let corrupt = map_reconciliation_error(WorkspaceStoreError::AgentSessionReconciliation(
+            AgentSessionReconciliationError::Agent(AgentStoreError::WorkCut(
+                work_cut(HomeTransferStoreError::Corrupt("test")).into(),
+            )),
+        ));
+        assert_eq!(corrupt.code(), ControlErrorCode::PersistenceFailure);
+    }
 }

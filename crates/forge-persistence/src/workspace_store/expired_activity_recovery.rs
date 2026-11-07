@@ -353,6 +353,10 @@ pub enum ExpiredActivityRecoveryStoreError {
     ),
     #[error("expired Activity recovery activation validation failed")]
     BindingActivation(#[source] Box<crate::AgentBindingActivationError>),
+    #[error("expired Activity recovery reservation validation failed")]
+    BindingReservation(#[source] Box<crate::AgentBindingReservationError>),
+    #[error("expired Activity recovery retirement validation failed")]
+    BindingRetirement(#[source] Box<crate::workspace_home_transfers::HomeTransferStoreError>),
     #[error("expired Activity recovery delegated Workspace persistence failure")]
     Workspace(#[source] Box<WorkspaceStoreError>),
 }
@@ -1325,6 +1329,39 @@ pub(crate) fn first_blocker(
                 "activation and rejection both exist",
             ));
         }
+        let retirement = crate::workspace_home_transfers::retirements::get_for_reservation(
+            connection, request_id,
+        )
+        .map_err(|error| ExpiredActivityRecoveryStoreError::BindingRetirement(Box::new(error)))?;
+        if let Some(_retirement) = retirement {
+            if activation_present || rejection_present {
+                return Err(ExpiredActivityRecoveryStoreError::Corrupt(
+                    "retirement competes with activation or rejection",
+                ));
+            }
+            let reservation =
+                crate::workspace_agent_binding_reservations::get(connection, request_id)
+                    .map_err(|error| {
+                        ExpiredActivityRecoveryStoreError::BindingReservation(Box::new(error))
+                    })?
+                    .ok_or(ExpiredActivityRecoveryStoreError::Corrupt(
+                        "binding reservation readback",
+                    ))?;
+            let retirement_settled =
+                crate::workspace_home_transfers::retirements::is_valid_settlement(
+                    connection,
+                    &reservation,
+                )
+                .map_err(|error| {
+                    ExpiredActivityRecoveryStoreError::BindingRetirement(Box::new(error))
+                })?;
+            if !retirement_settled {
+                return Err(ExpiredActivityRecoveryStoreError::Corrupt(
+                    "reservation retirement is not a current settlement",
+                ));
+            }
+            continue;
+        }
         if activation_present {
             if crate::workspace_agent_binding_activation::get(connection, request_id)
                 .map_err(|error| {
@@ -1464,6 +1501,43 @@ pub(crate) struct StartedActivityPhysicalBlockers {
     pub row_count: u32,
     pub digest: [u8; 32],
     pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ReservationRetirementDigestEntry {
+    reservation_request_id: Uuid,
+    preparation_id: Uuid,
+    request_digest: [u8; DIGEST_BYTES],
+    reservation_digest: [u8; DIGEST_BYTES],
+    receipt_digest: [u8; DIGEST_BYTES],
+    observed_at_ms: i64,
+}
+
+fn physical_blocker_digest_with_retirements(
+    legacy_digest: [u8; DIGEST_BYTES],
+    mut retirements: Vec<ReservationRetirementDigestEntry>,
+) -> Result<[u8; DIGEST_BYTES], ExpiredActivityRecoveryStoreError> {
+    // Preserve the v1 census bytes for scopes without retirement receipts.
+    if retirements.is_empty() {
+        return Ok(legacy_digest);
+    }
+    retirements.sort_unstable_by_key(|entry| entry.reservation_request_id);
+    let count = u32::try_from(retirements.len())
+        .map_err(|_| ExpiredActivityRecoveryStoreError::Corrupt("retirement digest count"))?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"forge.started_activity_lease_resume.physical_blockers.with_home_retirement.v1");
+    hasher.update(legacy_digest);
+    hasher.update(count.to_be_bytes());
+    for entry in retirements {
+        hasher.update([1]);
+        hasher.update(entry.reservation_request_id.as_bytes());
+        hasher.update(entry.preparation_id.as_bytes());
+        hasher.update(entry.request_digest);
+        hasher.update(entry.reservation_digest);
+        hasher.update(entry.receipt_digest);
+        hasher.update(entry.observed_at_ms.to_be_bytes());
+    }
+    Ok(hasher.finalize().into())
 }
 
 const STARTED_PHYSICAL_PREDICATES: [(&str, &str); 13] = [
@@ -1743,6 +1817,7 @@ pub(crate) fn started_activity_physical_blockers(
     let mut dispositions = connection.prepare(disposition_sql)?;
     let mut rows = dispositions.query(params![workspace.as_slice(), activity.as_slice(), limit])?;
     let mut reservation_pending_count = 0_u64;
+    let mut retirement_evidence = Vec::new();
     while let Some(row) = rows.next()? {
         let request_id = Uuid::from_slice(row.get::<_, Vec<u8>>(0)?.as_slice())
             .map_err(|_| ExpiredActivityRecoveryStoreError::Corrupt("binding request id"))?;
@@ -1753,6 +1828,49 @@ pub(crate) fn started_activity_physical_blockers(
                 "activation and rejection both exist",
             ));
         }
+        let retirement = crate::workspace_home_transfers::retirements::get_for_reservation(
+            connection, request_id,
+        )
+        .map_err(|error| ExpiredActivityRecoveryStoreError::BindingRetirement(Box::new(error)))?;
+        let retired = if let Some(retirement) = retirement {
+            if activated || rejected {
+                return Err(ExpiredActivityRecoveryStoreError::Corrupt(
+                    "retirement competes with activation or rejection",
+                ));
+            }
+            let reservation =
+                crate::workspace_agent_binding_reservations::get(connection, request_id)
+                    .map_err(|error| {
+                        ExpiredActivityRecoveryStoreError::BindingReservation(Box::new(error))
+                    })?
+                    .ok_or(ExpiredActivityRecoveryStoreError::Corrupt(
+                        "binding reservation readback",
+                    ))?;
+            let settled = crate::workspace_home_transfers::retirements::is_valid_settlement(
+                connection,
+                &reservation,
+            )
+            .map_err(|error| {
+                ExpiredActivityRecoveryStoreError::BindingRetirement(Box::new(error))
+            })?;
+            if !settled {
+                return Err(ExpiredActivityRecoveryStoreError::Corrupt(
+                    "reservation retirement is not a current settlement",
+                ));
+            }
+            retirement_evidence.push(ReservationRetirementDigestEntry {
+                reservation_request_id: retirement.request().reservation_request_id(),
+                preparation_id: retirement.request().preparation_id(),
+                request_digest: *retirement.request().request_digest().as_bytes(),
+                reservation_digest: *retirement.reservation_digest(),
+                receipt_digest: *retirement.receipt_digest(),
+                observed_at_ms: retirement.observed_at().get(),
+            });
+            row_count = row_count.saturating_add(1);
+            true
+        } else {
+            false
+        };
         let settled_rejection = rejected
             && crate::workspace_agent_binding_rejections::is_valid_settlement(
                 connection, request_id,
@@ -1769,7 +1887,7 @@ pub(crate) fn started_activity_physical_blockers(
             {
                 unknown_count = unknown_count.saturating_add(1);
             }
-        } else if !settled_rejection {
+        } else if !settled_rejection && !retired {
             reservation_pending_count = reservation_pending_count.saturating_add(1);
         }
     }
@@ -1805,11 +1923,13 @@ pub(crate) fn started_activity_physical_blockers(
     }
     let row_count = u32::try_from(row_count.min(u64::from(maximum)))
         .map_err(|_| ExpiredActivityRecoveryStoreError::Corrupt("physical row count"))?;
+    let legacy_digest = hasher.finalize().into();
+    let digest = physical_blocker_digest_with_retirements(legacy_digest, retirement_evidence)?;
     Ok(StartedActivityPhysicalBlockers {
         pending_count,
         unknown_count,
         row_count,
-        digest: hasher.finalize().into(),
+        digest,
         truncated,
     })
 }
@@ -2744,6 +2864,39 @@ mod tests {
             ),])
         );
         let _ = successor;
+        Ok(())
+    }
+
+    #[test]
+    fn retirement_digest_preserves_legacy_empty_bytes_and_sorts_scoped_receipts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let legacy = [0xA5; DIGEST_BYTES];
+        assert_eq!(
+            physical_blocker_digest_with_retirements(legacy, Vec::new())?,
+            legacy,
+            "no valid retirement keeps the historical physical digest byte-for-byte",
+        );
+
+        let first = ReservationRetirementDigestEntry {
+            reservation_request_id: Uuid::from_u128(1),
+            preparation_id: Uuid::from_u128(11),
+            request_digest: [0x11; DIGEST_BYTES],
+            reservation_digest: [0x21; DIGEST_BYTES],
+            receipt_digest: [0x31; DIGEST_BYTES],
+            observed_at_ms: 41,
+        };
+        let second = ReservationRetirementDigestEntry {
+            reservation_request_id: Uuid::from_u128(2),
+            preparation_id: Uuid::from_u128(12),
+            request_digest: [0x12; DIGEST_BYTES],
+            reservation_digest: [0x22; DIGEST_BYTES],
+            receipt_digest: [0x32; DIGEST_BYTES],
+            observed_at_ms: 42,
+        };
+        let ordered = physical_blocker_digest_with_retirements(legacy, vec![first, second])?;
+        let reversed = physical_blocker_digest_with_retirements(legacy, vec![second, first])?;
+        assert_eq!(ordered, reversed);
+        assert_ne!(ordered, legacy);
         Ok(())
     }
 }

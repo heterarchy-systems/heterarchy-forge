@@ -9,7 +9,7 @@ use forge_domain::{
     AcknowledgeAgentAssignmentCancellation, ActivityCoordinatorActor, ActivityId,
     AgentAssignmentId, AgentAssignmentSummary, AgentAssignmentTarget, AgentInstanceId,
     AgentInstanceRevision, AgentSessionId, AuthenticatedPrincipal, CancelAgentAssignment,
-    ClaimAgentAssignment, InterruptAgentAssignment, OfferAgentAssignment,
+    ClaimAgentAssignment, EvaluationClockReading, InterruptAgentAssignment, OfferAgentAssignment,
     RegisteredAgentAssignment, ReviewAgentAssignment, SubmitAgentAssignment, TimestampMillis,
 };
 use forge_persistence::{
@@ -19,7 +19,8 @@ use forge_persistence::{
 
 use crate::agent_session::AgentSessionResolveRequest;
 use crate::{
-    ControlError, ControlErrorCode, ForgeControl, GoalDeletionAuthority, ResolvedWorkspaceScope,
+    ControlError, ControlErrorCode, EvaluationEvidenceService, ForgeControl, GoalDeletionAuthority,
+    ResolvedWorkspaceScope,
 };
 
 pub const MAX_ASSIGNMENT_LIST_RESULTS: u32 = 32;
@@ -142,6 +143,69 @@ impl ForgeControl {
         .map_err(map_assignment_store_error)?;
         self.confirm_assignment_write(&scope, &store)?;
         Ok(result)
+    }
+
+    /// Submit or review an assignment while attaching trusted source timing in
+    /// the same persistence transaction. Existing actor/session admission and
+    /// the descriptive command timestamp remain unchanged.
+    pub(crate) fn agent_assignment_mutate_with_source_clock<C>(
+        &self,
+        request: &AgentAssignmentMutationRequest,
+        service: EvaluationEvidenceService,
+        admitted_at: TimestampMillis,
+        sample_clock: C,
+    ) -> Result<RegisteredAgentAssignment, ControlError>
+    where
+        C: FnOnce() -> EvaluationClockReading,
+    {
+        if service.backend_id().into_uuid().is_nil() || service.destination_id().is_nil() {
+            return Err(ControlError::new(ControlErrorCode::AgentConflict));
+        }
+        let (scope, mut store) = self.open_assignment_workspace(&request.scope)?;
+        self.authenticate_assignment_mutation(&scope, &store, &request.mutation)?;
+        if store
+            .agent_operations_delegation()
+            .map_err(map_assignment_store_error)?
+            .is_some_and(|delegation| delegation.destination_id() != service.destination_id())
+        {
+            return Err(ControlError::new(ControlErrorCode::AgentConflict));
+        }
+        let assignment = match &request.mutation {
+            AgentAssignmentMutation::Submit(command) => store
+                .submit_agent_assignment_with_source_clock(
+                    command,
+                    admitted_at,
+                    service.backend_id(),
+                    sample_clock,
+                )
+                .map(|outcome| outcome.assignment().clone()),
+            AgentAssignmentMutation::Accept(command) => store
+                .accept_agent_assignment_with_source_clock(
+                    command,
+                    admitted_at,
+                    service.backend_id(),
+                    sample_clock,
+                )
+                .map(|outcome| outcome.assignment().clone()),
+            AgentAssignmentMutation::Reject(command) => store
+                .reject_agent_assignment_with_source_clock(
+                    command,
+                    admitted_at,
+                    service.backend_id(),
+                    sample_clock,
+                )
+                .map(|outcome| outcome.assignment().clone()),
+            AgentAssignmentMutation::Offer(_)
+            | AgentAssignmentMutation::Claim(_)
+            | AgentAssignmentMutation::Cancel(_)
+            | AgentAssignmentMutation::AcknowledgeCancellation(_)
+            | AgentAssignmentMutation::Interrupt { .. } => {
+                return Err(ControlError::new(ControlErrorCode::InvalidInput));
+            }
+        }
+        .map_err(map_assignment_source_store_error)?;
+        self.confirm_assignment_write(&scope, &store)?;
+        Ok(assignment)
     }
 
     /// Install or exactly replay one permanent offer seal, then return the
@@ -484,6 +548,19 @@ fn map_assignment_store_error(error: WorkspaceStoreError) -> ControlError {
         return ControlError::committed();
     }
     let code = match &error {
+        WorkspaceStoreError::AgentAssignment(AgentAssignmentStoreError::HomeTransfer(source))
+            if matches!(
+                source.as_ref(),
+                forge_persistence::HomeTransferStoreError::Fenced { .. }
+            ) =>
+        {
+            ControlErrorCode::HomeTransferFenced
+        }
+        WorkspaceStoreError::AgentAssignment(AgentAssignmentStoreError::WorkCut(source))
+            if crate::error::is_home_transfer_cut_fence(source.as_ref()) =>
+        {
+            ControlErrorCode::HomeTransferFenced
+        }
         WorkspaceStoreError::AgentAssignment(
             AgentAssignmentStoreError::AssignmentNotFound(_)
             | AgentAssignmentStoreError::Agent(_)
@@ -494,6 +571,7 @@ fn map_assignment_store_error(error: WorkspaceStoreError) -> ControlError {
             | AgentAssignmentStoreError::CoordinatorTargetSameAgent
             | AgentAssignmentStoreError::OfferAdmissionSealed { .. }
             | AgentAssignmentStoreError::InvalidOfferSealIdentity
+            | AgentAssignmentStoreError::EvaluationEvidenceObservationRequired { .. }
             | AgentAssignmentStoreError::RevisionConflict
             | AgentAssignmentStoreError::Transition(_)
             | AgentAssignmentStoreError::Focus(_),
@@ -530,8 +608,20 @@ fn map_assignment_store_error(error: WorkspaceStoreError) -> ControlError {
     ControlError::with_source(code, error)
 }
 
+fn map_assignment_source_store_error(error: WorkspaceStoreError) -> ControlError {
+    if matches!(
+        &error,
+        WorkspaceStoreError::EvaluationEvidenceCommittedUnconfirmed { .. }
+            | WorkspaceStoreError::AgentAssignmentCommittedUnconfirmed { .. }
+    ) {
+        return ControlError::committed_with_source(error);
+    }
+    map_assignment_store_error(error)
+}
+
 #[cfg(test)]
 mod tests {
+    use super::map_assignment_store_error;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -548,19 +638,49 @@ mod tests {
         ReviewAgentAssignment, SubmitAgentAssignment, TimestampMillis, WorkspaceId,
         WorkspaceRevision, WorkspaceRoot,
     };
-    use forge_persistence::{AgentOperationsFreezeRequest, GlobalRegistry, WorkspaceStore};
+    use forge_persistence::{
+        AgentAssignmentStoreError, AgentOperationsFreezeRequest, GlobalRegistry, WorkspaceStore,
+        WorkspaceStoreError,
+    };
     use forge_workspace::{LocationService, WorkspaceLocator, WorkspaceStateLayout};
     use sha2::{Digest, Sha256};
     use uuid::Uuid;
 
     use crate::{
         AgentAssignmentGetRequest, AgentAssignmentMutation, AgentAssignmentMutationRequest,
-        AgentAssignmentReadAuthority, AgentOperationsDelegationRequest,
+        AgentAssignmentReadAuthority, AgentOperationsDelegationRequest, ControlErrorCode,
         EffectFactOutboxReadRequest, ForgeControl, ResolvedWorkspaceScope,
     };
 
     fn id(value: u128) -> Uuid {
         Uuid::from_u128(value)
+    }
+
+    #[test]
+    fn home_assignment_fences_are_conflicts_and_corruption_stays_persistence() {
+        let preparation_id = id(0xA13);
+        let direct = map_assignment_store_error(WorkspaceStoreError::AgentAssignment(
+            AgentAssignmentStoreError::HomeTransfer(Box::new(
+                forge_persistence::HomeTransferStoreError::Fenced { preparation_id },
+            )),
+        ));
+        assert_eq!(direct.code(), ControlErrorCode::HomeTransferFenced);
+
+        let nested = map_assignment_store_error(WorkspaceStoreError::AgentAssignment(
+            AgentAssignmentStoreError::WorkCut(Box::new(
+                forge_persistence::WorkCutError::HomeTransfer(Box::new(
+                    forge_persistence::HomeTransferStoreError::Fenced { preparation_id },
+                )),
+            )),
+        ));
+        assert_eq!(nested.code(), ControlErrorCode::HomeTransferFenced);
+
+        let corrupt = map_assignment_store_error(WorkspaceStoreError::AgentAssignment(
+            AgentAssignmentStoreError::HomeTransfer(Box::new(
+                forge_persistence::HomeTransferStoreError::Corrupt("test"),
+            )),
+        ));
+        assert_eq!(corrupt.code(), ControlErrorCode::PersistenceFailure);
     }
 
     fn timestamp(value: i64) -> Result<TimestampMillis, Box<dyn std::error::Error>> {
@@ -1175,5 +1295,18 @@ mod tests {
 
         fs::remove_dir_all(fixture.root)?;
         Ok(())
+    }
+
+    #[test]
+    fn evaluation_assignment_observation_required_is_a_pre_mutation_agent_conflict() {
+        let error = WorkspaceStoreError::AgentAssignment(
+            AgentAssignmentStoreError::EvaluationEvidenceObservationRequired {
+                workspace_id: WorkspaceId::from_uuid(id(0xCA50)),
+                assignment_id: AgentAssignmentId::from_uuid(id(0xCA51)),
+            },
+        );
+        let mapped = map_assignment_store_error(error);
+        assert_eq!(mapped.code(), ControlErrorCode::AgentConflict);
+        assert!(!mapped.is_committed());
     }
 }

@@ -285,6 +285,8 @@ cargo xtask fmt
 cargo xtask check
 cargo xtask test
 cargo xtask ci
+cargo xtask harness
+make harness
 cargo xtask msrv
 cargo xtask doctor
 cargo xtask supply-chain
@@ -294,19 +296,39 @@ cargo run --locked -p forge-backend -- init-registry /absolute/path/registry.sql
 cargo run --locked -p forge-backend -- serve /absolute/path/backend.json
 ```
 
-For a verification run with an explicit existing temporary directory, set
-`FORGE_VERIFY_TMPDIR`. The xtask forwards it as Cargo command-line configuration
-to every child Cargo, including when an inherited `[env]` entry forces another
-`TMPDIR`. The outer Cargo also needs that override when launching xtask:
+`make ci` is the public-source gate and must run without `.agents`. The strict
+local-only check is available as `make harness` or `cargo xtask harness`; it
+requires the ignored local agent Harness and fails if that material is missing
+or invalid. Keep `.agents/` ignored and out of source commits, CI inputs, and
+release artifacts.
+
+The test runner requires `TMPDIR` to name an absolute, existing real directory;
+it creates private test sandboxes beneath that directory and has no system-temp
+fallback. `FORGE_VERIFY_TMPDIR` is an optional verification override. It must
+name an existing real directory equal to or below the canonical `TMPDIR` path.
+Verification commands force the validated base or override through Cargo
+command-line configuration, including MSRV checks and inherited `[env]` entries
+that force another `TMPDIR`. The outer Cargo must also receive the approved
+`TMPDIR` when launching xtask:
 
 ```bash
-FORGE_VERIFY_TMPDIR=/absolute/task/tmp \
+TMPDIR=/absolute/task/tmp \
+FORGE_VERIFY_TMPDIR=/absolute/task/tmp/forge-verify \
 cargo --config 'env.TMPDIR.value="/absolute/task/tmp"' --config env.TMPDIR.force=true xtask ci
 ```
 
-This opt-in setting requires a real absolute directory and changes only the
-verification process temporary path. It does not edit Cargo configuration,
-select Cargo/Rustup homes, alter product startup storage policy or skip gates.
+Both directories must already exist. The override changes only the verification
+process temporary path; it does not edit Cargo configuration, select Cargo or
+Rustup homes, alter product startup storage policy or skip gates. The copied
+test executable receives its own private `TMPDIR`, and the override is removed
+before that executable starts.
+
+PackageV validates executable and snapshot identity independently of their
+volume name. Mounted storage receives the same canonical-path, regular-file,
+single-link, executable-identity and digest checks as other paths. Execution
+retains the exact read-only snapshot and executable sandbox scope; accepting a
+storage location does not grant Workspace writes or network access. Physical
+volume provenance is not part of this capability contract.
 
 The [backend host instructions](crates/forge-backend/README.md) specify exact
 Registry, Workspace, backend/destination identity and separate service credentials.

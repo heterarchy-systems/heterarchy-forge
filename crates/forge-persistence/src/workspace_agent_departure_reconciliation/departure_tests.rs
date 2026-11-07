@@ -717,8 +717,9 @@ fn delegated_handoff_fences_roll_back_without_partial_facts() -> TestResult {
 /// Drop every schema object that post-v38 migrations added so the fixture
 /// matches the exact historical v38 shape. The later additions include
 /// approval-authority freeze fences, Goal watermarks, Assignment offer seals,
-/// and the work-cut and continuation journals.
-fn drop_post_v38_schema_objects(conn: &Connection) -> Result<(), rusqlite::Error> {
+/// the work-cut and continuation journals, and evaluation evidence.
+fn drop_post_v38_schema_objects(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
+    crate::evaluation_schema_fixture::remove_empty_evaluation_schema(conn)?;
     conn.execute_batch(
         "DROP TABLE IF EXISTS unstarted_activity_continuation_receipts;
         DROP TRIGGER IF EXISTS agent_binding_activations_block_rejection;

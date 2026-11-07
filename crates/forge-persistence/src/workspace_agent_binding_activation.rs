@@ -131,6 +131,8 @@ pub enum AgentBindingActivationError {
     Reservation(#[from] AgentBindingReservationError),
     #[error(transparent)]
     Agent(#[from] AgentStoreError),
+    #[error(transparent)]
+    Retirement(#[from] Box<crate::HomeTransferStoreError>),
     #[error("Agent binding rejection read failed while checking activation exclusivity")]
     Rejection(
         #[source] Box<crate::workspace_agent_binding_rejections::AgentBindingRejectionStoreError>,
@@ -369,7 +371,7 @@ pub(crate) fn activate(
         return Ok(receipt);
     }
 
-    ensure_binding_available(&transaction, &reservation)?;
+    ensure_fresh_activation_available(&transaction, request.request_id(), &reservation)?;
 
     let agent = RegisteredAgentInstance::create_bound(
         reservation.request().agent_id(),
@@ -416,10 +418,17 @@ pub(crate) fn activate(
     Ok(receipt)
 }
 
-fn ensure_binding_available(
+fn ensure_fresh_activation_available(
     connection: &Connection,
+    request_id: Uuid,
     reservation: &AgentBindingReservation,
 ) -> Result<(), AgentBindingActivationError> {
+    if crate::workspace_home_transfers::retirements::get_for_reservation(connection, request_id)
+        .map_err(|error| AgentBindingActivationError::Retirement(Box::new(error)))?
+        .is_some()
+    {
+        return Err(AgentBindingActivationError::RequestConflict(request_id));
+    }
     if workspace_agents::get_in_transaction(connection, reservation.request().agent_id())?.is_some()
     {
         return Err(AgentBindingActivationError::AgentIdConflict(

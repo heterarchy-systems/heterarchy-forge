@@ -695,6 +695,11 @@ pub(crate) fn reconcile_session_in_transaction(
     {
         return Err(AgentStoreError::SessionAttachmentConflict);
     }
+    crate::workspace_work_cuts::guards::ensure_session_binding_open(
+        transaction,
+        command.workspace_id(),
+        command.session_id(),
+    )?;
     let updated = current
         .bind_session(
             command.expected_agent_revision(),
@@ -1145,6 +1150,23 @@ pub(crate) fn insert_reserved_binding(
             "binding activation admission",
         ));
     }
+    crate::workspace_work_cuts::guards::ensure_session_binding_open(
+        connection,
+        agent.workspace_id(),
+        agent
+            .session_id()
+            .ok_or(AgentStoreError::InvalidProjection(
+                "reserved binding Session missing",
+            ))?,
+    )?;
+    crate::workspace_home_transfers::retirements::ensure_binding_identity_open(
+        connection,
+        agent.workspace_id(),
+        agent.activity_id(),
+        agent.id(),
+        agent.session_id(),
+    )
+    .map_err(|error| AgentStoreError::Retirement(Box::new(error)))?;
     insert_agent_row(connection, agent)?;
     insert_focus_event(
         connection,
@@ -1201,6 +1223,20 @@ fn update_agent(
     updated: &RegisteredAgentInstance,
 ) -> Result<(), AgentStoreError> {
     crate::workspace_agent_migration::ensure_work_writes(connection)?;
+    if current.id() != updated.id()
+        || current.workspace_id() != updated.workspace_id()
+        || current.activity_id() != updated.activity_id()
+        || current.session_id() != updated.session_id()
+    {
+        crate::workspace_home_transfers::retirements::ensure_binding_identity_open(
+            connection,
+            updated.workspace_id(),
+            updated.activity_id(),
+            updated.id(),
+            updated.session_id(),
+        )
+        .map_err(|error| AgentStoreError::Retirement(Box::new(error)))?;
+    }
     let (goal_id, goal_revision, dag_revision, node_id, node_revision) =
         encode_focus(updated.focus());
     let changed = connection.execute(
@@ -1862,6 +1898,8 @@ const WORK_UPDATE_EVIDENCE_FOR_AGENT_QUERY: &str = "SELECT e.update_id, e.eviden
 pub enum AgentStoreError {
     #[error(transparent)]
     WorkCut(#[from] Box<crate::WorkCutError>),
+    #[error(transparent)]
+    Retirement(#[from] Box<crate::HomeTransferStoreError>),
     #[error("Agent work fact could not be recorded")]
     EffectOutbox(#[source] Box<crate::AgentEffectOutboxError>),
     #[error(transparent)]

@@ -167,9 +167,6 @@ fn validate_executable_path(path: &Path) -> Result<PathBuf, PackageVExecutableEr
     if !path.is_absolute() {
         return Err(PackageVExecutableError::ExecutableNotAbsolute);
     }
-    if path.starts_with("/Volumes/256.SSD") {
-        return Err(PackageVExecutableError::ExternalStorageRejected);
-    }
     let metadata = fs::symlink_metadata(path).map_err(PackageVExecutableError::Inspect)?;
     if metadata.file_type().is_symlink()
         || !metadata.is_file()
@@ -229,8 +226,6 @@ pub enum PackageVExecutableError {
     ExecutableUnavailable,
     #[error("PackageV executable identity changed")]
     ExecutableChanged,
-    #[error("PackageV cannot use the external SSD root")]
-    ExternalStorageRejected,
     #[error("PackageV executable inspection failed")]
     Inspect(#[source] std::io::Error),
 }
@@ -423,7 +418,7 @@ pub fn validate_package_root(
         return Err(PackageVValidationError::InvalidRoot);
     }
     let root = fs::canonicalize(root).map_err(PackageVValidationError::ManifestRead)?;
-    if !root.is_dir() || root.starts_with("/Volumes/256.SSD") {
+    if !root.is_dir() {
         return Err(PackageVValidationError::InvalidRoot);
     }
     let manifest_file = root.join(manifest_path);
@@ -932,9 +927,25 @@ fn hex(bytes: &[u8; 32]) -> String {
 mod tests {
     use super::*;
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
     use uuid::Uuid;
+
+    const HASH_MEASURE_INPUT_ENV: &str = "FORGE_PACKAGE_V_HASH_MEASURE_INPUT";
+    const HASH_MEASURE_EXPECTED_SHA_ENV: &str = "FORGE_PACKAGE_V_HASH_MEASURE_EXPECTED_SHA256";
+
+    fn configured_tempdir() -> Result<PathBuf, Box<dyn std::error::Error>> {
+        let configured = std::env::var_os("TMPDIR").ok_or("TMPDIR must be configured")?;
+        let configured = PathBuf::from(configured);
+        if !configured.is_absolute() {
+            return Err("TMPDIR must be absolute".into());
+        }
+        let canonical = fs::canonicalize(&configured)?;
+        if canonical != configured || !canonical.is_dir() {
+            return Err("TMPDIR must be an existing canonical directory".into());
+        }
+        Ok(canonical)
+    }
 
     fn fixture_root() -> Result<PathBuf, Box<dyn std::error::Error>> {
         let unique = format!(
@@ -942,13 +953,9 @@ mod tests {
             SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
             Uuid::now_v7()
         );
-        let base = if cfg!(target_os = "macos") {
-            PathBuf::from("/private/tmp")
-        } else {
-            PathBuf::from("/tmp")
-        };
+        let base = configured_tempdir()?;
         let root = base.join(format!("forge-package-v-{unique}"));
-        fs::create_dir_all(&root)?;
+        fs::create_dir(&root)?;
         Ok(root)
     }
 
@@ -1029,8 +1036,10 @@ mod tests {
     }
 
     #[test]
-    fn executable_capability_rejects_non_executable_and_external_storage()
+    fn executable_capability_accepts_configured_storage_and_rejects_unsafe_identity()
     -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::symlink;
+
         let root = fixture_root()?;
         let file = root.join("backend");
         fs::write(&file, b"backend")?;
@@ -1039,12 +1048,118 @@ mod tests {
         fs::set_permissions(&file, permissions)?;
         let capability = PackageVExecutableCapability::prepare_at(&file)?;
         capability.revalidate()?;
+
+        let mut permissions = fs::metadata(&file)?.permissions();
+        permissions.set_mode(0o644);
+        fs::set_permissions(&file, permissions)?;
+        assert!(matches!(
+            PackageVExecutableCapability::prepare_at(&file),
+            Err(PackageVExecutableError::ExecutableUnavailable)
+        ));
+        let mut permissions = fs::metadata(&file)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&file, permissions)?;
+
+        let symlink_path = root.join("backend-symlink");
+        symlink(&file, &symlink_path)?;
+        assert!(matches!(
+            PackageVExecutableCapability::prepare_at(&symlink_path),
+            Err(PackageVExecutableError::ExecutableUnavailable)
+        ));
+
+        let hardlink_path = root.join("backend-hardlink");
+        fs::hard_link(&file, &hardlink_path)?;
+        assert!(matches!(
+            PackageVExecutableCapability::prepare_at(&file),
+            Err(PackageVExecutableError::ExecutableUnavailable)
+        ));
+        fs::remove_file(&hardlink_path)?;
+
         fs::write(&file, b"changed")?;
         assert!(matches!(
             capability.revalidate(),
             Err(PackageVExecutableError::ExecutableChanged)
         ));
+
+        let replacement = root.join("backend-replacement");
+        fs::write(&replacement, b"backend")?;
+        let mut permissions = fs::metadata(&replacement)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&replacement, permissions)?;
+        fs::rename(&replacement, &file)?;
+        assert!(matches!(
+            capability.revalidate(),
+            Err(PackageVExecutableError::ExecutableChanged)
+        ));
+
         fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "informational hash timing; requires an explicit SSD test input"]
+    fn ssd_backend_hash_measurement_is_read_only_and_informational()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let input = std::env::var_os(HASH_MEASURE_INPUT_ENV)
+            .map(PathBuf::from)
+            .ok_or("FORGE_PACKAGE_V_HASH_MEASURE_INPUT must be configured")?;
+        let expected_sha = std::env::var(HASH_MEASURE_EXPECTED_SHA_ENV)
+            .map_err(|_| "FORGE_PACKAGE_V_HASH_MEASURE_EXPECTED_SHA256 must be configured")?;
+        if expected_sha.len() != 64 || !expected_sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(
+                "expected measurement SHA-256 must contain 64 hexadecimal characters".into(),
+            );
+        }
+        if !input.is_absolute() {
+            return Err("hash measurement input must be absolute".into());
+        }
+        let temporary_base = configured_tempdir()?;
+        let before = fs::symlink_metadata(&input)?;
+        if before.file_type().is_symlink()
+            || !before.is_file()
+            || before.nlink() != 1
+            || before.mode() & 0o111 == 0
+            || before.mode() & 0o222 != 0
+        {
+            return Err("hash measurement input must be a read-only executable file".into());
+        }
+        let canonical = fs::canonicalize(&input)?;
+        if canonical != input || !canonical.starts_with(&temporary_base) {
+            return Err(
+                "hash measurement input must be canonical and under configured TMPDIR".into(),
+            );
+        }
+        let byte_count = before.len();
+
+        for iteration in 1..=2 {
+            let prepare_started = Instant::now();
+            let capability = PackageVExecutableCapability::prepare_at(&canonical)?;
+            let prepare_micros = prepare_started.elapsed().as_micros();
+            assert!(
+                hex(capability.sha256()) == expected_sha,
+                "measured executable SHA-256 did not match the captured input"
+            );
+
+            let revalidate_started = Instant::now();
+            capability.revalidate()?;
+            let revalidate_micros = revalidate_started.elapsed().as_micros();
+
+            assert!(capability.path() == canonical, "measurement path changed");
+            eprintln!(
+                "PackageV hash measurement iteration={iteration} bytes={byte_count} prepare_micros={prepare_micros} revalidate_micros={revalidate_micros}"
+            );
+        }
+
+        let after = fs::symlink_metadata(&canonical)?;
+        assert_eq!(before.dev(), after.dev(), "measurement device changed");
+        assert_eq!(before.ino(), after.ino(), "measurement inode changed");
+        assert_eq!(before.len(), after.len(), "measurement length changed");
+        assert_eq!(before.mode(), after.mode(), "measurement mode changed");
+        assert_eq!(
+            before.nlink(),
+            after.nlink(),
+            "measurement link count changed"
+        );
         Ok(())
     }
 }
