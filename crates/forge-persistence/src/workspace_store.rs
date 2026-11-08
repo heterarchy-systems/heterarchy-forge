@@ -21,12 +21,12 @@ use forge_domain::{
     ActivityRevision, ActivityState, ActivitySuccessor, ApprovalDecision, ApprovalRequestId,
     ApprovalRevision, AuthorizedExecutionRead, AutoApprovalScope, AutoApprovalScopeId,
     BeginDiffEvidence, BeginDiffPurge, BeginExecution, BeginFileMutation, BeginFileMutationResult,
-    BeginFileMutationStatus, BootstrapActivity, BootstrapActivityDecision, ChangeSetAttribution,
-    ChangeSetProducer, CheckpointId, CheckpointRestoreId, CheckpointRestoreRevision,
-    CheckpointRevision, ClaimRecoveryLease, CloseActivity, CompleteDiffEvidence, CompleteDiffPurge,
-    CompleteExecution, CompleteFileMutation, CreateActivity, DagHeadRevision, DagRevision,
-    DagRevisionNumber, DiffId, DiffListLimit, DiffPurgeRecord, DiffRetentionKeepCount,
-    DiffRetentionPlan, DiffRetentionPlanLimit, EstablishWorkspace, ExecutionAgentProvenance,
+    BeginFileMutationStatus, BootstrapActivity, BootstrapActivityDecision, ChangeSetProducer,
+    CheckpointId, CheckpointRestoreId, CheckpointRestoreRevision, CheckpointRevision,
+    ClaimRecoveryLease, CloseActivity, CompleteDiffEvidence, CompleteDiffPurge, CompleteExecution,
+    CompleteFileMutation, CreateActivity, DagHeadRevision, DagRevision, DagRevisionNumber, DiffId,
+    DiffListLimit, DiffPurgeRecord, DiffRetentionKeepCount, DiffRetentionPlan,
+    DiffRetentionPlanLimit, EstablishWorkspace, ExecutionAgentProvenance,
     ExecutionAuthorizationRequest, ExecutionGrant, ExecutionGrantId, ExecutionGrantRevision,
     ExecutionId, ExecutionListLimit, ExecutionOutputCursor, ExecutionOutputEvent,
     ExecutionOutputRead, FailExecution, FailFileMutation, FileMutationRecord, GoalEvidenceRef,
@@ -36,13 +36,14 @@ use forge_domain::{
     RegisteredApprovalRequest, RegisteredCheckpoint, RegisteredCheckpointRestore,
     RegisteredDagNode, RegisteredDiffEvidence, RegisteredExecution, RegisteredGoal,
     RegisteredWorkspace, ReleaseActivityLease, ReleaseRecoveryLease, RenewActivityLease,
-    RenewRecoveryLease, RuntimeInstanceId, SetActivityState, SourceTreeRequestDigest,
-    SourceWriteAuthority, TimestampMillis, TreeChangeSetAdmission, TreeChangeSetIntent,
-    TreeMutationId, VerificationInputEvidence, VerificationProjection, WorkspaceId,
-    WorkspacePolicy, WorkspaceRelativePath, WorkspaceRevision, WorkspaceRoot,
-    WorkspaceRootDecision, WorkspaceRootDecisionError, WorkspaceRootFingerprint,
-    decide_bootstrap_activity, decide_workspace_root,
+    RenewRecoveryLease, RuntimeInstanceId, SetActivityState, SourceWriteAuthority, TimestampMillis,
+    VerificationInputEvidence, VerificationProjection, WorkspaceId, WorkspacePolicy,
+    WorkspaceRelativePath, WorkspaceRevision, WorkspaceRoot, WorkspaceRootDecision,
+    WorkspaceRootDecisionError, WorkspaceRootFingerprint, decide_bootstrap_activity,
+    decide_workspace_root,
 };
+#[cfg(test)]
+use forge_domain::{SourceTreeRequestDigest, TreeChangeSetAdmission, TreeChangeSetIntent};
 use forge_workspace::{
     ExistingWorkspaceStateLayout, StateLayoutError, WorkspaceStateExclusiveGate,
     WorkspaceStateGateError, WorkspaceStateLayout, WorkspaceStateSharedGate,
@@ -574,82 +575,6 @@ impl FileMutationDiffRecord {
 
     pub const fn mutation(&self) -> &forge_domain::RegisteredFileMutation {
         self.file.mutation()
-    }
-}
-
-/// Historical single-file mutation metadata and its optional Diff projection
-/// read from one Workspace `SQLite` snapshot.
-#[must_use]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FileMutationReadSnapshot {
-    record: FileMutationRecord,
-    diff: Option<RegisteredDiffEvidence>,
-}
-
-impl FileMutationReadSnapshot {
-    pub(crate) const fn new(
-        record: FileMutationRecord,
-        diff: Option<RegisteredDiffEvidence>,
-    ) -> Self {
-        Self { record, diff }
-    }
-
-    pub const fn record(&self) -> &FileMutationRecord {
-        &self.record
-    }
-
-    pub const fn diff(&self) -> Option<&RegisteredDiffEvidence> {
-        self.diff.as_ref()
-    }
-}
-
-/// Historical source-tree metadata and its optional Diff projection read from
-/// one Workspace `SQLite` snapshot.
-#[must_use]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SourceTreeReadSnapshot {
-    change_set: forge_domain::RegisteredChangeSet,
-    request_digest: SourceTreeRequestDigest,
-    applied_mutations: Vec<TreeMutationId>,
-    mutation_count: usize,
-    diff: Option<RegisteredDiffEvidence>,
-}
-
-impl SourceTreeReadSnapshot {
-    pub(crate) const fn new(
-        change_set: forge_domain::RegisteredChangeSet,
-        request_digest: SourceTreeRequestDigest,
-        applied_mutations: Vec<TreeMutationId>,
-        mutation_count: usize,
-        diff: Option<RegisteredDiffEvidence>,
-    ) -> Self {
-        Self {
-            change_set,
-            request_digest,
-            applied_mutations,
-            mutation_count,
-            diff,
-        }
-    }
-
-    pub const fn change_set(&self) -> &forge_domain::RegisteredChangeSet {
-        &self.change_set
-    }
-
-    pub const fn request_digest(&self) -> SourceTreeRequestDigest {
-        self.request_digest
-    }
-
-    pub const fn applied_mutations(&self) -> &[TreeMutationId] {
-        self.applied_mutations.as_slice()
-    }
-
-    pub const fn mutation_count(&self) -> usize {
-        self.mutation_count
-    }
-
-    pub const fn diff(&self) -> Option<&RegisteredDiffEvidence> {
-        self.diff.as_ref()
     }
 }
 
@@ -4320,49 +4245,10 @@ impl WorkspaceStore {
         Ok(result)
     }
 
-    /// Inspect one caller-authored source-tree request before patch materialization.
-    ///
-    /// The raw request digest is durable retry identity. Exact source authority is
-    /// still revalidated against every caller-authored path so a completed retry
-    /// cannot bypass Agent/Goal/DAG/Writer-Lease fencing.
-    pub fn inspect_source_tree_request(
-        &mut self,
-        attribution: ChangeSetAttribution,
-        request_digest: SourceTreeRequestDigest,
-        observed_at: TimestampMillis,
-        authority: SourceWriteAuthority,
-        paths: &[&WorkspaceRelativePath],
-    ) -> Result<Option<TreeChangeSetAdmission>, WorkspaceStoreError> {
-        self.ensure_live_binding()?;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Deferred)?;
-        workspace_writer_leases::authorize_source_write(
-            &transaction,
-            attribution.workspace_id(),
-            attribution.activity_id(),
-            authority,
-            observed_at,
-            paths,
-        )?;
-        let result = workspace_changesets::inspect_source_tree_request(
-            &transaction,
-            attribution,
-            request_digest,
-        )?;
-        if result.is_some()
-            && workspace_diffs::get_by_change_set(&transaction, attribution.id())?.is_none()
-        {
-            return Err(DiffStoreError::RecordMissing.into());
-        }
-        transaction.commit()?;
-        self.ensure_live_binding()?;
-        Ok(result)
-    }
-
     /// Persist one materialized source-tree `ChangeSet` together with its caller
     /// request digest before any filesystem effect.
-    pub fn begin_source_tree_change_set(
+    #[cfg(test)]
+    pub(crate) fn begin_source_tree_change_set(
         &mut self,
         intent: &TreeChangeSetIntent,
         diff_command: &BeginDiffEvidence,
@@ -4430,52 +4316,12 @@ impl WorkspaceStore {
         Ok(result)
     }
 
-    /// Inspect an existing tree-level `ChangeSet` without creating durable intent.
-    ///
-    /// Exact source authority is still validated so an idempotent retry cannot bypass
-    /// Agent/Goal/DAG/Writer-Lease fencing merely because the original effect completed.
-    pub fn inspect_tree_change_set(
-        &mut self,
-        intent: &TreeChangeSetIntent,
-        diff_command: &BeginDiffEvidence,
-        authority: SourceWriteAuthority,
-    ) -> Result<Option<TreeChangeSetAdmission>, WorkspaceStoreError> {
-        self.ensure_live_binding()?;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Deferred)?;
-        let mut paths = Vec::with_capacity(intent.mutations().len() * 2);
-        for mutation in intent.mutations() {
-            paths.push(mutation.plan().primary_path());
-            if let Some(path) = mutation.plan().secondary_path() {
-                paths.push(path);
-            }
-        }
-        let attribution = intent.attribution();
-        workspace_writer_leases::authorize_source_write(
-            &transaction,
-            attribution.workspace_id(),
-            attribution.activity_id(),
-            authority,
-            intent.observed_at(),
-            &paths,
-        )?;
-        let result = workspace_changesets::inspect_tree_change_set(&transaction, intent)?;
-        if result.is_some()
-            && workspace_diffs::inspect_tree(&transaction, intent, diff_command)?.is_none()
-        {
-            return Err(DiffStoreError::RecordMissing.into());
-        }
-        transaction.commit()?;
-        self.ensure_live_binding()?;
-        Ok(result)
-    }
-
     /// Persist one bounded tree-level `ChangeSet` intent before any source-tree effect.
     ///
     /// Writer Lease coverage is validated for every source/destination endpoint
     /// in the same `BEGIN IMMEDIATE` transaction as the durable intent.
-    pub fn begin_tree_change_set(
+    #[cfg(test)]
+    pub(crate) fn begin_tree_change_set(
         &mut self,
         intent: &TreeChangeSetIntent,
         diff_command: &BeginDiffEvidence,
@@ -4525,7 +4371,8 @@ impl WorkspaceStore {
         Ok(result)
     }
 
-    pub fn mark_tree_mutation_applied(
+    #[cfg(test)]
+    pub(crate) fn mark_tree_mutation_applied(
         &mut self,
         change_set_id: forge_domain::ChangeSetId,
         mutation_id: forge_domain::TreeMutationId,
@@ -4540,7 +4387,8 @@ impl WorkspaceStore {
         Ok(())
     }
 
-    pub fn complete_tree_change_set(
+    #[cfg(test)]
+    pub(crate) fn complete_tree_change_set(
         &mut self,
         change_set_id: forge_domain::ChangeSetId,
         diff_command: &CompleteDiffEvidence,
@@ -4569,50 +4417,6 @@ impl WorkspaceStore {
         transaction.commit()?;
         self.capture_sidecar_identities()?;
         Ok(result)
-    }
-
-    pub fn fail_tree_change_set_without_effect(
-        &mut self,
-        change_set_id: forge_domain::ChangeSetId,
-        diff_command: AbandonDiffEvidence,
-        failure_code: forge_domain::FileMutationFailureCode,
-        observed_at: TimestampMillis,
-        producer: ChangeSetProducer,
-    ) -> Result<forge_domain::RegisteredChangeSet, WorkspaceStoreError> {
-        self.ensure_live_binding()?;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        workspace_diffs::abandon(&transaction, diff_command)?;
-        let result = workspace_changesets::fail_tree_change_set_without_effect(
-            &transaction,
-            change_set_id,
-            failure_code,
-            observed_at,
-        )?;
-        let diff = workspace_diffs::get_by_id(&transaction, diff_command.id())?
-            .ok_or(DiffStoreError::RecordMissing)?;
-        workspace_effect_fact_outbox::append_change_set_terminal(
-            &transaction,
-            &result,
-            &diff,
-            producer,
-        )?;
-        append_change_set_semantic_events(&transaction, &result, &diff)?;
-        transaction.commit()?;
-        self.capture_sidecar_identities()?;
-        Ok(result)
-    }
-
-    pub fn tree_change_set_applied_mutations(
-        &self,
-        change_set_id: forge_domain::ChangeSetId,
-    ) -> Result<Vec<forge_domain::TreeMutationId>, WorkspaceStoreError> {
-        self.ensure_live_binding()?;
-        Ok(workspace_changesets::tree_change_set_applied_mutations(
-            &self.connection,
-            change_set_id,
-        )?)
     }
 
     /// Persist one Activity-attributed file mutation intent before its live
@@ -4798,58 +4602,6 @@ impl WorkspaceStore {
         let result = workspace_changesets::get(&self.connection, id)?;
         self.ensure_live_binding()?;
         Ok(result)
-    }
-
-    /// Read one historical single-file mutation and its optional Diff
-    /// projection from the same deferred `SQLite` snapshot. This path performs
-    /// no current Writer Lease or source-mutation authority check.
-    pub fn file_mutation_read_snapshot(
-        &mut self,
-        id: forge_domain::ChangeSetId,
-    ) -> Result<Option<FileMutationReadSnapshot>, WorkspaceStoreError> {
-        self.ensure_live_binding()?;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Deferred)?;
-        let Some(record) = workspace_changesets::get(&transaction, id)? else {
-            transaction.commit()?;
-            self.ensure_live_binding()?;
-            return Ok(None);
-        };
-        let diff = workspace_diffs::get_by_change_set(&transaction, id)?;
-        let snapshot = FileMutationReadSnapshot::new(record, diff);
-        transaction.commit()?;
-        self.ensure_live_binding()?;
-        Ok(Some(snapshot))
-    }
-
-    /// Read one historical source-tree request and its optional Diff
-    /// projection from the same deferred `SQLite` snapshot. This path performs
-    /// no current Writer Lease or source-mutation authority check.
-    pub fn source_tree_read_snapshot(
-        &mut self,
-        id: forge_domain::ChangeSetId,
-    ) -> Result<Option<SourceTreeReadSnapshot>, WorkspaceStoreError> {
-        self.ensure_live_binding()?;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Deferred)?;
-        let Some(data) = workspace_changesets::source_tree_read_data(&transaction, id)? else {
-            transaction.commit()?;
-            self.ensure_live_binding()?;
-            return Ok(None);
-        };
-        let diff = workspace_diffs::get_by_change_set(&transaction, id)?;
-        let snapshot = SourceTreeReadSnapshot::new(
-            data.change_set,
-            data.request_digest,
-            data.applied_mutations,
-            data.mutation_count,
-            diff,
-        );
-        transaction.commit()?;
-        self.ensure_live_binding()?;
-        Ok(Some(snapshot))
     }
 
     /// Read the Diff Evidence row associated with one `ChangeSet`.

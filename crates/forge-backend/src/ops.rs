@@ -47,7 +47,6 @@ mod goals;
 pub(crate) mod home_transfers;
 pub mod lease;
 pub mod location_removal;
-mod mutation;
 mod observability;
 mod plan;
 mod planning;
@@ -59,15 +58,11 @@ mod work_cuts;
 pub mod workspace_root_recovery;
 pub mod workspace_stop;
 
+mod activity_lease_resume;
+mod activity_quiescent_lease_resume;
 #[cfg(test)]
 mod authority_metadata_tests;
 mod registry;
-mod source;
-pub(crate) use source::scope_json;
-mod activity_lease_resume;
-mod activity_quiescent_lease_resume;
-mod source_write;
-mod tree;
 
 /// One source for the closed operation names, parser and capability ordering.
 macro_rules! define_command_ops {
@@ -187,18 +182,11 @@ define_command_ops! {
     ExecutionWait => "execution.wait",
     ExecutionGet => "execution.get",
     DiffRead => "diff.read",
-    FileList => "file.list",
-    TextSearch => "text.search",
-    FileReadSlice => "file.read_slice",
     WriterLeaseAcquire => "writer_lease.acquire",
     WriterLeaseRenew => "writer_lease.renew",
     WriterLeaseRelease => "writer_lease.release",
     WriterLeaseGet => "writer_lease.get",
     WriterLeaseList => "writer_lease.list",
-    FileMutationReadback => "file.mutation_readback",
-    FileApplyPatch => "file.apply_patch",
-    SourceTreeApply => "source_tree.apply",
-    SourceTreeReadback => "source_tree.readback",
     GoalCreate => "goal.create",
     GoalRevise => "goal.revise",
     GoalTransition => "goal.transition",
@@ -283,8 +271,6 @@ impl CommandOp {
                 | Self::WriterLeaseAcquire
                 | Self::WriterLeaseRenew
                 | Self::WriterLeaseRelease
-                | Self::FileApplyPatch
-                | Self::SourceTreeApply
                 | Self::GoalCreate
                 | Self::GoalRevise
                 | Self::GoalTransition
@@ -593,18 +579,6 @@ pub enum Command {
         scope: ResolvedWorkspaceScope,
         diff_id: forge_domain::DiffId,
     },
-    FileList {
-        request_id: Uuid,
-        request: Box<forge_control::FileListRequest>,
-    },
-    TextSearch {
-        request_id: Uuid,
-        request: Box<forge_control::TextSearchRequest>,
-    },
-    FileReadSlice {
-        request_id: Uuid,
-        request: Box<forge_control::FileReadSliceRequest>,
-    },
     WriterLeaseAcquire {
         request_id: Uuid,
         request: Box<forge_control::WriterLeaseAcquireRequest>,
@@ -624,18 +598,6 @@ pub enum Command {
     WriterLeaseList {
         request_id: Uuid,
         request: Box<forge_control::WriterLeaseListRequest>,
-    },
-    FileApplyPatch {
-        request_id: Uuid,
-        request: Box<forge_control::FileApplyPatchRequest>,
-    },
-    SourceTreeApply {
-        request_id: Uuid,
-        request: Box<forge_control::SourceTreeTransactionRequest>,
-    },
-    SourceTreeReadback {
-        request_id: Uuid,
-        request: Box<forge_control::SourceTreeReadbackRequest>,
     },
     GoalMutation {
         request_id: Uuid,
@@ -658,10 +620,6 @@ pub enum Command {
     DagPlanReadback {
         request_id: Uuid,
         request: Box<forge_control::DagPlanReadbackRequest>,
-    },
-    FileMutationReadback {
-        request_id: Uuid,
-        request: Box<forge_control::FileMutationReadbackRequest>,
     },
     LocationRegister {
         request_id: Uuid,
@@ -845,10 +803,7 @@ impl Command {
                 | Self::ActivityBootstrap { .. }
         )
     }
-    #[expect(
-        clippy::too_many_lines,
-        reason = "One arm per closed command preserves the transport request identity table."
-    )]
+
     pub const fn request_id(&self) -> Uuid {
         match self {
             Self::ActivityStartedLeaseResume { request_id, .. }
@@ -898,18 +853,11 @@ impl Command {
             | Self::ExecutionGet { request_id, .. }
             | Self::ExecutionWait { request_id, .. }
             | Self::DiffRead { request_id, .. }
-            | Self::FileList { request_id, .. }
-            | Self::TextSearch { request_id, .. }
-            | Self::FileReadSlice { request_id, .. }
             | Self::WriterLeaseAcquire { request_id, .. }
             | Self::WriterLeaseRenew { request_id, .. }
             | Self::WriterLeaseRelease { request_id, .. }
             | Self::WriterLeaseGet { request_id, .. }
             | Self::WriterLeaseList { request_id, .. }
-            | Self::FileMutationReadback { request_id, .. }
-            | Self::FileApplyPatch { request_id, .. }
-            | Self::SourceTreeApply { request_id, .. }
-            | Self::SourceTreeReadback { request_id, .. }
             | Self::GoalMutation { request_id, .. }
             | Self::GoalMutationReadback { request_id, .. }
             | Self::GoalReview { request_id, .. }
@@ -1087,22 +1035,6 @@ impl Command {
                 draft_digest: encode_hex(request.request.digest().as_bytes()),
             });
         }
-        if let Self::SourceTreeApply { request, .. } = self {
-            return Some(crate::error::ReadbackHint::TreeChangeSet {
-                workspace_id: request.scope.workspace_id().into_uuid(),
-                activity_id: request.activity.activity_id.into_uuid(),
-                change_set_id: request.change_set_id.into_uuid(),
-                request_digest: encode_hex(request.request_digest.as_bytes()),
-            });
-        }
-        if let Self::FileApplyPatch { request, .. } = self {
-            return Some(crate::error::ReadbackHint::FileMutation {
-                workspace_id: request.scope.workspace_id().into_uuid(),
-                activity_id: request.activity.activity_id.into_uuid(),
-                change_set_id: request.change_set_id.into_uuid(),
-                mutation_id: request.mutation_id.into_uuid(),
-            });
-        }
         let lease_id = match self {
             Self::WriterLeaseAcquire { request, .. } => Some(request.command.lease_id()),
             Self::WriterLeaseRenew { request, .. } => Some(request.command.lease_id()),
@@ -1191,18 +1123,11 @@ impl Command {
             Self::ExecutionWait { .. } => CommandOp::ExecutionWait,
             Self::ExecutionGet { .. } => CommandOp::ExecutionGet,
             Self::DiffRead { .. } => CommandOp::DiffRead,
-            Self::FileList { .. } => CommandOp::FileList,
-            Self::TextSearch { .. } => CommandOp::TextSearch,
-            Self::FileReadSlice { .. } => CommandOp::FileReadSlice,
             Self::WriterLeaseAcquire { .. } => CommandOp::WriterLeaseAcquire,
             Self::WriterLeaseRenew { .. } => CommandOp::WriterLeaseRenew,
             Self::WriterLeaseRelease { .. } => CommandOp::WriterLeaseRelease,
             Self::WriterLeaseGet { .. } => CommandOp::WriterLeaseGet,
             Self::WriterLeaseList { .. } => CommandOp::WriterLeaseList,
-            Self::FileMutationReadback { .. } => CommandOp::FileMutationReadback,
-            Self::FileApplyPatch { .. } => CommandOp::FileApplyPatch,
-            Self::SourceTreeApply { .. } => CommandOp::SourceTreeApply,
-            Self::SourceTreeReadback { .. } => CommandOp::SourceTreeReadback,
             Self::GoalMutation { request, .. } => match request.command.kind() {
                 forge_domain::GoalMutationKind::Create => CommandOp::GoalCreate,
                 forge_domain::GoalMutationKind::Revise => CommandOp::GoalRevise,
@@ -1471,49 +1396,11 @@ pub fn parse_command(op: CommandOp, request_id: Uuid, payload: &serde_json::Valu
         | CommandOp::ExecutionGet
         | CommandOp::ExecutionWait => parse_execution_command(op, request_id, payload),
         CommandOp::DiffRead => parse_diff_read(request_id, payload),
-        CommandOp::FileList => Ok(Command::FileList {
-            request_id,
-            request: Box::new(source::parse_file_list(payload)?),
-        }),
-        CommandOp::TextSearch => Ok(Command::TextSearch {
-            request_id,
-            request: Box::new(source::parse_text_search(payload)?),
-        }),
         CommandOp::WriterLeaseAcquire
         | CommandOp::WriterLeaseRenew
         | CommandOp::WriterLeaseRelease
         | CommandOp::WriterLeaseGet
         | CommandOp::WriterLeaseList => parse_writer_lease_command(op, request_id, payload),
-        CommandOp::SourceTreeApply => {
-            require_payload_bound(payload, crate::config::MAX_BODY_BYTES, "source_tree.apply")?;
-            Ok(Command::SourceTreeApply {
-                request_id,
-                request: Box::new(tree::parse_apply(payload)?),
-            })
-        }
-        CommandOp::SourceTreeReadback => Ok(Command::SourceTreeReadback {
-            request_id,
-            request: Box::new(tree::parse_readback(payload)?),
-        }),
-        CommandOp::FileApplyPatch => {
-            require_payload_bound(
-                payload,
-                MAX_SOURCE_MUTATION_PAYLOAD_BYTES,
-                "file.apply_patch",
-            )?;
-            Ok(Command::FileApplyPatch {
-                request_id,
-                request: Box::new(source_write::parse_apply_patch(payload)?),
-            })
-        }
-        CommandOp::FileMutationReadback => Ok(Command::FileMutationReadback {
-            request_id,
-            request: Box::new(mutation::parse_readback(payload)?),
-        }),
-        CommandOp::FileReadSlice => Ok(Command::FileReadSlice {
-            request_id,
-            request: Box::new(source::parse_file_read_slice(payload)?),
-        }),
         CommandOp::LocationRegister => Ok(Command::LocationRegister {
             request_id,
             request: Box::new(registry::parse_location_register_payload(payload)?),
@@ -2004,9 +1891,6 @@ fn parse_body<T: for<'de> Deserialize<'de>>(
     T::deserialize(payload).map_err(|_| ForgeError::invalid_input(message))
 }
 
-/// Maximum compact JSON payload size before decoding a source mutation.
-pub(crate) const MAX_SOURCE_MUTATION_PAYLOAD_BYTES: usize = 16 * 1024;
-
 fn require_payload_bound(
     payload: &serde_json::Value,
     max_bytes: usize,
@@ -2294,9 +2178,6 @@ fn execute_on_bridge_inner(
             "execution.wait requires async admission",
         )),
         Command::DiffRead { scope, diff_id, .. } => execute_diff_read(client, scope, *diff_id),
-        Command::FileList { request, .. } => source::execute_file_list(client, request),
-        Command::TextSearch { request, .. } => source::execute_text_search(client, request),
-        Command::FileReadSlice { request, .. } => source::execute_file_read_slice(client, request),
         Command::WriterLeaseAcquire { request, .. } => lease::execute_acquire(client, request),
         Command::WriterLeaseRenew { request, .. } => lease::execute_renew(client, request),
         Command::WriterLeaseRelease { request, .. } => lease::execute_release(client, request),
@@ -2312,14 +2193,6 @@ fn execute_on_bridge_inner(
         } => goals::execute_review(client, scope, *activity_id, *goal_id),
         Command::DagPlanCommit { request, .. } => dag_plan::execute_commit(client, request),
         Command::DagPlanReadback { request, .. } => dag_plan::execute_readback(client, request),
-        Command::SourceTreeApply { request, .. } => tree::execute_apply(client, request),
-        Command::SourceTreeReadback { request, .. } => tree::execute_readback(client, request),
-        Command::FileApplyPatch { request, .. } => {
-            source_write::execute_apply_patch(client, request)
-        }
-        Command::FileMutationReadback { request, .. } => {
-            mutation::execute_readback(client, request)
-        }
         Command::LocationRegister { request, .. } => {
             registry::execute_location_register(client, request)
         }
@@ -2773,7 +2646,7 @@ fn execute_diff_read(
         "diff_id": result.evidence().id().into_uuid(),
         "health": diff_health_json(result.health()),
         "has_content": result.content().is_some(),
-        "scope": source::scope_json(result.scope())?,
+        "scope": scope_json(result.scope())?,
         "diff": diff_evidence_json(result.evidence()),
         "content": result.content(),
     }))
@@ -2857,8 +2730,8 @@ fn diff_payload_paths_json(
 fn diff_entry_json(entry: &forge_domain::DiffEntrySummary) -> serde_json::Value {
     json!({
         "subject": match entry.subject() { forge_domain::DiffEntrySubject::File => "file", forge_domain::DiffEntrySubject::Directory => "directory" },
-        "primary_path_base64":source::encode_relative_path(entry.primary_path()),
-        "secondary_path_base64":entry.secondary_path().map(source::encode_relative_path),
+        "primary_path_base64":encode_relative_path(entry.primary_path()),
+        "secondary_path_base64":entry.secondary_path().map(encode_relative_path),
         "change_kind":diff_change_kind_json(entry.kind()),
         "additions":entry.additions().get(),"deletions":entry.deletions().get(),
     })
@@ -2980,7 +2853,7 @@ pub fn started_activity_lease_resume_request_digest(
     request_id: Uuid,
     probe: &forge_domain::StartedActivityLeaseResumeProbe,
 ) -> Result<[u8; 32], ForgeError> {
-    let scope_value = source::scope_json(scope)?;
+    let scope_value = scope_json(scope)?;
     let scope_dto: ScopeDto =
         serde_json::from_value(scope_value).map_err(|_| ForgeError::internal())?;
     activity_lease_resume::canonical_request_digest_for_probe(&scope_dto, request_id, probe)
@@ -2993,12 +2866,73 @@ pub fn quiescent_activity_lease_resume_request_digest(
     request_id: Uuid,
     probe: &forge_domain::QuiescentActivityLeaseResumeProbe,
 ) -> Result<[u8; 32], ForgeError> {
-    let scope_value = source::scope_json(scope)?;
+    let scope_value = scope_json(scope)?;
     let scope_dto: ScopeDto =
         serde_json::from_value(scope_value).map_err(|_| ForgeError::internal())?;
     activity_quiescent_lease_resume::canonical_request_digest_for_probe(
         &scope_dto, request_id, probe,
     )
+}
+
+pub(crate) fn scope_json(scope: &ResolvedWorkspaceScope) -> Result<serde_json::Value, ForgeError> {
+    let relative_root = scope
+        .locator()
+        .relative_root()
+        .to_str()
+        .ok_or_else(ForgeError::internal)?;
+    Ok(json!({
+        "workspace_id": scope.workspace_id().into_uuid(),
+        "workspace_revision": scope.workspace_revision().get(),
+        "locator": {
+            "location_id": scope.locator().location_id().into_uuid(),
+            "expected_revision": scope.locator().expected_revision().get(),
+            "relative_root": relative_root,
+        },
+    }))
+}
+
+pub(crate) fn encode_relative_path(path: &forge_domain::WorkspaceRelativePath) -> String {
+    use base64::Engine as _;
+    use std::os::unix::ffi::OsStrExt as _;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(path.as_path().as_os_str().as_bytes())
+}
+
+pub(crate) fn decode_relative_path(
+    value: &str,
+) -> Result<forge_domain::WorkspaceRelativePath, ForgeError> {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt as _;
+    use std::path::PathBuf;
+
+    const fn base64_url_no_pad_len(byte_count: usize) -> usize {
+        let full_triplets = (byte_count / 3) * 4;
+        let remainder = byte_count % 3;
+        full_triplets + if remainder == 0 { 0 } else { remainder + 1 }
+    }
+
+    if value.is_empty()
+        || value.len() > base64_url_no_pad_len(forge_domain::MAX_WORKSPACE_RELATIVE_PATH_BYTES)
+    {
+        return Err(ForgeError::invalid_input("source path token is invalid"));
+    }
+    let bytes = URL_SAFE_NO_PAD
+        .decode(value)
+        .map_err(|_| ForgeError::invalid_input("source path token is invalid"))?;
+    if URL_SAFE_NO_PAD.encode(&bytes) != value {
+        return Err(ForgeError::invalid_input(
+            "source path token is not canonical",
+        ));
+    }
+    forge_domain::WorkspaceRelativePath::new(PathBuf::from(OsString::from_vec(bytes)))
+        .map_err(|_| ForgeError::invalid_input("source path is not confined"))
+}
+
+pub(crate) fn parse_content_hash(value: &str) -> Result<forge_domain::FileContentHash, ForgeError> {
+    use std::str::FromStr as _;
+    forge_domain::FileContentHash::from_str(value)
+        .map_err(|_| ForgeError::invalid_input("source content hash is invalid"))
 }
 
 fn decode_file_activity(

@@ -2,6 +2,8 @@ use std::ffi::OsString;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
+#[cfg(test)]
+use forge_domain::TreeChangeSetIntent;
 use forge_domain::{
     AbandonDiffEvidence, ActivityId, BeginDiffEvidence, BeginDiffPurge, BeginFileMutation,
     ChangeSetId, CompleteDiffEvidence, CompleteDiffPurge, DiffArtifactInventoryName,
@@ -10,8 +12,7 @@ use forge_domain::{
     DiffLineCount, DiffListLimit, DiffOrigin, DiffPayloadHash, DiffPayloadProjection,
     DiffPurgeRecord, DiffPurgeStatus, DiffRedactionPolicyVersion, DiffRenderKind,
     DiffRendererVersion, DiffRetentionKeepCount, DiffRetentionPlanLimit, DiffRevision,
-    FileMutationId, RegisteredDiffEvidence, TimestampMillis, TreeChangeSetIntent, WorkspaceId,
-    WorkspaceRelativePath,
+    FileMutationId, RegisteredDiffEvidence, TimestampMillis, WorkspaceId, WorkspaceRelativePath,
 };
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 use thiserror::Error;
@@ -296,6 +297,7 @@ pub(crate) fn begin(
     insert_begin(transaction, command)
 }
 
+#[cfg(test)]
 pub(crate) fn begin_tree(
     transaction: &Transaction<'_>,
     tree_intent: &TreeChangeSetIntent,
@@ -305,6 +307,7 @@ pub(crate) fn begin_tree(
     insert_begin(transaction, command)
 }
 
+#[cfg(test)]
 pub(crate) fn inspect_tree(
     connection: &Connection,
     tree_intent: &TreeChangeSetIntent,
@@ -1129,6 +1132,7 @@ fn validate_file_begin_linkage(
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_tree_begin_linkage(
     tree_intent: &TreeChangeSetIntent,
     command: &BeginDiffEvidence,
@@ -1154,6 +1158,7 @@ fn validate_tree_begin_linkage(
 /// delete effects. V1 keeps the historical structured summary contract for
 /// arbitrary validated tree plans. V2 adds text and its explicit oversized
 /// fallback for patch-only plans.
+#[cfg(test)]
 fn valid_tree_begin_payload(
     versions: DiffContractVersions,
     payload: &DiffPayloadProjection,
@@ -1177,6 +1182,7 @@ fn valid_tree_begin_payload(
     }
 }
 
+#[cfg(test)]
 const fn is_patch_only_file_modified_entry(entry: &DiffEntrySummary) -> bool {
     matches!(entry.subject(), DiffEntrySubject::File)
         && entry.secondary_path().is_none()

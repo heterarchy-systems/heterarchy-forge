@@ -351,7 +351,7 @@ pub(super) fn execute_commit(
     client: &ForgeControlClient,
     request: &AgentDagPlanCommitRequest,
 ) -> Result<Value, ForgeError> {
-    let scope = super::source::scope_json(&request.scope)?;
+    let scope = super::scope_json(&request.scope)?;
     let result = client
         .agent_dag_plan_commit(request.clone())
         .map_err(|error| super::forge_error_of_client(&error))?;
@@ -387,7 +387,7 @@ fn readback_json(
     request: &DagPlanReadbackRequest,
     record: Option<&AgentDagPlanRecord>,
 ) -> Result<Value, ForgeError> {
-    let scope = super::source::scope_json(&request.scope)?;
+    let scope = super::scope_json(&request.scope)?;
     let common = json!({
         "scope": scope,
         "activity_id": request.activity_id.into_uuid(),

@@ -58,8 +58,6 @@ use crate::binding_reference::{
     AgentDepartureReconcileDestinationRequest, AgentOperationsDelegateReferenceRequest,
     AgentSessionReconcileDestinationRequest,
 };
-use crate::checkpoint::CheckpointRestoreOutcome;
-use crate::checkpoint::CheckpointRestoreRequest;
 use crate::command::{
     PreparedProjectCommandVerification, ProjectCommandListRequest, ProjectCommandListResult,
 };
@@ -78,12 +76,6 @@ use crate::diff::{
 use crate::doctor::{WorkspaceDoctorRequest, WorkspaceDoctorResult, WorkspaceIdentityDoctorReport};
 use crate::error::{ControlError, ControlErrorCode, ControlErrorView};
 use crate::execution_stop::ExecutionStopContext;
-use crate::filesystem::{
-    FileActivityScope, FileApplyPatchRequest, FileApplyPatchResult, FileListRequest,
-    FileListResult, FileMutationRequest, FileMutationResult, FileReadRequest, FileReadResult,
-    FileReadSliceRequest, FileReadSliceResult, SourceTreeTransactionRequest,
-    SourceTreeTransactionResult, TextSearchRequest, TextSearchResult,
-};
 use crate::goal::{GoalCompletionRequest, GoalContractRevisionRequest, GoalLifecycleRequest};
 use crate::queue::{
     QueueAttribution, QueueConfigError, QueueDequeue, QueueEnqueueError, QueueMailbox,
@@ -465,13 +457,6 @@ pub(crate) enum ForgeControlRequest {
         locator: WorkspaceLocator,
         response: Response<ResolvedWorkspaceScope>,
     },
-    /// Internal durable Activity admission used by transport scope resolvers.
-    /// It is not part of any public tool surface.
-    AuthorizeActivity {
-        scope: ResolvedWorkspaceScope,
-        activity: FileActivityScope,
-        response: Response<()>,
-    },
     WorkspaceDoctor {
         request: WorkspaceDoctorRequest,
         response: Response<WorkspaceDoctorResult>,
@@ -677,26 +662,6 @@ pub(crate) enum ForgeControlRequest {
         execution_id: ExecutionId,
         response: Response<Option<std::path::PathBuf>>,
     },
-    FileRead {
-        request: FileReadRequest,
-        response: Response<FileReadResult>,
-    },
-    FileList {
-        request: FileListRequest,
-        response: Response<FileListResult>,
-    },
-    TextSearch {
-        request: TextSearchRequest,
-        response: Response<TextSearchResult>,
-    },
-    FileMutationReadback {
-        request: crate::FileMutationReadbackRequest,
-        response: Response<Option<forge_persistence::FileMutationReadSnapshot>>,
-    },
-    SourceTreeReadback {
-        request: crate::SourceTreeReadbackRequest,
-        response: Response<Option<forge_persistence::SourceTreeReadSnapshot>>,
-    },
     GoalMutation {
         request: Box<crate::GoalMutationRequest>,
         response: Response<forge_persistence::GoalMutationResult>,
@@ -708,27 +673,6 @@ pub(crate) enum ForgeControlRequest {
     DagPlanReadback {
         request: crate::DagPlanReadbackRequest,
         response: Response<Option<forge_persistence::AgentDagPlanRecord>>,
-    },
-    FileReadSlice {
-        request: FileReadSliceRequest,
-        response: Response<FileReadSliceResult>,
-    },
-    FileApplyPatch {
-        request: FileApplyPatchRequest,
-        response: Response<FileApplyPatchResult>,
-    },
-    SourceTreeApply {
-        request: SourceTreeTransactionRequest,
-        response: Response<SourceTreeTransactionResult>,
-    },
-    FileImportBinary {
-        request: FileMutationRequest,
-        response: Response<FileMutationResult>,
-        _permit: BinaryImportPermit,
-    },
-    FileMutate {
-        request: FileMutationRequest,
-        response: Response<FileMutationResult>,
     },
     ExecutionMarkRunning {
         scope: ResolvedWorkspaceScope,
@@ -963,10 +907,6 @@ pub(crate) enum ForgeControlRequest {
         request_id: uuid::Uuid,
         request_digest: [u8; 32],
         response: Response<Option<forge_persistence::RecoveryRunReceipt>>,
-    },
-    CheckpointRestoreRun {
-        request: CheckpointRestoreRequest,
-        response: Response<CheckpointRestoreOutcome>,
     },
     EnsureWorkspacePolicy {
         scope: ResolvedWorkspaceScope,
@@ -1332,18 +1272,6 @@ enum ControlSender {
 pub struct ForgeControlClient {
     sender: ControlSender,
     accepting: Arc<AtomicBool>,
-    binary_import: Arc<AtomicBool>,
-}
-
-/// Owns the one queued-or-running binary slot. All terminal paths drop the
-/// request, so rejection and shutdown cannot leak capacity.
-#[derive(Debug)]
-pub(crate) struct BinaryImportPermit(Arc<AtomicBool>);
-
-impl Drop for BinaryImportPermit {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
-    }
 }
 
 impl ForgeControlClient {
@@ -1763,11 +1691,7 @@ impl ForgeControlClient {
         self.submit(|response| ForgeControlRequest::AgentSessionProve { request, response })
     }
     fn new(sender: ControlSender, accepting: Arc<AtomicBool>) -> Self {
-        Self {
-            sender,
-            accepting,
-            binary_import: Arc::new(AtomicBool::new(false)),
-        }
+        Self { sender, accepting }
     }
 
     /// Read the bounded general-mailbox projection without entering the
@@ -1972,20 +1896,6 @@ impl ForgeControlClient {
             location_id,
             expected_revision,
             locator,
-            response,
-        })
-    }
-
-    /// Revalidate Activity ownership through the single-owner control worker.
-    /// The worker stamps the observation immediately before the durable check.
-    pub fn authorize_activity(
-        &self,
-        scope: ResolvedWorkspaceScope,
-        activity: FileActivityScope,
-    ) -> Result<(), ControlClientError> {
-        self.submit(|response| ForgeControlRequest::AuthorizeActivity {
-            scope,
-            activity,
             response,
         })
     }
@@ -2702,90 +2612,6 @@ impl ForgeControlClient {
         })
     }
 
-    /// Blocking confined file read through the single-owner application
-    /// service worker.
-    pub fn file_read(
-        &self,
-        request: FileReadRequest,
-    ) -> Result<FileReadResult, ControlClientError> {
-        self.submit_file_read(request)?.recv()
-    }
-
-    pub fn submit_file_read(
-        &self,
-        request: FileReadRequest,
-    ) -> Result<PendingControl<FileReadResult>, ControlClientError> {
-        self.submit_pending(|response| ForgeControlRequest::FileRead { request, response })
-    }
-
-    pub fn file_list(
-        &self,
-        request: FileListRequest,
-    ) -> Result<FileListResult, ControlClientError> {
-        self.submit_file_list(request)?.recv()
-    }
-
-    pub fn submit_file_list(
-        &self,
-        request: FileListRequest,
-    ) -> Result<PendingControl<FileListResult>, ControlClientError> {
-        self.submit_pending(|response| ForgeControlRequest::FileList { request, response })
-    }
-
-    pub fn text_search(
-        &self,
-        request: TextSearchRequest,
-    ) -> Result<TextSearchResult, ControlClientError> {
-        self.submit_text_search(request)?.recv()
-    }
-
-    pub fn submit_text_search(
-        &self,
-        request: TextSearchRequest,
-    ) -> Result<PendingControl<TextSearchResult>, ControlClientError> {
-        self.submit_pending(|response| ForgeControlRequest::TextSearch { request, response })
-    }
-
-    /// Observe one exact historical mutation tuple without acquiring write authority.
-    pub fn file_mutation_readback(
-        &self,
-        request: crate::FileMutationReadbackRequest,
-    ) -> Result<Option<forge_persistence::FileMutationReadSnapshot>, ControlClientError> {
-        self.submit_file_mutation_readback(request)?.recv()
-    }
-
-    pub fn submit_file_mutation_readback(
-        &self,
-        request: crate::FileMutationReadbackRequest,
-    ) -> Result<
-        PendingControl<Option<forge_persistence::FileMutationReadSnapshot>>,
-        ControlClientError,
-    > {
-        self.submit_pending(|response| ForgeControlRequest::FileMutationReadback {
-            request,
-            response,
-        })
-    }
-
-    /// Observe one exact historical mutation tuple without acquiring write authority.
-    pub fn source_tree_readback(
-        &self,
-        request: crate::SourceTreeReadbackRequest,
-    ) -> Result<Option<forge_persistence::SourceTreeReadSnapshot>, ControlClientError> {
-        self.submit_source_tree_readback(request)?.recv()
-    }
-
-    pub fn submit_source_tree_readback(
-        &self,
-        request: crate::SourceTreeReadbackRequest,
-    ) -> Result<PendingControl<Option<forge_persistence::SourceTreeReadSnapshot>>, ControlClientError>
-    {
-        self.submit_pending(|response| ForgeControlRequest::SourceTreeReadback {
-            request,
-            response,
-        })
-    }
-
     pub fn goal_mutation(
         &self,
         request: crate::GoalMutationRequest,
@@ -2830,106 +2656,6 @@ impl ForgeControlClient {
     ) -> Result<PendingControl<Option<forge_persistence::AgentDagPlanRecord>>, ControlClientError>
     {
         self.submit_pending(|response| ForgeControlRequest::DagPlanReadback { request, response })
-    }
-
-    pub fn file_read_slice(
-        &self,
-        request: FileReadSliceRequest,
-    ) -> Result<FileReadSliceResult, ControlClientError> {
-        self.submit_file_read_slice(request)?.recv()
-    }
-
-    pub fn submit_file_read_slice(
-        &self,
-        request: FileReadSliceRequest,
-    ) -> Result<PendingControl<FileReadSliceResult>, ControlClientError> {
-        self.submit_pending(|response| ForgeControlRequest::FileReadSlice { request, response })
-    }
-
-    pub fn file_apply_patch(
-        &self,
-        request: FileApplyPatchRequest,
-    ) -> Result<FileApplyPatchResult, ControlClientError> {
-        self.submit_file_apply_patch(request)?.recv()
-    }
-
-    pub fn submit_file_apply_patch(
-        &self,
-        request: FileApplyPatchRequest,
-    ) -> Result<PendingControl<FileApplyPatchResult>, ControlClientError> {
-        self.submit_pending(|response| ForgeControlRequest::FileApplyPatch { request, response })
-    }
-
-    pub fn source_tree_apply(
-        &self,
-        request: SourceTreeTransactionRequest,
-    ) -> Result<SourceTreeTransactionResult, ControlClientError> {
-        self.submit_source_tree_apply(request)?.recv()
-    }
-
-    pub fn submit_source_tree_apply(
-        &self,
-        request: SourceTreeTransactionRequest,
-    ) -> Result<PendingControl<SourceTreeTransactionResult>, ControlClientError> {
-        self.submit_pending(|response| ForgeControlRequest::SourceTreeApply { request, response })
-    }
-
-    /// Bounded native binary import; payload size is checked before queue admission.
-    pub fn file_import_binary(
-        &self,
-        request: FileMutationRequest,
-    ) -> Result<FileMutationResult, ControlClientError> {
-        self.submit_file_import_binary(request)?.recv()
-    }
-
-    pub fn submit_file_import_binary(
-        &self,
-        request: FileMutationRequest,
-    ) -> Result<PendingControl<FileMutationResult>, ControlClientError> {
-        let content = request.content.as_deref().ok_or_else(|| {
-            ControlClientError::Service(ControlError::new(ControlErrorCode::FileConflict))
-        })?;
-        if content.len() > forge_workspace::MAX_BINARY_IMPORT_BYTES {
-            return Err(ControlClientError::Service(ControlError::new(
-                ControlErrorCode::FileCapacityExceeded,
-            )));
-        }
-        // One queued-or-running binary payload per worker, independent of the
-        // configurable general queue capacity. The owned permit follows the
-        // request through rejection, shutdown and effect completion.
-        self.binary_import
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .map_err(|_| ControlClientError::QueueFull)?;
-        let permit = BinaryImportPermit(Arc::clone(&self.binary_import));
-        self.submit_pending(|response| ForgeControlRequest::FileImportBinary {
-            request,
-            response,
-            _permit: permit,
-        })
-    }
-
-    /// Blocking one-file mutation with bounded content before queue admission.
-    pub fn file_mutate(
-        &self,
-        request: FileMutationRequest,
-    ) -> Result<FileMutationResult, ControlClientError> {
-        self.submit_file_mutate(request)?.recv()
-    }
-
-    pub fn submit_file_mutate(
-        &self,
-        request: FileMutationRequest,
-    ) -> Result<PendingControl<FileMutationResult>, ControlClientError> {
-        if request
-            .content
-            .as_ref()
-            .is_some_and(|content| content.len() > forge_workspace::MAX_FILE_WRITE_BYTES)
-        {
-            return Err(ControlClientError::Service(ControlError::new(
-                ControlErrorCode::FileCapacityExceeded,
-            )));
-        }
-        self.submit_pending(|response| ForgeControlRequest::FileMutate { request, response })
     }
 
     pub fn execution_mark_running(
@@ -3595,14 +3321,6 @@ impl ForgeControlClient {
             request_digest,
             response,
         })
-    }
-
-    /// Restore one Ready checkpoint through the bounded control worker.
-    pub fn checkpoint_restore(
-        &self,
-        request: CheckpointRestoreRequest,
-    ) -> Result<CheckpointRestoreOutcome, ControlClientError> {
-        self.submit(|response| ForgeControlRequest::CheckpointRestoreRun { request, response })
     }
 
     pub fn ensure_workspace_policy(
@@ -4448,15 +4166,6 @@ fn queue_attribution_for_request(request: &ForgeControlRequest) -> QueueAttribut
         ForgeControlRequest::ProjectCommandList { request, .. } => {
             QueueAttribution::Workspace(request.scope.workspace_id())
         }
-        ForgeControlRequest::FileRead { request, .. } => {
-            QueueAttribution::Workspace(request.scope.workspace_id())
-        }
-        ForgeControlRequest::FileList { request, .. } => {
-            QueueAttribution::Workspace(request.scope.workspace_id())
-        }
-        ForgeControlRequest::TextSearch { request, .. } => {
-            QueueAttribution::Workspace(request.scope.workspace_id())
-        }
         ForgeControlRequest::GoalMutation { request, .. } => {
             QueueAttribution::Workspace(request.scope.workspace_id())
         }
@@ -4464,25 +4173,6 @@ fn queue_attribution_for_request(request: &ForgeControlRequest) -> QueueAttribut
             QueueAttribution::Workspace(request.scope.workspace_id())
         }
         ForgeControlRequest::DagPlanReadback { request, .. } => {
-            QueueAttribution::Workspace(request.scope.workspace_id())
-        }
-        ForgeControlRequest::SourceTreeReadback { request, .. } => {
-            QueueAttribution::Workspace(request.scope.workspace_id())
-        }
-        ForgeControlRequest::FileMutationReadback { request, .. } => {
-            QueueAttribution::Workspace(request.scope.workspace_id())
-        }
-        ForgeControlRequest::FileReadSlice { request, .. } => {
-            QueueAttribution::Workspace(request.scope.workspace_id())
-        }
-        ForgeControlRequest::FileApplyPatch { request, .. } => {
-            QueueAttribution::Workspace(request.scope.workspace_id())
-        }
-        ForgeControlRequest::SourceTreeApply { request, .. } => {
-            QueueAttribution::Workspace(request.scope.workspace_id())
-        }
-        ForgeControlRequest::FileMutate { request, .. }
-        | ForgeControlRequest::FileImportBinary { request, .. } => {
             QueueAttribution::Workspace(request.scope.workspace_id())
         }
         ForgeControlRequest::ExecutionGetEvidence { request, .. }
@@ -4519,9 +4209,6 @@ fn queue_attribution_for_request(request: &ForgeControlRequest) -> QueueAttribut
             QueueAttribution::Workspace(command.scope.workspace_id())
         }
         ForgeControlRequest::RecoveryMaintenanceDurable { request, .. } => {
-            QueueAttribution::Workspace(request.scope.workspace_id())
-        }
-        ForgeControlRequest::CheckpointRestoreRun { request, .. } => {
             QueueAttribution::Workspace(request.scope.workspace_id())
         }
         ForgeControlRequest::ReplaceWorkspacePolicy { request, .. } => {
@@ -4687,7 +4374,6 @@ fn queue_attribution_for_request(request: &ForgeControlRequest) -> QueueAttribut
                 },
             ..
         }
-        | ForgeControlRequest::AuthorizeActivity { scope, .. }
         | ForgeControlRequest::BootstrapActivity { scope, .. }
         | ForgeControlRequest::RenewActivityLease { scope, .. }
         | ForgeControlRequest::RenewActivityLeaseBatch { scope, .. }
@@ -4809,8 +4495,7 @@ fn service_class_for_request(request: &ForgeControlRequest) -> ServiceClass {
         | ForgeControlRequest::ListActivityProjections { .. }
         | ForgeControlRequest::ListWorkspaceActivityProjections { .. }
         | ForgeControlRequest::ActivityRead { .. } => Liveness,
-        ForgeControlRequest::AuthorizeActivity { .. }
-        | ForgeControlRequest::AgentCoordinationView { .. }
+        ForgeControlRequest::AgentCoordinationView { .. }
         | ForgeControlRequest::AgentInboxList { .. }
         | ForgeControlRequest::AgentSessionOpen { .. }
         | ForgeControlRequest::AgentSessionResolve { .. }
@@ -4914,11 +4599,6 @@ fn service_class_for_request(request: &ForgeControlRequest) -> ServiceClass {
         | ForgeControlRequest::AgentAssignmentList { .. }
         | ForgeControlRequest::AgentGetContext { .. }
         | ForgeControlRequest::ProjectCommandList { .. }
-        | ForgeControlRequest::FileRead { .. }
-        | ForgeControlRequest::FileList { .. }
-        | ForgeControlRequest::FileReadSlice { .. }
-        | ForgeControlRequest::FileMutationReadback { .. }
-        | ForgeControlRequest::SourceTreeReadback { .. }
         | ForgeControlRequest::GoalMutationReadback { .. }
         | ForgeControlRequest::DagPlanReadback { .. }
         | ForgeControlRequest::ExecutionGet { .. }
@@ -4957,10 +4637,6 @@ fn service_class_for_request(request: &ForgeControlRequest) -> ServiceClass {
         | ForgeControlRequest::ProjectCommandResolve { .. }
         | ForgeControlRequest::ProjectCommandPrepareVerification { .. }
         | ForgeControlRequest::WorkspaceVerificationPrepare { .. }
-        | ForgeControlRequest::FileApplyPatch { .. }
-        | ForgeControlRequest::SourceTreeApply { .. }
-        | ForgeControlRequest::FileImportBinary { .. }
-        | ForgeControlRequest::FileMutate { .. }
         | ForgeControlRequest::ExecutionMarkRunning { .. }
         | ForgeControlRequest::ExecutionCompleteGenerated { .. }
         | ForgeControlRequest::ExecutionComplete { .. }
@@ -4982,10 +4658,8 @@ fn service_class_for_request(request: &ForgeControlRequest) -> ServiceClass {
         | ForgeControlRequest::DagNodeStart { .. }
         | ForgeControlRequest::DagNodeComplete { .. }
         | ForgeControlRequest::DagNodeUpdate { .. }
-        | ForgeControlRequest::CheckpointRestoreRun { .. }
         | ForgeControlRequest::GeneratedPackageAccess { .. } => Work,
-        ForgeControlRequest::TextSearch { .. }
-        | ForgeControlRequest::GeneratedArtifactInventory { .. }
+        ForgeControlRequest::GeneratedArtifactInventory { .. }
         | ForgeControlRequest::RecoveryLeaseGet { .. }
         | ForgeControlRequest::RecoveryLeaseClaim { .. }
         | ForgeControlRequest::RecoveryLeaseRenew { .. }
@@ -5718,19 +5392,6 @@ fn dispatch_agent_or_activity_request(control: &ForgeControl, request: ForgeCont
     }
 }
 
-fn dispatch_authorize_activity(
-    control: &ForgeControl,
-    scope: &ResolvedWorkspaceScope,
-    mut activity: FileActivityScope,
-    response: &Response<()>,
-) {
-    let result = runtime_timestamp_millis().and_then(|observed_at| {
-        activity.observed_at = observed_at;
-        control.authorize_activity_request(scope, activity)
-    });
-    let _ignored = response.send(result);
-}
-
 fn dispatch_bootstrap_activity(
     control: &ForgeControl,
     scope: &ResolvedWorkspaceScope,
@@ -5934,11 +5595,6 @@ fn dispatch_activity_request(control: &ForgeControl, request: ForgeControlReques
         | ForgeControlRequest::ApprovalExpiryObserve { .. }) => {
             dispatch_approval_expiry_request(control, request);
         }
-        ForgeControlRequest::AuthorizeActivity {
-            scope,
-            activity,
-            response,
-        } => dispatch_authorize_activity(control, &scope, activity, &response),
         ForgeControlRequest::WorkspaceDoctor { request, response } => {
             dispatch_workspace_doctor(control, &request, &response);
         }
@@ -6064,18 +5720,8 @@ fn dispatch_activity_request(control: &ForgeControl, request: ForgeControlReques
         | ForgeControlRequest::ProjectCommandList { .. }
         | ForgeControlRequest::GeneratedArtifactInventory { .. }
         | ForgeControlRequest::GeneratedPackageAccess { .. }
-        | ForgeControlRequest::FileRead { .. }
-        | ForgeControlRequest::FileList { .. }
-        | ForgeControlRequest::TextSearch { .. }
-        | ForgeControlRequest::FileReadSlice { .. }
-        | ForgeControlRequest::FileMutationReadback { .. }
-        | ForgeControlRequest::SourceTreeReadback { .. }
         | ForgeControlRequest::GoalMutationReadback { .. }
         | ForgeControlRequest::DagPlanReadback { .. }
-        | ForgeControlRequest::FileApplyPatch { .. }
-        | ForgeControlRequest::SourceTreeApply { .. }
-        | ForgeControlRequest::FileImportBinary { .. }
-        | ForgeControlRequest::FileMutate { .. }
         | ForgeControlRequest::ExecutionMarkRunning { .. }
         | ForgeControlRequest::ExecutionCompleteGenerated { .. }
         | ForgeControlRequest::ExecutionComplete { .. }
@@ -6122,7 +5768,6 @@ fn dispatch_activity_request(control: &ForgeControl, request: ForgeControlReques
         | ForgeControlRequest::HomeTransferSource { .. }
         | ForgeControlRequest::RecoveryMaintenanceDurable { .. }
         | ForgeControlRequest::RecoveryMaintenanceGet { .. }
-        | ForgeControlRequest::CheckpointRestoreRun { .. }
         | ForgeControlRequest::EnsureWorkspacePolicy { .. }
         | ForgeControlRequest::GetWorkspacePolicy { .. }
         | ForgeControlRequest::ReplaceWorkspacePolicy { .. }
@@ -6178,7 +5823,6 @@ fn dispatch_supervisor_request(control: &ForgeControl, request: ForgeControlRequ
         | ForgeControlRequest::WorkspaceList { .. }
         | ForgeControlRequest::WorkspaceDiscover { .. }
         | ForgeControlRequest::ResolveWorkspace { .. }
-        | ForgeControlRequest::AuthorizeActivity { .. }
         | ForgeControlRequest::BootstrapActivity { .. }
         | ForgeControlRequest::RenewActivityLease { .. }
         | ForgeControlRequest::SupervisedActivityLeaseRenew { .. }
@@ -6366,8 +6010,7 @@ fn dispatch_effect_request_inner(control: &ForgeControl, request: ForgeControlRe
         | ForgeControlRequest::RecoveryLeaseRelease { .. }
         | ForgeControlRequest::RecoveryMaintenanceRun { .. }
         | ForgeControlRequest::RecoveryMaintenanceDurable { .. }
-        | ForgeControlRequest::RecoveryMaintenanceGet { .. }
-        | ForgeControlRequest::CheckpointRestoreRun { .. }) => {
+        | ForgeControlRequest::RecoveryMaintenanceGet { .. }) => {
             dispatch_recovery_request(control, request);
         }
         request @ (ForgeControlRequest::ApprovalCleanupPermitMint { .. }
@@ -6600,21 +6243,6 @@ fn dispatch_file_effect_request(
     request: ForgeControlRequest,
 ) -> Option<ForgeControlRequest> {
     match request {
-        ForgeControlRequest::FileRead { request, response } => {
-            dispatch_file_read(control, request, &response);
-        }
-        ForgeControlRequest::FileList { request, response } => {
-            dispatch_file_list(control, request, &response);
-        }
-        ForgeControlRequest::TextSearch { request, response } => {
-            dispatch_text_search(control, request, &response);
-        }
-        ForgeControlRequest::FileMutationReadback { request, response } => {
-            send_response(&response, control.file_mutation_readback(&request));
-        }
-        ForgeControlRequest::SourceTreeReadback { request, response } => {
-            send_response(&response, control.source_tree_readback(&request));
-        }
         ForgeControlRequest::GoalMutation { request, response } => {
             let result = runtime_timestamp_millis()
                 .and_then(|admitted_at| control.goal_mutation(&request, admitted_at));
@@ -6625,29 +6253,6 @@ fn dispatch_file_effect_request(
         }
         ForgeControlRequest::DagPlanReadback { request, response } => {
             send_response(&response, control.dag_plan_readback(&request));
-        }
-        ForgeControlRequest::FileReadSlice { request, response } => {
-            dispatch_file_read_slice(control, request, &response);
-        }
-        ForgeControlRequest::FileApplyPatch { request, response } => {
-            dispatch_file_apply_patch(control, request, &response);
-        }
-        ForgeControlRequest::SourceTreeApply { request, response } => {
-            dispatch_source_tree_apply(control, request, &response);
-        }
-        ForgeControlRequest::FileImportBinary {
-            mut request,
-            response,
-            _permit,
-        } => {
-            let result = runtime_timestamp_millis().and_then(|observed_at| {
-                request.activity.observed_at = observed_at;
-                control.file_import_binary(&request)
-            });
-            let _ignored = response.send(result);
-        }
-        ForgeControlRequest::FileMutate { request, response } => {
-            dispatch_file_mutation(control, request, &response);
         }
         other => return Some(other),
     }
@@ -7428,9 +7033,6 @@ fn dispatch_recovery_request(control: &ForgeControl, request: ForgeControlReques
             let _ignored =
                 response.send(control.recovery_maintenance_get(&scope, request_id, request_digest));
         }
-        ForgeControlRequest::CheckpointRestoreRun { request, response } => {
-            let _ignored = response.send(control.checkpoint_restore(&request));
-        }
         other => dispatch_supervisor_request(control, other),
     }
 }
@@ -7782,90 +7384,6 @@ fn dispatch_delete_orphan_diff_artifact(
     let _ignored = response.send(control.delete_orphan_diff_artifact(request));
 }
 
-fn dispatch_file_read(
-    control: &ForgeControl,
-    mut request: FileReadRequest,
-    response: &Response<FileReadResult>,
-) {
-    let result = runtime_timestamp_millis().and_then(|observed_at| {
-        request.activity.observed_at = observed_at;
-        control.file_read(&request)
-    });
-    let _ignored = response.send(result);
-}
-
-fn dispatch_file_list(
-    control: &ForgeControl,
-    mut request: FileListRequest,
-    response: &Response<FileListResult>,
-) {
-    let result = runtime_timestamp_millis().and_then(|observed_at| {
-        request.activity.observed_at = observed_at;
-        control.file_list(&request)
-    });
-    let _ignored = response.send(result);
-}
-
-fn dispatch_text_search(
-    control: &ForgeControl,
-    mut request: TextSearchRequest,
-    response: &Response<TextSearchResult>,
-) {
-    let result = runtime_timestamp_millis().and_then(|observed_at| {
-        request.activity.observed_at = observed_at;
-        control.text_search(&request)
-    });
-    let _ignored = response.send(result);
-}
-
-fn dispatch_file_read_slice(
-    control: &ForgeControl,
-    mut request: FileReadSliceRequest,
-    response: &Response<FileReadSliceResult>,
-) {
-    let result = runtime_timestamp_millis().and_then(|observed_at| {
-        request.activity.observed_at = observed_at;
-        control.file_read_slice(&request)
-    });
-    let _ignored = response.send(result);
-}
-
-fn dispatch_file_apply_patch(
-    control: &ForgeControl,
-    mut request: FileApplyPatchRequest,
-    response: &Response<FileApplyPatchResult>,
-) {
-    let result = runtime_timestamp_millis().and_then(|observed_at| {
-        request.activity.observed_at = observed_at;
-        control.file_apply_patch(&request)
-    });
-    let _ignored = response.send(result);
-}
-
-fn dispatch_source_tree_apply(
-    control: &ForgeControl,
-    mut request: SourceTreeTransactionRequest,
-    response: &Response<SourceTreeTransactionResult>,
-) {
-    let result = runtime_timestamp_millis().and_then(|observed_at| {
-        request.activity.observed_at = observed_at;
-        control.source_tree_apply(&request)
-    });
-    let _ignored = response.send(result);
-}
-
-fn dispatch_file_mutation(
-    control: &ForgeControl,
-    mut request: FileMutationRequest,
-    response: &Response<FileMutationResult>,
-) {
-    let result = runtime_timestamp_millis().and_then(|observed_at| {
-        request.activity.observed_at = observed_at;
-        control.file_mutate(&request)
-    });
-    let _ignored = response.send(result);
-}
-
 fn rebase_policy_request(
     mut request: WorkspacePolicyReplaceRequest,
 ) -> Result<WorkspacePolicyReplaceRequest, ControlError> {
@@ -8140,7 +7658,6 @@ where
             | ForgeControlRequest::WorkspaceList { .. }
             | ForgeControlRequest::WorkspaceDiscover { .. }
             | ForgeControlRequest::ResolveWorkspace { .. }
-            | ForgeControlRequest::AuthorizeActivity { .. }
             | ForgeControlRequest::WorkspaceDoctor { .. }
             | ForgeControlRequest::WorkspaceIdentityDoctor { .. }
             | ForgeControlRequest::BootstrapActivity { .. }) => reject_queued_workspace(request),
@@ -8247,30 +7764,6 @@ where
             ForgeControlRequest::GeneratedPackageAccess { response, .. } => {
                 let _ignored = response.send(worker_shutting_down());
             }
-            ForgeControlRequest::FileRead { response, .. } => {
-                let _ignored =
-                    response.send(Err(ControlError::new(ControlErrorCode::WorkerShuttingDown)));
-            }
-            ForgeControlRequest::FileList { response, .. } => {
-                let _ignored =
-                    response.send(Err(ControlError::new(ControlErrorCode::WorkerShuttingDown)));
-            }
-            ForgeControlRequest::TextSearch { response, .. } => {
-                let _ignored =
-                    response.send(Err(ControlError::new(ControlErrorCode::WorkerShuttingDown)));
-            }
-            ForgeControlRequest::FileMutationReadback { response, .. } => {
-                send_response(
-                    &response,
-                    Err(ControlError::new(ControlErrorCode::WorkerShuttingDown)),
-                );
-            }
-            ForgeControlRequest::SourceTreeReadback { response, .. } => {
-                send_response(
-                    &response,
-                    Err(ControlError::new(ControlErrorCode::WorkerShuttingDown)),
-                );
-            }
             ForgeControlRequest::GoalMutation { response, .. } => {
                 send_response(
                     &response,
@@ -8288,25 +7781,6 @@ where
                     &response,
                     Err(ControlError::new(ControlErrorCode::WorkerShuttingDown)),
                 );
-            }
-
-            ForgeControlRequest::FileReadSlice { response, .. } => {
-                let _ignored =
-                    response.send(Err(ControlError::new(ControlErrorCode::WorkerShuttingDown)));
-            }
-            ForgeControlRequest::FileApplyPatch { response, .. }
-            | ForgeControlRequest::FileImportBinary { response, .. }
-            | ForgeControlRequest::FileMutate { response, .. } => {
-                let _ignored =
-                    response.send(Err(ControlError::new(ControlErrorCode::WorkerShuttingDown)));
-            }
-            ForgeControlRequest::SourceTreeApply { response, .. } => {
-                let _ignored =
-                    response.send(Err(ControlError::new(ControlErrorCode::WorkerShuttingDown)));
-            }
-            ForgeControlRequest::CheckpointRestoreRun { response, .. } => {
-                let _ignored =
-                    response.send(Err(ControlError::new(ControlErrorCode::WorkerShuttingDown)));
             }
             request @ (ForgeControlRequest::ExecutionMarkRunning { .. }
             | ForgeControlRequest::ExecutionCompleteGenerated { .. }
@@ -8652,9 +8126,6 @@ fn reject_queued_workspace(request: ForgeControlRequest) {
         ForgeControlRequest::ResolveWorkspace { response, .. } => {
             let _ignored = response.send(worker_shutting_down());
         }
-        ForgeControlRequest::AuthorizeActivity { response, .. } => {
-            let _ignored = response.send(worker_shutting_down());
-        }
         ForgeControlRequest::WorkspaceDoctor { response, .. } => {
             let _ignored = response.send(worker_shutting_down());
         }
@@ -8861,9 +8332,6 @@ fn reject_queued_recovery(request: ForgeControlRequest) {
             let _ignored = response.send(worker_shutting_down());
         }
         ForgeControlRequest::HomeTransferSource { response, .. } => {
-            let _ignored = response.send(worker_shutting_down());
-        }
-        ForgeControlRequest::CheckpointRestoreRun { response, .. } => {
             let _ignored = response.send(worker_shutting_down());
         }
         ForgeControlRequest::RecoveryLeaseGet { response, .. }
@@ -9126,41 +8594,6 @@ mod tests {
         drain_queued_requests(&request_receiver);
         let Err(error) = response_receiver.recv()? else {
             return Err("shutdown unexpectedly accepted queued Workspace Doctor".into());
-        };
-        assert_eq!(error.code(), ControlErrorCode::WorkerShuttingDown);
-        Ok(())
-    }
-
-    #[test]
-    fn queued_source_operations_are_rejected_during_shutdown_drain()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let scope = ResolvedWorkspaceScope::from_observation(
-            WorkspaceId::from_uuid(Uuid::from_u128(0x3501)),
-            WorkspaceRevision::INITIAL,
-            WorkspaceLocator::new(
-                LocationId::from_uuid(Uuid::from_u128(0x3502)),
-                LocationRevision::INITIAL,
-                Path::new("workspace"),
-            )?,
-        );
-        let (request_sender, request_receiver) = mpsc::sync_channel(1);
-        let (response_sender, response_receiver) = mpsc::sync_channel(1);
-        request_sender.send(ForgeControlRequest::FileList {
-            request: FileListRequest {
-                scope,
-                activity: crate::FileActivityScope {
-                    activity_id: ActivityId::from_uuid(Uuid::from_u128(0x3503)),
-                    runtime_instance_id: RuntimeInstanceId::from_uuid(Uuid::from_u128(0x3504)),
-                    observed_at: TimestampMillis::new(1)?,
-                },
-                directory: None,
-                options: forge_domain::FileListOptions::default(),
-            },
-            response: response_sender,
-        })?;
-        drain_queued_requests(&request_receiver);
-        let Err(error) = response_receiver.recv()? else {
-            return Err("queued source operation was unexpectedly accepted".into());
         };
         assert_eq!(error.code(), ControlErrorCode::WorkerShuttingDown);
         Ok(())

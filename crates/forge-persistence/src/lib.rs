@@ -184,12 +184,12 @@ pub use workspace_semantic_events::{
 pub use workspace_store::{
     BeginFileMutationDiffResult, EvaluationAssignmentReview, EvaluationAssignmentSubmission,
     EvaluationEvidenceMutationIdentity, EvaluationT1ClosureOutcome, FileMutationDiffRecord,
-    FileMutationReadSnapshot, RecoveryRunOperation, RootRecoveryAuthorityBlocker,
-    RootRecoveryIdentityObservation, RootRecoveryOperation, RootRecoveryProbe, RootRecoveryReceipt,
-    RootRecoveryStoreError, SourceTreeReadSnapshot, WORKSPACE_APPLICATION_ID, WorkspaceDoctorCount,
-    WorkspaceDoctorIntegrity, WorkspaceDoctorOutcome, WorkspaceDoctorReport,
-    WorkspaceDoctorSourceObservation, WorkspaceJournalBinding, WorkspaceStateRemovalBlocker,
-    WorkspaceStore, WorkspaceStoreError, WorkspaceStoreHealth, delegated_authority_digest,
+    RecoveryRunOperation, RootRecoveryAuthorityBlocker, RootRecoveryIdentityObservation,
+    RootRecoveryOperation, RootRecoveryProbe, RootRecoveryReceipt, RootRecoveryStoreError,
+    WORKSPACE_APPLICATION_ID, WorkspaceDoctorCount, WorkspaceDoctorIntegrity,
+    WorkspaceDoctorOutcome, WorkspaceDoctorReport, WorkspaceDoctorSourceObservation,
+    WorkspaceJournalBinding, WorkspaceStateRemovalBlocker, WorkspaceStore, WorkspaceStoreError,
+    WorkspaceStoreHealth, delegated_authority_digest,
 };
 pub use workspace_store::{
     ExpiredActivityRecoveryOperation, ExpiredActivityRecoveryReadback,

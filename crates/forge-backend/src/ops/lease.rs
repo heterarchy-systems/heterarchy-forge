@@ -351,7 +351,7 @@ fn decode_lease_entries(entries: Vec<LeaseScopeEntryDto>) -> Result<WriterLeaseS
             };
             Ok(WriterLeaseScopeEntry::new(
                 kind,
-                super::source::decode_relative_path(&entry.path_base64)?,
+                super::decode_relative_path(&entry.path_base64)?,
             ))
         })
         .collect::<Result<Vec<_>, ForgeError>>()?;
@@ -412,14 +412,14 @@ fn lease_json(
                     WriterLeaseScopeKind::ExactPath => "exact_path",
                     WriterLeaseScopeKind::DirectorySubtree => "directory_subtree",
                 },
-                "path_base64": super::source::encode_relative_path(entry.path()),
+                "path_base64": super::encode_relative_path(entry.path()),
             })
         })
         .collect::<Vec<_>>();
     let next_scope_offset =
         (scope_offset + scopes.len() < total_scope_count).then_some(scope_offset + scopes.len());
     let mut object = Map::new();
-    object.insert("scope".to_owned(), super::source::scope_json(scope)?);
+    object.insert("scope".to_owned(), super::scope_json(scope)?);
     object.insert("writer_lease_id".to_owned(), json!(lease.id().to_string()));
     object.insert(
         "workspace_id".to_owned(),

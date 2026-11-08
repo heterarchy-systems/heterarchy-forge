@@ -67,7 +67,9 @@ pub(super) async fn assert_http_effect_fact_outbox(
     if native.is_empty() {
         return Err("real fixture produced no delegated effect facts".into());
     }
-    let source_path = fixture.workspace_root.join("tree-fixture/new.txt");
+    let source_path = fixture
+        .workspace_root
+        .join(super::lease_readback::MUTATION_PATH);
     let source_before = fs::read(&source_path)?;
     let full = http_page(address, fixture, migration_id, destination_id, 0, 64).await?;
     assert_page_header(&full, migration_id, destination_id, 0);

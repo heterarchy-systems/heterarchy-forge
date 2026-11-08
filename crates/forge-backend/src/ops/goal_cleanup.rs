@@ -155,7 +155,7 @@ pub(super) fn execute_list(
         .goal_list(command.scope.clone(), command.activity_id, command.limit)
         .map_err(|error| super::forge_error_of_client(&error))?;
     Ok(json!({
-        "scope": super::source::scope_json(&command.scope)?,
+        "scope": super::scope_json(&command.scope)?,
         "activity_id": command.activity_id.into_uuid(),
         "goals": goals.iter().map(super::plan::goal_json).collect::<Vec<_>>(),
     }))
@@ -199,7 +199,7 @@ fn delete_json(
     outcome: GoalDeleteOutcome,
 ) -> Result<Value, ForgeError> {
     Ok(json!({
-        "scope": super::source::scope_json(scope)?,
+        "scope": super::scope_json(scope)?,
         "target": target_json(outcome.target()),
         "goal_id": outcome.goal_id().into_uuid(),
         "phase": phase_json(outcome.phase()),
@@ -216,7 +216,7 @@ fn pending_json(
     inventory: &GoalDeletionPendingInventory,
 ) -> Result<Value, ForgeError> {
     Ok(json!({
-        "scope": super::source::scope_json(scope)?,
+        "scope": super::scope_json(scope)?,
         "summaries": inventory.summaries().iter().map(|summary| {
             let request = summary.request();
             json!({

@@ -302,7 +302,7 @@ pub(super) fn execute_diff_list(
     Ok(json!({
         "diffs": diffs,
         "diff_count": diffs.len(),
-        "scope": super::source::scope_json(result.scope())?,
+        "scope": super::scope_json(result.scope())?,
         "activity_id":activity_id.into_uuid(),
     }))
 }

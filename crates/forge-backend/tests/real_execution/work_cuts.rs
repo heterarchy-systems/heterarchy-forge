@@ -107,13 +107,6 @@ async fn run_cut_flow(
         "actor":actor,"writer_lease_id":lease_id,"duration_ms":60_000,"scopes":[{"kind":"exact_path","path_base64":path_token("cut-source.rs")},
             {"kind":"exact_path","path_base64":path_token("cut-new.rs")}]})).await?;
     let lease_revision = lease["revision"].as_i64().ok_or("lease revision missing")?;
-    let mut source =
-        super::source_writes::source_authority_payload(fixture, lease_id, lease_revision)?;
-    source["change_set_id"] = json!(Uuid::now_v7());
-    source["mutation_id"] = json!(Uuid::now_v7());
-    source["operation"] =
-        json!({"kind":"add","path_base64":path_token("cut-source.rs"),"content":"before cut\n"});
-    let old = post_ok(address, "file.apply_patch", source.clone()).await?;
     let request = cut_request(fixture, destination, elected, Uuid::now_v7())?;
     let mut prepare = base_payload(fixture, destination);
     prepare["request"] = request_json(&request);
@@ -144,22 +137,6 @@ async fn run_cut_flow(
         history["record"]["snapshot_digest"],
         prepared["record"]["snapshot_digest"]
     );
-    let source_history=post_ok(address,"file.mutation_readback",json!({"scope":scope_json(fixture),
-        "activity_id":fixture.activity_id.into_uuid(),"change_set_id":old["change_set_id"],"mutation_id":old["mutation_id"]})).await?;
-    assert_eq!(source_history["found"], true);
-    assert_eq!(source_history["change_set_state"], "applied");
-    source["change_set_id"] = json!(Uuid::now_v7());
-    source["mutation_id"] = json!(Uuid::now_v7());
-    source["operation"] =
-        json!({"kind":"add","path_base64":path_token("cut-new.rs"),"content":"must stay absent\n"});
-    let (status, blocked) = post_command(address, "file.apply_patch", source).await?;
-    assert_ne!(status, 200, "new source crossed cut: {blocked}");
-    assert_eq!(blocked["error"]["code"], "SOURCE_CONFLICT");
-    assert!(!fixture.workspace_root.join("cut-new.rs").exists());
-    assert_eq!(
-        fs::read_to_string(fixture.workspace_root.join("cut-source.rs"))?,
-        "before cut\n"
-    );
     read["expected_revision"] = json!(1);
     let pending = post_ok(address, "work_cut.drain", read.clone()).await?;
     assert_eq!(pending["effects_drained"], false);
@@ -178,6 +155,5 @@ async fn run_cut_flow(
         replay["record"]["snapshot_digest"],
         prepared["record"]["snapshot_digest"]
     );
-    assert_eq!(old["status"], "applied");
     Ok(())
 }

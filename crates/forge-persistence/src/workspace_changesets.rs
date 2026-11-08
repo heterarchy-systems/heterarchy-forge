@@ -9,9 +9,13 @@ use forge_domain::{
     FileMutationFailureCode, FileMutationId, FileMutationIdentity, FileMutationKind,
     FileMutationPlan, FileMutationRecord, FileMutationRevision, FilePathState, FilePrecondition,
     MAX_TREE_CHANGESET_MUTATIONS, RegisteredChangeSet, RegisteredFileMutation, RuntimeInstanceId,
-    SourceTreeRequestDigest, TimestampMillis, TreeChangeSetAdmission, TreeChangeSetAdmissionStatus,
-    TreeChangeSetIntent, TreeMutationId, TreeMutationIntent, TreeMutationPlan, WorkspaceId,
-    WorkspaceRelativePath, WorkspaceRevision,
+    SourceTreeRequestDigest, TimestampMillis, TreeMutationId, WorkspaceId, WorkspaceRelativePath,
+    WorkspaceRevision,
+};
+#[cfg(test)]
+use forge_domain::{
+    TreeChangeSetAdmission, TreeChangeSetAdmissionStatus, TreeChangeSetIntent, TreeMutationIntent,
+    TreeMutationPlan,
 };
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 use thiserror::Error;
@@ -77,6 +81,7 @@ pub(crate) fn source_tree_request_schema_objects() -> [(&'static str, &'static s
     crate::workspace_source_tree_requests::schema_objects()
 }
 
+#[cfg(test)]
 pub(crate) fn insert_source_tree_request_digest(
     connection: &Connection,
     change_set_id: ChangeSetId,
@@ -86,6 +91,7 @@ pub(crate) fn insert_source_tree_request_digest(
         .map_err(map_source_tree_request_store_error)
 }
 
+#[cfg(test)]
 pub(crate) fn source_tree_request_digest_matches(
     connection: &Connection,
     change_set_id: ChangeSetId,
@@ -94,39 +100,6 @@ pub(crate) fn source_tree_request_digest_matches(
     crate::workspace_source_tree_requests::get(connection, change_set_id)
         .map(|stored| stored == Some(request_digest))
         .map_err(map_source_tree_request_store_error)
-}
-
-pub(crate) fn inspect_tree_change_set(
-    transaction: &Transaction<'_>,
-    intent: &TreeChangeSetIntent,
-) -> Result<Option<TreeChangeSetAdmission>, ChangeSetStoreError> {
-    let _current_activity_lease_revision =
-        validate_change_set_scope(transaction, intent.attribution())?;
-    existing_tree_change_set_admission(transaction, intent)
-}
-
-pub(crate) fn inspect_source_tree_request(
-    transaction: &Transaction<'_>,
-    attribution: ChangeSetAttribution,
-    request_digest: SourceTreeRequestDigest,
-) -> Result<Option<TreeChangeSetAdmission>, ChangeSetStoreError> {
-    let _current_activity_lease_revision = validate_change_set_scope(transaction, attribution)?;
-    let Some(existing) = query_change_set_header(transaction, attribution.id())? else {
-        return Ok(None);
-    };
-    let stored_digest = crate::workspace_source_tree_requests::get(transaction, attribution.id())
-        .map_err(map_source_tree_request_store_error)?;
-    if !change_set_matches_attribution(&existing, attribution)
-        || stored_digest != Some(request_digest)
-    {
-        return Err(ChangeSetStoreError::IdentityConflict);
-    }
-    let status = match existing.state() {
-        ChangeSetState::Starting => TreeChangeSetAdmissionStatus::RecoveryRequired,
-        ChangeSetState::Applied => TreeChangeSetAdmissionStatus::AlreadyApplied,
-        ChangeSetState::Failed => TreeChangeSetAdmissionStatus::TerminalFailed,
-    };
-    Ok(Some(TreeChangeSetAdmission::new(existing, status)))
 }
 
 fn map_source_tree_request_store_error(
@@ -145,6 +118,7 @@ fn map_source_tree_request_store_error(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn begin_tree_change_set(
     transaction: &Transaction<'_>,
     intent: &TreeChangeSetIntent,
@@ -186,6 +160,7 @@ pub(crate) fn begin_tree_change_set(
     ))
 }
 
+#[cfg(test)]
 fn existing_tree_change_set_admission(
     connection: &Connection,
     intent: &TreeChangeSetIntent,
@@ -207,6 +182,7 @@ fn existing_tree_change_set_admission(
     Ok(Some(TreeChangeSetAdmission::new(existing, status)))
 }
 
+#[cfg(test)]
 fn insert_change_set_header(
     transaction: &Transaction<'_>,
     attribution: ChangeSetAttribution,
@@ -237,6 +213,7 @@ fn insert_change_set_header(
     Ok(())
 }
 
+#[cfg(test)]
 fn insert_tree_mutation(
     transaction: &Transaction<'_>,
     change_set_id: ChangeSetId,
@@ -264,6 +241,7 @@ fn insert_tree_mutation(
     Ok(())
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EncodedTreeMutation {
     kind: i64,
@@ -273,6 +251,7 @@ struct EncodedTreeMutation {
     intended_hash: Option<Vec<u8>>,
 }
 
+#[cfg(test)]
 impl EncodedTreeMutation {
     fn new(
         kind: i64,
@@ -291,6 +270,7 @@ impl EncodedTreeMutation {
     }
 }
 
+#[cfg(test)]
 fn encode_tree_mutation(plan: &TreeMutationPlan) -> EncodedTreeMutation {
     let path = |value: &WorkspaceRelativePath| value.as_path().as_os_str().as_bytes().to_vec();
     let hash = |value: FileContentHash| value.as_bytes().to_vec();
@@ -426,6 +406,7 @@ fn decode_change_set_header_inner(
     ))
 }
 
+#[cfg(test)]
 fn change_set_matches_attribution(
     change_set: &RegisteredChangeSet,
     attribution: ChangeSetAttribution,
@@ -437,6 +418,7 @@ fn change_set_matches_attribution(
         && change_set.runtime_instance_id() == attribution.runtime_instance_id()
 }
 
+#[cfg(test)]
 fn tree_mutations_match_intent(
     connection: &Connection,
     intent: &TreeChangeSetIntent,
@@ -470,6 +452,7 @@ fn tree_mutations_match_intent(
     Ok(rows.next()?.is_none())
 }
 
+#[cfg(test)]
 pub(crate) fn mark_tree_mutation_applied(
     transaction: &Transaction<'_>,
     change_set_id: ChangeSetId,
@@ -516,6 +499,7 @@ pub(crate) fn mark_tree_mutation_applied(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn complete_tree_change_set(
     transaction: &Transaction<'_>,
     change_set_id: ChangeSetId,
@@ -561,106 +545,6 @@ pub(crate) fn complete_tree_change_set(
         return Err(ChangeSetStoreError::RevisionConflict);
     }
     query_change_set_header(transaction, change_set_id)?.ok_or(ChangeSetStoreError::RecordMissing)
-}
-
-pub(crate) fn fail_tree_change_set_without_effect(
-    transaction: &Transaction<'_>,
-    change_set_id: ChangeSetId,
-    failure_code: FileMutationFailureCode,
-    observed_at: TimestampMillis,
-) -> Result<RegisteredChangeSet, ChangeSetStoreError> {
-    let current = query_change_set_header(transaction, change_set_id)?
-        .ok_or(ChangeSetStoreError::RecordMissing)?;
-    if current.state() != ChangeSetState::Starting {
-        return Err(ChangeSetStoreError::Terminal);
-    }
-    if observed_at.get() < current.created_at().get() {
-        return Err(ChangeSetStoreError::TimestampOrder);
-    }
-    let id = change_set_id.into_uuid().into_bytes();
-    let applied: i64 = transaction.query_row(
-        "SELECT COALESCE(SUM(applied), 0) FROM tree_mutations WHERE changeset_id = ?1",
-        params![id.as_slice()],
-        |row| row.get(0),
-    )?;
-    if applied != 0 {
-        return Err(ChangeSetStoreError::RevisionConflict);
-    }
-    let next_revision = current
-        .revision()
-        .checked_next()
-        .map_err(|_| ChangeSetStoreError::RevisionOverflow)?;
-    let changed = transaction.execute(
-        "UPDATE change_sets
-         SET state = ?1, failure_code = ?2, updated_at_ms = ?3, revision = ?4
-         WHERE changeset_id = ?5 AND state = ?6 AND revision = ?7",
-        params![
-            encode_change_set_state(ChangeSetState::Failed),
-            encode_failure_code(failure_code),
-            observed_at.get(),
-            next_revision.get(),
-            id.as_slice(),
-            encode_change_set_state(ChangeSetState::Starting),
-            current.revision().get(),
-        ],
-    )?;
-    if changed != 1 {
-        return Err(ChangeSetStoreError::RevisionConflict);
-    }
-    query_change_set_header(transaction, change_set_id)?.ok_or(ChangeSetStoreError::RecordMissing)
-}
-
-pub(crate) fn tree_change_set_applied_mutations(
-    connection: &Connection,
-    change_set_id: ChangeSetId,
-) -> Result<Vec<forge_domain::TreeMutationId>, ChangeSetStoreError> {
-    let id = change_set_id.into_uuid().into_bytes();
-    let mut statement = connection.prepare(
-        "SELECT mutation_id FROM tree_mutations
-         WHERE changeset_id = ?1 AND applied = 1 ORDER BY ordinal ASC",
-    )?;
-    statement
-        .query_map(params![id.as_slice()], |row| row.get::<_, Vec<u8>>(0))?
-        .map(|row| {
-            let raw = row?;
-            decode_uuid("tree_mutation.id", &raw).map(forge_domain::TreeMutationId::from_uuid)
-        })
-        .collect()
-}
-
-pub(crate) struct SourceTreeReadData {
-    pub(crate) change_set: RegisteredChangeSet,
-    pub(crate) request_digest: SourceTreeRequestDigest,
-    pub(crate) applied_mutations: Vec<TreeMutationId>,
-    pub(crate) mutation_count: usize,
-}
-
-pub(crate) fn source_tree_read_data(
-    connection: &Connection,
-    change_set_id: ChangeSetId,
-) -> Result<Option<SourceTreeReadData>, ChangeSetStoreError> {
-    let Some(request_digest) =
-        crate::workspace_source_tree_requests::get(connection, change_set_id)
-            .map_err(map_source_tree_request_store_error)?
-    else {
-        return Ok(None);
-    };
-    let change_set = query_change_set_header(connection, change_set_id)?.ok_or(
-        ChangeSetStoreError::CorruptRecord("source_tree_requests.change_set"),
-    )?;
-    let TreeMutationReadState {
-        applied_mutations,
-        mutation_count,
-    } = tree_mutation_read_state(connection, change_set_id)?;
-    if mutation_count == 0 {
-        return Err(ChangeSetStoreError::CorruptRecord("tree_mutations.rows"));
-    }
-    Ok(Some(SourceTreeReadData {
-        change_set,
-        request_digest,
-        applied_mutations,
-        mutation_count,
-    }))
 }
 
 /// Canonical tree header and bounded mutation state, including legacy intents
@@ -1951,16 +1835,12 @@ mod tests {
         let transaction = connection.transaction()?;
         mark_tree_mutation_applied(&transaction, attribution.id(), mutation_ids[0])?;
         transaction.commit()?;
-        let read = source_tree_read_data(&connection, attribution.id())?
+        let read = tree_change_set_read_data(&connection, attribution.id())?
             .ok_or("request journal missing")?;
         assert_eq!(read.change_set.id(), attribution.id());
-        assert_eq!(read.request_digest, request_digest);
+        assert_eq!(read.request_digest, Some(request_digest));
         assert_eq!(read.applied_mutations, vec![mutation_ids[0]]);
         assert_eq!(read.mutation_count, mutation_ids.len());
-        assert_eq!(
-            tree_change_set_applied_mutations(&connection, attribution.id())?,
-            vec![mutation_ids[0]]
-        );
         let transaction = connection.transaction()?;
         assert_eq!(
             begin_tree_change_set(&transaction, &intent)?.status(),
@@ -1987,57 +1867,6 @@ mod tests {
             begin_tree_change_set(&transaction, &intent)?.status(),
             TreeChangeSetAdmissionStatus::AlreadyApplied
         );
-        drop(transaction);
-        Ok(())
-    }
-
-    #[test]
-    fn tree_changeset_can_fail_terminally_only_before_any_applied_effect()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let (mut connection, attribution) = tree_changeset_test_connection()?;
-        let mutation_ids = tree_changeset_test_mutation_ids();
-        let intent = TreeChangeSetIntent::from_plan(
-            attribution,
-            mutation_ids.clone(),
-            &tree_changeset_test_plan(1)?,
-            TimestampMillis::new(20)?,
-        )?;
-        let transaction = connection.transaction()?;
-        let _started = begin_tree_change_set(&transaction, &intent)?;
-        transaction.commit()?;
-        let transaction = connection.transaction()?;
-        let failed = fail_tree_change_set_without_effect(
-            &transaction,
-            attribution.id(),
-            FileMutationFailureCode::PathConflict,
-            TimestampMillis::new(21)?,
-        )?;
-        assert_eq!(failed.state(), ChangeSetState::Failed);
-        transaction.commit()?;
-
-        let (mut connection, attribution) = tree_changeset_test_connection()?;
-        let intent = TreeChangeSetIntent::from_plan(
-            attribution,
-            mutation_ids.clone(),
-            &tree_changeset_test_plan(1)?,
-            TimestampMillis::new(20)?,
-        )?;
-        let transaction = connection.transaction()?;
-        let _started = begin_tree_change_set(&transaction, &intent)?;
-        transaction.commit()?;
-        let transaction = connection.transaction()?;
-        mark_tree_mutation_applied(&transaction, attribution.id(), mutation_ids[0])?;
-        transaction.commit()?;
-        let transaction = connection.transaction()?;
-        assert!(matches!(
-            fail_tree_change_set_without_effect(
-                &transaction,
-                attribution.id(),
-                FileMutationFailureCode::IoFailure,
-                TimestampMillis::new(21)?,
-            ),
-            Err(ChangeSetStoreError::RevisionConflict)
-        ));
         drop(transaction);
         Ok(())
     }

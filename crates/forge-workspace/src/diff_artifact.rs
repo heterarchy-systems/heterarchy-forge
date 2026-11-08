@@ -30,9 +30,6 @@ use crate::confinement::{
 };
 use crate::{CapturedDiffSource, ConfinedFilesystemError};
 
-mod patch;
-pub use patch::render_patch_diff_evidence;
-
 /// Legacy whole-source renderer contract; patch windows use domain V2 versions.
 pub const DIFF_RENDERER_VERSION: u32 = 1;
 /// Legacy whole-source redaction contract; V2 preserves patch-window line counts.

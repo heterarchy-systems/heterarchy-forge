@@ -133,7 +133,7 @@ pub(super) fn execute_inventory(
         .execution_evidence_inventory(command.scope.clone(), command.selection, command.limit)
         .map_err(|error| super::forge_error_of_client(&error))?;
     Ok(
-        json!({"scope":super::source::scope_json(&command.scope)?,"selection":selection_json(inventory.selection()),
+        json!({"scope":super::scope_json(&command.scope)?,"selection":selection_json(inventory.selection()),
         "entries":inventory.entries().iter().map(record_json).collect::<Vec<_>>(),
         "entry_count":inventory.entries().len(),"has_more":inventory.has_more()}),
     )
@@ -154,7 +154,7 @@ pub(super) fn execute_observe(
         )
         .map_err(|error| super::forge_error_of_client(&error))?;
     Ok(
-        json!({"scope":super::source::scope_json(&command.scope)?,"selection":selection_json(read.selection()),
+        json!({"scope":super::scope_json(&command.scope)?,"selection":selection_json(read.selection()),
         "record":record_json(read.record()),"output":{"execution_id":command.execution_id.into_uuid(),
             "next_sequence":read.output().next_cursor().after_sequence(), "truncated":read.output().truncated(),
             "event_count":read.output().events().len(),

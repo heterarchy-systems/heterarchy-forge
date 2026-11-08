@@ -612,10 +612,10 @@ mod tests {
         AgentSessionId, AgentSessionOpenRequestId, ChangeSetId, CheckpointId,
         DagAcceptanceCriterion, DagNodeDefinition, DagNodeId, DagNodeObjective, DagNodeOrdinal,
         DagNodeTitle, DagRevision, DagRevisionId, DagRevisionNumber, DiffId, EstablishWorkspace,
-        FileMutationId, FileMutationKind, FileMutationPlan, FilePrecondition, GoalContract, GoalId,
-        GoalObjective, GoalStatement, LocationId, LocationRevision, OpenAgentSession,
-        RegisteredCheckpoint, RegisteredDagNode, RegisteredGoal, RuntimeInstanceId,
-        TimestampMillis, WorkspaceId, WorkspaceRelativePath, WorkspaceRevision, WorkspaceRoot,
+        FileMutationId, GoalContract, GoalId, GoalObjective, GoalStatement, LocationId,
+        LocationRevision, OpenAgentSession, RegisteredCheckpoint, RegisteredDagNode,
+        RegisteredGoal, RuntimeInstanceId, TimestampMillis, WorkspaceId, WorkspaceRelativePath,
+        WorkspaceRevision, WorkspaceRoot,
     };
     use forge_persistence::{DAG_DOCTOR_MAX_CURRENT_DAGS, GlobalRegistry};
     use forge_workspace::{
@@ -627,8 +627,8 @@ mod tests {
 
     use super::*;
     use crate::filesystem::{
-        FileActivityScope, FileMutationRequest, FileMutationStatus,
-        source_write_test_support::seed_source_write_authority,
+        FileActivityScope,
+        source_write_test_support::{seed_applied_file_diff, seed_source_write_authority},
     };
 
     static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
@@ -753,28 +753,21 @@ mod tests {
             ),
         )?;
         let change_set_id = ChangeSetId::from_uuid(Uuid::from_u128(0xF400 + seed));
-        let request = FileMutationRequest {
-            scope: fixture.scope.clone(),
-            activity: FileActivityScope {
+        let _record = seed_applied_file_diff(
+            &fixture.control,
+            &fixture.scope,
+            FileActivityScope {
                 activity_id,
                 runtime_instance_id: runtime_id,
                 observed_at: mutation_at,
             },
-            goal: None,
+            None,
             write_authority,
             change_set_id,
-            mutation_id: FileMutationId::from_uuid(Uuid::from_u128(0xF500 + seed)),
-            plan: FileMutationPlan::new(
-                WorkspaceRelativePath::new(name.into())?,
-                FileMutationKind::Create,
-                FilePrecondition::Absent,
-            ),
-            content: Some(b"checkpoint doctor\n".to_vec()),
-        };
-        assert_eq!(
-            fixture.control.file_mutate(&request)?.status(),
-            FileMutationStatus::Applied
-        );
+            FileMutationId::from_uuid(Uuid::from_u128(0xF500 + seed)),
+            WorkspaceRelativePath::new(name.into())?,
+            b"checkpoint doctor\n",
+        )?;
         let existing = WorkspaceStateLayout::inspect_existing(&fixture.workspace_root)?
             .ok_or("checkpoint Doctor layout missing")?;
         let store = WorkspaceStore::open_existing(&existing)?;
@@ -1029,25 +1022,18 @@ mod tests {
             ),
         )?;
         let change_set_id = ChangeSetId::from_uuid(Uuid::from_u128(0xF102));
-        let mutation = FileMutationRequest {
-            scope: fixture.scope.clone(),
-            activity: activity_scope,
-            goal: None,
+        assert!(activity.activity().is_some());
+        let _record = seed_applied_file_diff(
+            &fixture.control,
+            &fixture.scope,
+            activity_scope,
+            None,
             write_authority,
             change_set_id,
-            mutation_id: FileMutationId::from_uuid(Uuid::from_u128(0xF103)),
-            plan: FileMutationPlan::new(
-                WorkspaceRelativePath::new("doctor-diff.txt".into())?,
-                FileMutationKind::Create,
-                FilePrecondition::Absent,
-            ),
-            content: Some(b"doctor diff\n".to_vec()),
-        };
-        assert!(activity.activity().is_some());
-        assert_eq!(
-            fixture.control.file_mutate(&mutation)?.status(),
-            FileMutationStatus::Applied
-        );
+            FileMutationId::from_uuid(Uuid::from_u128(0xF103)),
+            WorkspaceRelativePath::new("doctor-diff.txt".into())?,
+            b"doctor diff\n",
+        )?;
         let diff_id = DiffId::for_change_set(change_set_id);
         let artifact = fixture
             .workspace_root

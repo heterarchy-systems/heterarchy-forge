@@ -57,6 +57,7 @@ pub(crate) fn validate_schema(connection: &Connection) -> Result<(), SourceTreeR
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn insert(
     connection: &Connection,
     change_set_id: ChangeSetId,

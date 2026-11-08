@@ -2099,8 +2099,7 @@ mod tests {
     use forge_domain::{
         ActivityId, ExecutionArgument, ExecutionAttribution, ExecutionId, ExecutionLimits,
         ExecutionOutputCursor, ExecutionOutputLimit, ExecutionPermissions, ExecutionProgram,
-        ExecutionScript, ExecutionTimeoutMillis, FileMutationId, FileMutationKind,
-        FileMutationPlan, FilePrecondition, WorkspaceId,
+        ExecutionScript, ExecutionTimeoutMillis, WorkspaceId,
     };
     use forge_workspace::{ConfinedWorkspace, WorkspaceStateLayout};
     use rustix_process::process::test_kill_process;
@@ -3028,39 +3027,19 @@ mod tests {
         fs::create_dir(&mutation_root)?;
         let mutation_path =
             forge_domain::WorkspaceRelativePath::new(PathBuf::from("prepared-mutation/probe.txt"))?;
-        let created = confined
-            .prepare_mutation(&FileMutationPlan::new(
-                mutation_path.clone(),
-                FileMutationKind::Create,
-                FilePrecondition::Absent,
-            ))?
-            .apply(
-                FileMutationId::from_uuid(Uuid::from_u128(9101)),
-                Some(b"one"),
-            )?;
-        let created_hash = created.post_state().hash().ok_or("created hash missing")?;
-        let replaced = confined
-            .prepare_mutation(&FileMutationPlan::new(
-                mutation_path.clone(),
-                FileMutationKind::Replace,
-                FilePrecondition::Matches(created_hash),
-            ))?
-            .apply(
-                FileMutationId::from_uuid(Uuid::from_u128(9102)),
-                Some(b"two"),
-            )?;
-        let replaced_hash = replaced
-            .post_state()
-            .hash()
-            .ok_or("replaced hash missing")?;
-        let deleted = confined
-            .prepare_mutation(&FileMutationPlan::new(
-                mutation_path,
-                FileMutationKind::Delete,
-                FilePrecondition::Matches(replaced_hash),
-            ))?
-            .apply(FileMutationId::from_uuid(Uuid::from_u128(9103)), None)?;
-        assert_eq!(deleted.post_state(), forge_domain::FilePathState::Absent);
+        fs::write(mutation_root.join("probe.txt"), b"one")?;
+        let created_read = confined.read(&mutation_path)?;
+        assert_eq!(created_read.content(), b"one");
+        let created_hash = created_read.hash();
+        fs::write(mutation_root.join("probe.txt"), b"two")?;
+        let replaced_read = confined.read(&mutation_path)?;
+        assert_eq!(replaced_read.content(), b"two");
+        assert_ne!(replaced_read.hash(), created_hash);
+        fs::remove_file(mutation_root.join("probe.txt"))?;
+        assert_eq!(
+            confined.observe(&mutation_path)?,
+            forge_domain::FilePathState::Absent
+        );
         assert!(!root.join("prepared-mutation/probe.txt").exists());
 
         fs::remove_dir_all(root)?;

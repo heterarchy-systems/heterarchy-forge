@@ -261,84 +261,6 @@ async fn acquire_historical_readback_lease(
     Ok((lease_id, revision, lease_until_ms))
 }
 
-async fn assert_historical_readback(
-    address: SocketAddr,
-    fixture: &Fixture,
-    change_set_id: forge_domain::ChangeSetId,
-    mutation_id: FileMutationId,
-) -> Result<Uuid, Box<dyn std::error::Error>> {
-    let scope = scope_json(fixture);
-
-    let readback = post_ok(
-        address,
-        "file.mutation_readback",
-        json!({
-            "scope": scope.clone(),
-            "activity_id": fixture.activity_id.into_uuid(),
-            "change_set_id": change_set_id.into_uuid(),
-            "mutation_id": mutation_id.into_uuid(),
-        }),
-    )
-    .await?;
-    assert_eq!(readback["found"], true);
-    assert_eq!(readback["scope"], scope);
-    assert_eq!(
-        readback["activity_id"],
-        json!(fixture.activity_id.into_uuid())
-    );
-    assert_eq!(readback["change_set_id"], json!(change_set_id.into_uuid()));
-    assert_eq!(readback["mutation_id"], json!(mutation_id.into_uuid()));
-    assert_eq!(readback["retry_authorized"], false);
-    assert_eq!(readback["request_equivalence_proven"], false);
-    assert_eq!(readback["change_set_state"], "applied");
-    assert_eq!(readback["kind"], "create");
-    assert_eq!(readback["path_base64"], path_token(MUTATION_PATH));
-    assert_eq!(readback["post_state"]["exists"], true);
-    assert_eq!(
-        readback["diff"]["origin_mutation_id"],
-        json!(mutation_id.into_uuid())
-    );
-    let diff_id = readback["diff"]["id"]
-        .as_str()
-        .ok_or("mutation readback diff id missing")?
-        .parse::<Uuid>()?;
-
-    let (status, wrong_mutation) = post_command(
-        address,
-        "file.mutation_readback",
-        json!({
-            "scope": scope.clone(),
-            "activity_id": fixture.activity_id.into_uuid(),
-            "change_set_id": change_set_id.into_uuid(),
-            "mutation_id": Uuid::now_v7(),
-        }),
-    )
-    .await?;
-    assert_ne!(
-        status, 200,
-        "wrong mutation tuple was accepted: {wrong_mutation}"
-    );
-    assert_eq!(wrong_mutation["ok"], false);
-
-    let (status, wrong_activity) = post_command(
-        address,
-        "file.mutation_readback",
-        json!({
-            "scope": scope,
-            "activity_id": Uuid::now_v7(),
-            "change_set_id": change_set_id.into_uuid(),
-            "mutation_id": mutation_id.into_uuid(),
-        }),
-    )
-    .await?;
-    assert_ne!(
-        status, 200,
-        "wrong Activity tuple was accepted: {wrong_activity}"
-    );
-    assert_eq!(wrong_activity["ok"], false);
-    Ok(diff_id)
-}
-
 pub(super) async fn assert_http_lease_and_mutation_readback(
     address: SocketAddr,
     fixture: &Fixture,
@@ -351,13 +273,6 @@ pub(super) async fn assert_http_lease_and_mutation_readback(
         active_lease_id,
         acquired_revision,
         ACTIVE_WRITE_LEASE_DURATION_MS,
-    )
-    .await?;
-    super::source_writes::assert_http_source_writes(
-        address,
-        fixture,
-        active_lease_id,
-        active_lease_revision,
     )
     .await?;
     assert!(timestamp_now()?.get() < active_lease_until_ms);
@@ -379,17 +294,36 @@ pub(super) async fn assert_http_lease_and_mutation_readback(
 
     let (short_lease_id, short_lease_revision, short_lease_until_ms) =
         acquire_historical_readback_lease(address, fixture).await?;
-    let (change_set_id, mutation_id) =
-        super::source_writes::assert_http_single_create_for_historical_readback(
-            address,
-            fixture,
-            short_lease_id,
-            short_lease_revision,
-        )
-        .await?;
+    let change_set_id = forge_domain::ChangeSetId::from_uuid(Uuid::now_v7());
+    let mutation_id = FileMutationId::from_uuid(Uuid::now_v7());
+    seed_historical_diff(
+        fixture,
+        forge_domain::SourceWriteAuthority::new(
+            fixture.agent_id,
+            fixture.agent_revision,
+            forge_domain::AuthenticatedPrincipal::TrustedStdio,
+            fixture.attribution,
+            forge_domain::WriterLeaseId::from_uuid(short_lease_id),
+            forge_domain::WriterLeaseRevision::new(short_lease_revision)?,
+            fixture.session_id,
+        ),
+        change_set_id,
+        mutation_id,
+    )?;
+    let diffs = fixture.client.diff_list(forge_control::DiffListRequest {
+        scope: fixture.scope.clone(),
+        activity_id: fixture.activity_id,
+        limit: forge_domain::DiffListLimit::new(16)?,
+    })?;
+    let diff_id = diffs
+        .diffs()
+        .iter()
+        .find(|diff| diff.change_set_id() == change_set_id)
+        .ok_or("mutation readback diff id missing")?
+        .id()
+        .into_uuid();
     wait_until_expired(short_lease_until_ms).await?;
     assert!(timestamp_now()?.get() >= short_lease_until_ms);
-    let diff_id = assert_historical_readback(address, fixture, change_set_id, mutation_id).await?;
     let released = post_ok(
         address,
         "writer_lease.release",
@@ -405,6 +339,146 @@ pub(super) async fn assert_http_lease_and_mutation_readback(
     assert_eq!(released["state"], "released");
     assert_eq!(released["status"], "released");
     assert_eq!(released["revision"], short_lease_revision + 1);
-    super::tree_writes::assert_http_tree_writes(address, fixture).await?;
     Ok(diff_id)
+}
+
+fn stage_historical_diff(
+    fixture: &Fixture,
+    diff_artifacts: &forge_workspace::DiffArtifactStore,
+    relative_path: &forge_domain::WorkspaceRelativePath,
+    change_set_id: forge_domain::ChangeSetId,
+    mutation_id: FileMutationId,
+    content: &[u8],
+    observed_at: forge_domain::TimestampMillis,
+) -> Result<
+    (
+        forge_domain::DiffId,
+        forge_workspace::StagedDiffArtifact,
+        forge_domain::BeginDiffEvidence,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let rendered = forge_workspace::render_diff_evidence(
+        relative_path,
+        forge_domain::DiffChangeKind::Created,
+        &forge_workspace::CapturedDiffSource::Absent,
+        &forge_workspace::CapturedDiffSource::Text(String::from_utf8(content.to_vec())?),
+    )?;
+    let forge_workspace::RenderedDiffEvidence::Text(rendered_text) = rendered else {
+        return Err("expected text diff".into());
+    };
+    let diff_id = forge_domain::DiffId::for_change_set(change_set_id);
+    let staged = diff_artifacts.stage(diff_id, &rendered_text)?;
+    let file_entry = forge_domain::DiffEntrySummary::new(
+        forge_domain::DiffEntrySubject::File,
+        relative_path.clone(),
+        None,
+        forge_domain::DiffChangeKind::Created,
+        rendered_text.additions(),
+        rendered_text.deletions(),
+    )?;
+    let begin_diff = forge_domain::BeginDiffEvidence::new(
+        forge_domain::DiffAttribution::for_file_mutation(
+            diff_id,
+            fixture.scope.workspace_id(),
+            fixture.activity_id,
+            change_set_id,
+            mutation_id,
+        ),
+        vec![file_entry],
+        forge_domain::DiffPayloadProjection::IntentText {
+            pending_relative_path: staged.pending_relative_path()?,
+            final_relative_path: staged.final_relative_path()?,
+            compressed_hash: staged.compressed_hash(),
+            uncompressed_hash: staged.uncompressed_hash(),
+            compressed_size: staged.compressed_size(),
+            uncompressed_size: staged.uncompressed_size(),
+        },
+        observed_at,
+        forge_domain::DiffContractVersions::V1,
+    )?;
+    Ok((diff_id, staged, begin_diff))
+}
+
+fn seed_historical_diff(
+    fixture: &Fixture,
+    write_authority: forge_domain::SourceWriteAuthority,
+    change_set_id: forge_domain::ChangeSetId,
+    mutation_id: FileMutationId,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let observed_at = timestamp_now()?;
+    let relative_path = forge_domain::WorkspaceRelativePath::new(MUTATION_PATH.into())?;
+    let content = b"historical source outcome\r\n";
+    let layout = forge_workspace::WorkspaceStateLayout::inspect_existing(&fixture.workspace_root)?
+        .ok_or("workspace state layout missing")?;
+    let mut store = forge_persistence::WorkspaceStore::open_existing(&layout)?;
+    let activity_row = store
+        .get_activity(fixture.activity_id)?
+        .ok_or("activity missing")?;
+    let filesystem = forge_workspace::ConfinedWorkspace::open(&layout)?;
+    let diff_artifacts = filesystem.diff_artifact_store()?;
+    let (diff_id, staged, begin_diff) = stage_historical_diff(
+        fixture,
+        &diff_artifacts,
+        &relative_path,
+        change_set_id,
+        mutation_id,
+        content,
+        observed_at,
+    )?;
+    std::fs::write(fixture.workspace_root.join(MUTATION_PATH), content)?;
+    let post_read = filesystem.read(&relative_path)?;
+    let intended_hash = post_read.hash();
+    let identity = forge_domain::FileMutationIdentity::new(change_set_id, mutation_id);
+    let begin_cmd = forge_domain::BeginFileMutation::new(
+        identity,
+        forge_domain::FileMutationScope::new(
+            fixture.scope.workspace_id(),
+            fixture.scope.workspace_revision(),
+            activity_row.id(),
+            fixture.runtime_instance_id,
+            activity_row.lease_revision(),
+        ),
+        forge_domain::FileMutationPlan::new(
+            relative_path,
+            forge_domain::FileMutationKind::Create,
+            forge_domain::FilePrecondition::Absent,
+        ),
+        Some(intended_hash),
+        forge_domain::FilePathState::Absent,
+        observed_at,
+    )?;
+    let begin =
+        store.begin_file_mutation_for_goal(&begin_cmd, &begin_diff, None, write_authority)?;
+    let published = diff_artifacts.publish(staged)?;
+    let expected = published.expectation();
+    let complete_cmd = forge_domain::CompleteFileMutation::new(
+        identity,
+        begin.record().change_set().revision(),
+        begin.record().mutation().revision(),
+        post_read.state(),
+        observed_at,
+    );
+    let diff_revision = begin.diff().map_or(
+        forge_domain::DiffRevision::INITIAL,
+        forge_domain::RegisteredDiffEvidence::revision,
+    );
+    let complete_diff = forge_domain::CompleteDiffEvidence::new(
+        diff_id,
+        diff_revision,
+        forge_domain::DiffPayloadProjection::Ready {
+            relative_path: published.relative_path()?,
+            compressed_hash: expected.compressed_hash(),
+            uncompressed_hash: expected.uncompressed_hash(),
+            compressed_size: expected.compressed_size(),
+            uncompressed_size: expected.uncompressed_size(),
+        },
+        observed_at,
+    )?;
+    let producer = forge_domain::ChangeSetProducer::new(
+        write_authority.agent_id(),
+        write_authority.session_id(),
+    );
+    let _record = store.complete_file_mutation(&complete_cmd, &complete_diff, producer)?;
+    Ok(())
 }

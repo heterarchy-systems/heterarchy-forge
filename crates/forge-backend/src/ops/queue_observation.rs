@@ -75,7 +75,7 @@ pub(super) fn execute(
                 .workspace_queue_settings(scope.clone())
                 .map_err(|error| super::forge_error_of_client(&error))?;
             let mut response = object(queue_status_json(status))?;
-            response.insert("scope".to_owned(), super::source::scope_json(scope)?);
+            response.insert("scope".to_owned(), super::scope_json(scope)?);
             Ok(Value::Object(response))
         }
         QueueObservationRequest::WorkspaceSettings { scope } => {
@@ -92,7 +92,7 @@ pub(super) fn execute(
                 .workspace_queue_settings(scope.clone())
                 .map_err(|error| super::forge_error_of_client(&error))?;
             Ok(json!({
-                "scope": super::source::scope_json(scope)?,
+                "scope": super::scope_json(scope)?,
                 "saved_preference": saved.as_ref().map(saved_preference_json),
                 "effective_runtime": queue_status_json(effective),
                 "observation": "separate_non_atomic_reads",

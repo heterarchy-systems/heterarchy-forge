@@ -450,16 +450,16 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use forge_domain::{
-        ActivityId, BootstrapActivity, ChangeSetId, FileMutationId, FileMutationKind,
-        FileMutationPlan, FilePrecondition, LocationId, LocationRevision, RuntimeInstanceId,
-        WorkspaceId, WorkspaceRelativePath, WorkspaceRevision, WorkspaceRoot,
+        ActivityId, BootstrapActivity, ChangeSetId, ChangeSetState, FileMutationId,
+        FileMutationRecord, LocationId, LocationRevision, RuntimeInstanceId, WorkspaceId,
+        WorkspaceRelativePath, WorkspaceRevision, WorkspaceRoot,
     };
     use forge_persistence::{GlobalRegistry, WorkspaceStore};
     use forge_workspace::{LocationService, WorkspaceLocator, WorkspaceStateLayout};
     use uuid::Uuid;
 
     use super::*;
-    use crate::{FileActivityScope, FileMutationRequest, FileMutationResult, FileMutationStatus};
+    use crate::FileActivityScope;
 
     static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
 
@@ -553,23 +553,18 @@ mod tests {
     fn apply_retained_diff(
         fixture: &Fixture,
         change_set_id: ChangeSetId,
-    ) -> Result<FileMutationResult, ControlError> {
-        fixture.control.file_mutate(&FileMutationRequest {
-            scope: fixture.scope.clone(),
-            activity: fixture.activity,
-            goal: None,
-            write_authority: fixture.write_authority,
+    ) -> Result<FileMutationRecord, Box<dyn std::error::Error>> {
+        crate::filesystem::source_write_test_support::seed_applied_file_diff(
+            &fixture.control,
+            &fixture.scope,
+            fixture.activity,
+            None,
+            fixture.write_authority,
             change_set_id,
-            mutation_id: FileMutationId::from_uuid(Uuid::from_u128(0xE111)),
-            plan: FileMutationPlan::new(
-                WorkspaceRelativePath::new(PathBuf::from("retained.txt")).map_err(|error| {
-                    ControlError::with_source(ControlErrorCode::InvalidInput, error)
-                })?,
-                FileMutationKind::Create,
-                FilePrecondition::Absent,
-            ),
-            content: Some(b"retention evidence\n".to_vec()),
-        })
+            FileMutationId::from_uuid(Uuid::from_u128(0xE111)),
+            WorkspaceRelativePath::new(PathBuf::from("retained.txt"))?,
+            b"retention evidence\n",
+        )
     }
 
     #[test]
@@ -626,7 +621,7 @@ mod tests {
         let fixture = fixture()?;
         let change_set_id = ChangeSetId::from_uuid(Uuid::from_u128(0xE110));
         let mutation = apply_retained_diff(&fixture, change_set_id)?;
-        assert_eq!(mutation.status(), FileMutationStatus::Applied);
+        assert_eq!(mutation.change_set().state(), ChangeSetState::Applied);
         let plan = fixture
             .control
             .plan_diff_retention(&DiffRetentionPlanRequest {

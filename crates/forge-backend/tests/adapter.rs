@@ -1766,7 +1766,6 @@ async fn assert_mutation_readback(
         serde_json::json!(lease_id)
     );
     assert!(reply["error"]["readback"].get("execution_id").is_none());
-    assert_source_mutation_readback(address, authority, lease_id).await?;
     assert_planning_readback(address, authority).await?;
     assert_goal_deletion_readback(address, authority).await?;
     let shutdown = state.shutdown(Duration::from_millis(100)).await;
@@ -1798,125 +1797,6 @@ async fn assert_activity_close_readback(
         serde_json::json!({"kind":"activity_lifecycle",
         "workspace_id":authority["scope"]["workspace_id"],"activity_id":payload["activity_id"],
         "runtime_instance_id":payload["runtime_instance_id"],"expected_lease_revision":1})
-    );
-    Ok(())
-}
-
-async fn assert_source_mutation_readback(
-    address: std::net::SocketAddr,
-    authority: &serde_json::Value,
-    lease_id: Uuid,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut payload = authority.clone();
-    let object = payload
-        .as_object_mut()
-        .ok_or("authority is not an object")?;
-    object.remove("command_id");
-    object.remove("execution_id");
-    let change_set_id = Uuid::from_u128(0x301);
-    let mutation_id = Uuid::from_u128(0x302);
-    payload["writer_lease_id"] = serde_json::json!(lease_id);
-    payload["expected_writer_lease_revision"] = serde_json::json!(1);
-    payload["change_set_id"] = serde_json::json!(change_set_id);
-    payload["mutation_id"] = serde_json::json!(mutation_id);
-    payload["operation"] = serde_json::json!({
-        "kind": "add", "path_base64": "dGVzdC50eHQ", "content": "source\n",
-    });
-    let body = envelope_body("file.apply_patch", &payload.to_string());
-    let (status, response) = http_request(
-        address,
-        "POST",
-        "/api/v1/commands/file.apply_patch",
-        Some(SECRET),
-        Some(&body),
-    )
-    .await?;
-    assert_eq!(status, 202, "source outcome: {response}");
-    let reply: serde_json::Value = serde_json::from_str(&body_of(&response))?;
-    assert_eq!(reply["error"]["code"], "UNKNOWN_OUTCOME");
-    assert_eq!(reply["error"]["retryable"], false);
-    assert_eq!(
-        reply["error"]["readback"],
-        serde_json::json!({
-            "kind": "file_mutation", "workspace_id": authority["scope"]["workspace_id"],
-            "activity_id": authority["activity"]["activity_id"],
-            "change_set_id": change_set_id, "mutation_id": mutation_id,
-        })
-    );
-    assert_tree_mutation_readback(address, authority, lease_id).await?;
-    payload["operation"]["content"] = serde_json::json!("a".repeat(16 * 1024));
-    let body = envelope_body("file.apply_patch", &payload.to_string());
-    let (status, response) = http_request(
-        address,
-        "POST",
-        "/api/v1/commands/file.apply_patch",
-        Some(SECRET),
-        Some(&body),
-    )
-    .await?;
-    assert_eq!(
-        status, 400,
-        "oversized patch must be rejected before admission: {response}"
-    );
-    let reply: serde_json::Value = serde_json::from_str(&body_of(&response))?;
-    assert_eq!(reply["error"]["code"], "INVALID_INPUT");
-    Ok(())
-}
-
-async fn assert_tree_mutation_readback(
-    address: std::net::SocketAddr,
-    authority: &serde_json::Value,
-    lease_id: Uuid,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut payload = authority.clone();
-    let object = payload
-        .as_object_mut()
-        .ok_or("authority is not an object")?;
-    object.remove("command_id");
-    object.remove("execution_id");
-    let change_set_id = Uuid::from_u128(0x401);
-    payload["writer_lease_id"] = serde_json::json!(lease_id);
-    payload["expected_writer_lease_revision"] = serde_json::json!(1);
-    payload["change_set_id"] = serde_json::json!(change_set_id);
-    payload["mutations"] = serde_json::json!([{
-        "kind":"create_file", "mutation_id":Uuid::from_u128(1),
-        "path_base64":"c3JjL2xpYi5ycw", "content":"one\n",
-    }]);
-    let body = envelope_body("source_tree.apply", &payload.to_string());
-    let (status, response) = http_request(
-        address,
-        "POST",
-        "/api/v1/commands/source_tree.apply",
-        Some(SECRET),
-        Some(&body),
-    )
-    .await?;
-    assert_eq!(status, 202, "tree outcome: {response}");
-    let reply: serde_json::Value = serde_json::from_str(&body_of(&response))?;
-    assert_eq!(reply["error"]["code"], "UNKNOWN_OUTCOME");
-    assert_eq!(reply["error"]["retryable"], false);
-    assert_eq!(
-        reply["error"]["readback"],
-        serde_json::json!({
-            "kind":"tree_change_set", "workspace_id":authority["scope"]["workspace_id"],
-            "activity_id":authority["activity"]["activity_id"], "change_set_id":change_set_id,
-            // Captured from the old native MCP implementation before extraction.
-            "request_digest":"4213614d32ddc2878a250136292ab370e534b27fad0ac1a13aae6d4d40e59d97",
-        })
-    );
-    payload["request_digest"] = serde_json::json!("00".repeat(32));
-    let body = envelope_body("source_tree.apply", &payload.to_string());
-    let (status, response) = http_request(
-        address,
-        "POST",
-        "/api/v1/commands/source_tree.apply",
-        Some(SECRET),
-        Some(&body),
-    )
-    .await?;
-    assert_eq!(
-        status, 400,
-        "caller-supplied digest must be rejected: {response}"
     );
     Ok(())
 }

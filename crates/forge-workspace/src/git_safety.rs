@@ -33,11 +33,6 @@ use crate::{
     ConfinedFilesystemError, ConfinedWorkspace, ExistingWorkspaceStateLayout, WorkspaceStateLayout,
 };
 
-#[path = "worker_worktree.rs"]
-pub(crate) mod worker_worktree;
-#[path = "worker_worktree_linux.rs"]
-pub(crate) mod worker_worktree_linux;
-
 mod home_artifact;
 pub use home_artifact::{
     HOME_ARTIFACT_REF_INVENTORY_MAX, HOME_ARTIFACT_REF_PREFIX, HomeArtifactPathRead,
@@ -1420,7 +1415,6 @@ impl GitCheckpointStore {
             stdin,
             extra_env: &environment,
             output_limit,
-            sandbox_profile: None,
             cancellation: None,
         };
         run_bounded_git_process(
@@ -1604,18 +1598,6 @@ pub(crate) struct GitOutput {
     pub(crate) stderr: Vec<u8>,
 }
 
-/// Closed platform-owned process confinement profile.
-///
-/// The profile is kept typed through process construction so a Linux
-/// bubblewrap invocation cannot accidentally reinterpret a text profile as
-/// newline-separated argv.  Paths in the Linux arm therefore retain their
-/// native Unix bytes all the way to `Command`.
-#[derive(Debug, Clone)]
-pub(crate) enum GitSandboxProfile {
-    Seatbelt(String),
-    Linux(Vec<OsString>),
-}
-
 /// Bounded Git invocation specification shared by product-owned Git adapters.
 /// The caller owns the source/worktree identity fences; this helper owns only
 /// process isolation, bounded pipes, timeout, cancellation, and joining.
@@ -1627,11 +1609,8 @@ pub(crate) struct GitProcessSpec<'a> {
     pub(crate) stdin: Option<&'a [u8]>,
     pub(crate) extra_env: &'a [(&'a str, OsString)],
     pub(crate) output_limit: usize,
-    /// Optional worker confinement profile. `None` preserves the checkpoint
-    /// adapter's existing product-owned bare-store process boundary.
-    pub(crate) sandbox_profile: Option<&'a GitSandboxProfile>,
     /// A caller-owned cancellation flag. Checkpoint callers deliberately pass
-    /// `None`; worker worktree callers pass their bounded operation flag.
+    /// `None`.
     pub(crate) cancellation: Option<&'a AtomicBool>,
 }
 
@@ -1742,19 +1721,7 @@ fn spawn_bounded_git_process(spec: &GitProcessSpec<'_>) -> Result<Child, GitSafe
             maximum: MAX_GIT_STDIN_BYTES,
         });
     }
-    let mut command = match spec.sandbox_profile {
-        Some(GitSandboxProfile::Seatbelt(profile)) => {
-            let mut command = Command::new("/usr/bin/sandbox-exec");
-            command.arg("-p").arg(profile).arg(FORGE_GIT_PROGRAM);
-            command
-        }
-        Some(GitSandboxProfile::Linux(arguments)) => {
-            let mut command = Command::new(worker_worktree_linux::WORKER_BWRAP);
-            command.args(arguments).arg("--").arg(FORGE_GIT_PROGRAM);
-            command
-        }
-        None => Command::new(FORGE_GIT_PROGRAM),
-    };
+    let mut command = Command::new(FORGE_GIT_PROGRAM);
     command
         .current_dir(spec.current_dir)
         .args(spec.arguments)

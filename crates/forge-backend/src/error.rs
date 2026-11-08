@@ -244,12 +244,6 @@ pub enum ReadbackHint {
         plan_request_id: Uuid,
         draft_digest: String,
     },
-    TreeChangeSet {
-        workspace_id: Uuid,
-        activity_id: Uuid,
-        change_set_id: Uuid,
-        request_digest: String,
-    },
     Execution {
         execution_id: Uuid,
     },
@@ -267,12 +261,6 @@ pub enum ReadbackHint {
     },
     WriterLease {
         writer_lease_id: Uuid,
-    },
-    FileMutation {
-        workspace_id: Uuid,
-        activity_id: Uuid,
-        change_set_id: Uuid,
-        mutation_id: Uuid,
     },
     ExpiredActivityRecovery {
         workspace_id: Uuid,
@@ -674,9 +662,9 @@ impl ForgeError {
         let code = match view.code() {
             ControlErrorCode::WorkspaceRemovalBlocked => ErrorCode::WorkspaceRemovalBlocked,
             ControlErrorCode::AuthorizationRequired => ErrorCode::AuthFailed,
-            ControlErrorCode::InvalidInput
-            | ControlErrorCode::RequestCancelled
-            | ControlErrorCode::FileReadRangeOutOfBounds => ErrorCode::InvalidInput,
+            ControlErrorCode::InvalidInput | ControlErrorCode::RequestCancelled => {
+                ErrorCode::InvalidInput
+            }
             ControlErrorCode::FilePathDenied => ErrorCode::WorkspaceConfinementDenied,
             ControlErrorCode::WorkspaceScopeOverlap => ErrorCode::WorkspaceScopeOverlap,
             ControlErrorCode::WorkspaceRootConflict => ErrorCode::WorkspaceRootConflict,
@@ -690,9 +678,7 @@ impl ForgeError {
             | ControlErrorCode::WriterLeaseConflict
             | ControlErrorCode::WriterLeaseRecoveryRequired
             | ControlErrorCode::RecoveryLeaseConflict => ErrorCode::LeaseConflict,
-            ControlErrorCode::FileConflict
-            | ControlErrorCode::FileWholeHashConflict
-            | ControlErrorCode::FileRangeConflict => ErrorCode::SourceConflict,
+            ControlErrorCode::FileConflict => ErrorCode::SourceConflict,
             ControlErrorCode::GoalConflict
             | ControlErrorCode::GoalNotFound
             | ControlErrorCode::GoalCompletionBlocked
@@ -864,20 +850,6 @@ impl std::error::Error for ForgeError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn file_read_range_out_of_bounds_is_invalid_input_with_source_context() {
-        let view =
-            ControlErrorView::from_service(ControlErrorCode::FileReadRangeOutOfBounds, false);
-        let mapped = ForgeError::from_control_view(&view);
-
-        assert_eq!(mapped.code(), ErrorCode::InvalidInput);
-        assert_eq!(mapped.message(), view.summary());
-        assert_eq!(mapped.category(), "source_precondition");
-        assert_eq!(mapped.recovery_action(), "correct_input");
-        assert_eq!(mapped.recovery_hint(), "");
-        assert!(!mapped.retryable());
-    }
 
     #[test]
     fn source_rejections_preserve_identity_through_the_http_code_contract() {

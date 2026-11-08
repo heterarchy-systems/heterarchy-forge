@@ -49,7 +49,7 @@ pub(super) fn execute(
         .map(inventory_json)
         .collect::<Result<Vec<_>, _>>()?;
     Ok(
-        json!({"scope": super::source::scope_json(result.scope())?, "activity_id":activity_id.into_uuid(),
+        json!({"scope": super::scope_json(result.scope())?, "activity_id":activity_id.into_uuid(),
         "diff_count":diffs.len(),"diffs":diffs}),
     )
 }

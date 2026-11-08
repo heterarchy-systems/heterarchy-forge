@@ -10,17 +10,17 @@ use forge_domain::{
     AgentDagPlanRequestId, AgentDeclaredRole, AgentDisplayName, AgentEventId, AgentFocus,
     AgentFocusNode, AgentInstanceId, AgentInstanceRevision, AgentSessionId,
     AgentSessionOpenRequestId, AgentTransportKind, AgentWorkUpdateId, AgentWorkUpdateSequence,
-    AuthenticatedPrincipal, ChangeSetId, DagAcceptanceCriterion, DagHeadRevision,
+    AuthenticatedPrincipal, ChangeSetId, ChangeSetState, DagAcceptanceCriterion, DagHeadRevision,
     DagNodeDefinition, DagNodeId, DagNodeObjective, DagNodeOrdinal, DagNodeTitle, DagRevision,
     DagRevisionId, DagRevisionNumber, DiffArtifactHealth, DiffEvidenceState, DiffId, DiffListLimit,
-    DiffPayloadProjection, EstablishWorkspace, FileContentHash, FileMutationId, FilePatch,
-    FilePatchHunk, GoalAttribution, GoalContract, GoalDeletionRequest, GoalDeletionTarget, GoalId,
-    GoalNodeAttribution, GoalObjective, GoalRevision, GoalStatement, GoalWorkAttribution,
-    LocationId, LocationRevision, OpenAgentSession, RegisteredAgentInstance, RegisteredDagNode,
-    RegisteredGoal, ReleaseWriterLease, RuntimeInstanceId, SourceLineRange, SourceRangeHash,
-    SourceWriteAuthority, TimestampMillis, WorkspaceId, WorkspaceRelativePath, WorkspaceRevision,
-    WorkspaceRoot, WriterLeaseDurationMillis, WriterLeaseId, WriterLeaseScope,
-    WriterLeaseScopeEntry, WriterLeaseScopeKind, WriterLeaseState, WriterLeaseStatus,
+    DiffPayloadProjection, EstablishWorkspace, FileContentHash, FileMutationId, GoalAttribution,
+    GoalContract, GoalDeletionRequest, GoalDeletionTarget, GoalId, GoalNodeAttribution,
+    GoalObjective, GoalRevision, GoalStatement, GoalWorkAttribution, LocationId, LocationRevision,
+    OpenAgentSession, RegisteredAgentInstance, RegisteredDagNode, RegisteredGoal,
+    ReleaseWriterLease, RuntimeInstanceId, SourceWriteAuthority, TimestampMillis, WorkspaceId,
+    WorkspaceRelativePath, WorkspaceRevision, WorkspaceRoot, WriterLeaseDurationMillis,
+    WriterLeaseId, WriterLeaseScope, WriterLeaseScopeEntry, WriterLeaseScopeKind, WriterLeaseState,
+    WriterLeaseStatus,
 };
 use forge_persistence::{GlobalRegistry, GoalDeletionArtifactKind, WorkspaceStore};
 use forge_workspace::{
@@ -28,10 +28,7 @@ use forge_workspace::{
 };
 use uuid::Uuid;
 
-use crate::{
-    DiffListRequest, DiffReadRequest, FileActivityScope, FileApplyPatchOperation,
-    FileApplyPatchRequest, FileMutationStatus, WriterLeaseReleaseRequest,
-};
+use crate::{DiffListRequest, DiffReadRequest, FileActivityScope, WriterLeaseReleaseRequest};
 
 use super::*;
 
@@ -876,38 +873,32 @@ fn apply_source_update(
     authority: SourceWriteAuthority,
     update: SourceUpdate<'_>,
 ) -> Result<DiffId, Box<dyn std::error::Error>> {
-    let whole_file_hash = *blake3::hash(update.before).as_bytes();
-    let request = FileApplyPatchRequest {
-        scope: fixture.scope.clone(),
-        activity: FileActivityScope {
+    assert_eq!(
+        fs::read(workspace_root(fixture).join(update.path))?,
+        update.before
+    );
+    let record = crate::filesystem::source_write_test_support::seed_applied_file_diff(
+        &fixture.control,
+        &fixture.scope,
+        FileActivityScope {
             activity_id: fixture.activity_id,
             runtime_instance_id: fixture.runtime_instance_id,
             observed_at: timestamp(20)?,
         },
-        goal: Some(update.goal),
-        write_authority: authority,
-        change_set_id: update.change_set_id,
-        mutation_id: update.mutation_id,
-        operation: FileApplyPatchOperation::Update {
-            path: WorkspaceRelativePath::new(PathBuf::from(update.path))?,
-            patch: FilePatch::new(
-                FileContentHash::from_bytes(whole_file_hash),
-                vec![FilePatchHunk::new(
-                    SourceLineRange::new(1, 1)?,
-                    SourceRangeHash::from_bytes(whole_file_hash),
-                    update.after.to_vec(),
-                )?],
-            )?,
-        },
-    };
-    let result = fixture.control.file_apply_patch(&request)?;
-    assert_eq!(result.status(), FileMutationStatus::Applied);
+        Some(update.goal),
+        authority,
+        update.change_set_id,
+        update.mutation_id,
+        WorkspaceRelativePath::new(PathBuf::from(update.path))?,
+        update.after,
+    )?;
+    assert_eq!(record.change_set().state(), ChangeSetState::Applied);
     assert_eq!(
         fs::read(workspace_root(fixture).join(update.path))?,
         update.after
     );
 
-    let diff_id = DiffId::for_change_set(request.change_set_id);
+    let diff_id = DiffId::for_change_set(update.change_set_id);
     let diff = fixture.control.diff_read(&DiffReadRequest {
         scope: fixture.scope.clone(),
         diff_id,

@@ -243,7 +243,7 @@ pub(super) fn execute_mutation(
     client: &ForgeControlClient,
     request: &forge_control::GoalMutationRequest,
 ) -> Result<Value, ForgeError> {
-    let scope = super::source::scope_json(&request.scope)?;
+    let scope = super::scope_json(&request.scope)?;
     let result = client
         .goal_mutation(request.clone())
         .map_err(|error| super::forge_error_of_client(&error))?;
@@ -262,7 +262,7 @@ pub(super) fn execute_readback(
     client: &ForgeControlClient,
     request: &forge_control::GoalMutationReadbackRequest,
 ) -> Result<Value, ForgeError> {
-    let scope = super::source::scope_json(&request.scope)?;
+    let scope = super::scope_json(&request.scope)?;
     let receipt = client
         .goal_mutation_readback(request.clone())
         .map_err(|error| super::forge_error_of_client(&error))?;
@@ -429,10 +429,10 @@ fn parse_verification_requirement(
             expected_hash,
             description,
         } => Ok(GoalVerificationRequirement::FilePresent {
-            path: super::source::decode_relative_path(&path_base64)?,
+            path: super::decode_relative_path(&path_base64)?,
             expected_hash: expected_hash
                 .as_deref()
-                .map(super::source_write::parse_content_hash)
+                .map(super::parse_content_hash)
                 .transpose()?,
             description: GoalStatement::new(description)
                 .map_err(|_| ForgeError::invalid_input("verification description is invalid"))?,

@@ -273,3 +273,166 @@ pub(crate) fn seed_source_write_authority(
         session_id(request),
     ))
 }
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub(crate) fn seed_applied_file_diff(
+    control: &ForgeControl,
+    scope: &ResolvedWorkspaceScope,
+    activity: crate::FileActivityScope,
+    goal: Option<forge_domain::GoalWorkAttribution>,
+    write_authority: SourceWriteAuthority,
+    change_set_id: forge_domain::ChangeSetId,
+    mutation_id: forge_domain::FileMutationId,
+    relative_path: WorkspaceRelativePath,
+    content: &[u8],
+) -> Result<forge_domain::FileMutationRecord, Box<dyn std::error::Error>> {
+    let (fresh_scope, layout, mut store) = control.open_effect_workspace(scope)?;
+    let activity_row = crate::filesystem::authorize_activity(&store, activity)?;
+    let filesystem = forge_workspace::ConfinedWorkspace::open(&layout)?;
+    let diff_artifacts = filesystem.diff_artifact_store()?;
+    let (pre_state, pre_source, kind, precondition) = match filesystem.read(&relative_path) {
+        Ok(read) => (
+            read.state(),
+            forge_workspace::CapturedDiffSource::Text(String::from_utf8(read.content().to_vec())?),
+            forge_domain::FileMutationKind::Replace,
+            forge_domain::FilePrecondition::Matches(read.hash()),
+        ),
+        Err(forge_workspace::ConfinedFilesystemError::NotFound) => (
+            forge_domain::FilePathState::Absent,
+            forge_workspace::CapturedDiffSource::Absent,
+            forge_domain::FileMutationKind::Create,
+            forge_domain::FilePrecondition::Absent,
+        ),
+        Err(error) => return Err(error.into()),
+    };
+    let post_source =
+        forge_workspace::CapturedDiffSource::Text(String::from_utf8(content.to_vec())?);
+    let diff_kind = match kind {
+        forge_domain::FileMutationKind::Create => forge_domain::DiffChangeKind::Created,
+        forge_domain::FileMutationKind::Replace => forge_domain::DiffChangeKind::Modified,
+        forge_domain::FileMutationKind::Delete => forge_domain::DiffChangeKind::Deleted,
+    };
+    let rendered = forge_workspace::render_diff_evidence(
+        &relative_path,
+        diff_kind,
+        &pre_source,
+        &post_source,
+    )?;
+    let forge_workspace::RenderedDiffEvidence::Text(rendered_text) = rendered else {
+        return Err("expected text diff".into());
+    };
+    let diff_id = forge_domain::DiffId::for_change_set(change_set_id);
+    let staged = diff_artifacts.stage(diff_id, &rendered_text)?;
+    let file_entry = forge_domain::DiffEntrySummary::new(
+        forge_domain::DiffEntrySubject::File,
+        relative_path.clone(),
+        None,
+        diff_kind,
+        rendered_text.additions(),
+        rendered_text.deletions(),
+    )?;
+    let begin_diff = forge_domain::BeginDiffEvidence::new(
+        forge_domain::DiffAttribution::for_file_mutation(
+            diff_id,
+            fresh_scope.workspace_id(),
+            activity.activity_id,
+            change_set_id,
+            mutation_id,
+        ),
+        vec![file_entry],
+        forge_domain::DiffPayloadProjection::IntentText {
+            pending_relative_path: staged.pending_relative_path()?,
+            final_relative_path: staged.final_relative_path()?,
+            compressed_hash: staged.compressed_hash(),
+            uncompressed_hash: staged.uncompressed_hash(),
+            compressed_size: staged.compressed_size(),
+            uncompressed_size: staged.uncompressed_size(),
+        },
+        activity.observed_at,
+        forge_domain::DiffContractVersions::V1,
+    )?;
+    let intended_hash =
+        forge_domain::FileContentHash::from_bytes(*blake3::hash(content).as_bytes());
+    let identity = forge_domain::FileMutationIdentity::new(change_set_id, mutation_id);
+    let begin_cmd = forge_domain::BeginFileMutation::new(
+        identity,
+        forge_domain::FileMutationScope::new(
+            fresh_scope.workspace_id(),
+            fresh_scope.workspace_revision(),
+            activity_row.id(),
+            activity.runtime_instance_id,
+            activity_row.lease_revision(),
+        ),
+        forge_domain::FileMutationPlan::new(relative_path, kind, precondition),
+        Some(intended_hash),
+        pre_state,
+        activity.observed_at,
+    )?;
+    let begin =
+        store.begin_file_mutation_for_goal(&begin_cmd, &begin_diff, goal, write_authority)?;
+    let path = begin.record().mutation().path();
+    let starting_checkpoint = match forge_workspace::GitCheckpointStore::new(
+        layout.workspace_root(),
+        layout.checkpoints(),
+    ) {
+        Ok(git_store) => {
+            let attribution = forge_domain::CheckpointAttribution::new(
+                forge_domain::CheckpointId::from_uuid(Uuid::now_v7()),
+                change_set_id,
+                fresh_scope.workspace_id(),
+                fresh_scope.workspace_revision(),
+                activity.activity_id,
+            );
+            let starting =
+                git_store.begin_checkpoint(attribution, path.clone(), activity.observed_at)?;
+            let starting = store.begin_checkpoint_for_goal(&starting, goal)?;
+            Some((git_store, starting))
+        }
+        Err(forge_workspace::GitSafetyError::NotGitRepository) => None,
+        Err(error) => return Err(error.into()),
+    };
+    let target = layout.workspace_root().join(path.as_path());
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&target, content)?;
+    let post_read = filesystem.read(path)?;
+    let published = diff_artifacts.publish(staged)?;
+    let expected = published.expectation();
+    let complete_cmd = forge_domain::CompleteFileMutation::new(
+        identity,
+        begin.record().change_set().revision(),
+        begin.record().mutation().revision(),
+        post_read.state(),
+        activity.observed_at,
+    );
+    let diff_revision = begin.diff().map_or(
+        forge_domain::DiffRevision::INITIAL,
+        forge_domain::RegisteredDiffEvidence::revision,
+    );
+    let complete_diff = forge_domain::CompleteDiffEvidence::new(
+        diff_id,
+        diff_revision,
+        forge_domain::DiffPayloadProjection::Ready {
+            relative_path: published.relative_path()?,
+            compressed_hash: expected.compressed_hash(),
+            uncompressed_hash: expected.uncompressed_hash(),
+            compressed_size: expected.compressed_size(),
+            uncompressed_size: expected.uncompressed_size(),
+        },
+        activity.observed_at,
+    )?;
+    let record = store.complete_file_mutation(
+        &complete_cmd,
+        &complete_diff,
+        forge_domain::ChangeSetProducer::new(
+            write_authority.agent_id(),
+            write_authority.session_id(),
+        ),
+    )?;
+    if let Some((git_store, starting)) = starting_checkpoint {
+        let completed = git_store.complete_checkpoint(&starting, activity.observed_at)?;
+        let _ready = store.complete_checkpoint(&completed, starting.revision())?;
+    }
+    Ok(record.file().clone())
+}

@@ -39,10 +39,6 @@ mod recovery_maintenance;
 mod registry_ops;
 #[path = "real_execution/research_package.rs"]
 mod research_package;
-#[path = "real_execution/source_reads.rs"]
-mod source_reads;
-#[path = "real_execution/source_writes.rs"]
-mod source_writes;
 #[path = "real_execution/standalone.rs"]
 pub(crate) mod standalone;
 pub(crate) use standalone::native_rust_ci::{
@@ -50,8 +46,6 @@ pub(crate) use standalone::native_rust_ci::{
 };
 #[path = "real_execution/home_source.rs"]
 mod home_source;
-#[path = "real_execution/tree_writes.rs"]
-mod tree_writes;
 #[path = "real_execution/work_cut_outage.rs"]
 mod work_cut_outage;
 #[path = "real_execution/work_cuts.rs"]
@@ -780,7 +774,6 @@ async fn real_http_snapshot_plan_source_and_mutation_readback()
     let address = serve(state.clone()).await?;
     assert_http_snapshot(address, &fixture).await?;
     assert_http_plan_reads(address, &fixture).await?;
-    source_reads::assert_http_source_reads(address, &fixture).await?;
     let diff_id =
         lease_readback::assert_http_lease_and_mutation_readback(address, &fixture).await?;
     readback_enrichment::assert_http_readback_enrichment(address, &fixture, diff_id).await?;

@@ -58,14 +58,6 @@ pub enum ControlErrorCode {
     FileNotFound = 1502,
     FileConflict = 1503,
     FileCapacityExceeded = 1504,
-    /// The caller's whole-file CAS digest did not match the observed source.
-    FileWholeHashConflict = 1505,
-    /// The caller's line range/context digest did not match the observed source.
-    FileRangeConflict = 1506,
-    /// A source-edit operation targeted non-text bytes.
-    FileSourceNotText = 1507,
-    /// A read-only source slice ended beyond the observed file bounds.
-    FileReadRangeOutOfBounds = 1508,
     /// A source operation expected a different filesystem object kind.
     InvalidPathKind = 1509,
     DiffNotFound = 1600,
@@ -147,10 +139,6 @@ impl ControlErrorCode {
             Self::FileNotFound => "CONTROL_FILE_NOT_FOUND",
             Self::FileConflict => "CONTROL_FILE_CONFLICT",
             Self::FileCapacityExceeded => "CONTROL_FILE_CAPACITY_EXCEEDED",
-            Self::FileWholeHashConflict => "CONTROL_FILE_WHOLE_HASH_CONFLICT",
-            Self::FileRangeConflict => "CONTROL_FILE_RANGE_CONFLICT",
-            Self::FileSourceNotText => "CONTROL_FILE_SOURCE_NOT_TEXT",
-            Self::FileReadRangeOutOfBounds => "CONTROL_FILE_READ_RANGE_OUT_OF_BOUNDS",
             Self::InvalidPathKind => "CONTROL_INVALID_PATH_KIND",
             Self::DiffNotFound => "CONTROL_DIFF_NOT_FOUND",
             Self::DiffUnavailable => "CONTROL_DIFF_UNAVAILABLE",
@@ -238,12 +226,6 @@ impl ControlErrorCode {
             Self::FileNotFound => "the requested file was not found",
             Self::FileConflict => "the requested file effect conflicts with current state",
             Self::FileCapacityExceeded => "the requested file effect exceeds bounded capacity",
-            Self::FileWholeHashConflict => "the source whole-file hash is stale",
-            Self::FileRangeConflict => "the source range or patch context is stale",
-            Self::FileSourceNotText => "the requested source is not valid text",
-            Self::FileReadRangeOutOfBounds => {
-                "the requested source read range exceeds the observed file bounds"
-            }
             Self::InvalidPathKind => "the requested source path has an unexpected object kind",
             Self::DiffNotFound => "the requested Diff Evidence was not found",
             Self::DiffUnavailable => "the requested Diff Evidence is unavailable",
@@ -501,10 +483,6 @@ pub enum ControlErrorDetails {
     None,
     /// Registration/upgrade may have changed state before its failing reply.
     WorkspaceRegistrationUnknown,
-    SourceReadRange {
-        end_line: u64,
-        total_lines: u64,
-    },
     PathKind {
         expected: FileEntryKind,
         actual: FileEntryKind,
@@ -577,12 +555,7 @@ impl ControlErrorCode {
             Self::WorkspaceScopeOverlap | Self::FilePathDenied | Self::InvalidPathKind => {
                 ControlErrorCategory::PathConfinement
             }
-            Self::FileNotFound
-            | Self::FileConflict
-            | Self::FileWholeHashConflict
-            | Self::FileRangeConflict
-            | Self::FileSourceNotText
-            | Self::FileReadRangeOutOfBounds => ControlErrorCategory::SourcePrecondition,
+            Self::FileNotFound | Self::FileConflict => ControlErrorCategory::SourcePrecondition,
             Self::DiffNotFound
             | Self::DiffUnavailable
             | Self::GoalEvidenceConflict
@@ -619,10 +592,8 @@ impl ControlErrorCode {
     pub const fn recovery_action(self) -> ControlRecoveryAction {
         match self {
             Self::InvalidInput
-            | Self::FileSourceNotText
             | Self::FilePathDenied
             | Self::WorkspaceScopeOverlap
-            | Self::FileReadRangeOutOfBounds
             | Self::InvalidPathKind => ControlRecoveryAction::CorrectInput,
             Self::AuthorizationRequired => ControlRecoveryAction::Authenticate,
             Self::RequestCancelled => ControlRecoveryAction::DoNotRetry,
@@ -662,10 +633,7 @@ impl ControlErrorCode {
             | Self::CoordinatorConflict
             | Self::WorkSelectionAmbiguous
             | Self::HomeTransferFenced => ControlRecoveryAction::RefreshWork,
-            Self::FileNotFound
-            | Self::FileConflict
-            | Self::FileWholeHashConflict
-            | Self::FileRangeConflict => ControlRecoveryAction::ReadSource,
+            Self::FileNotFound | Self::FileConflict => ControlRecoveryAction::ReadSource,
             Self::ActivityLeaseConflict
             | Self::RecoveryLeaseConflict
             | Self::WriterLeaseNotFound
@@ -822,7 +790,6 @@ impl ControlErrorView {
                     ControlRecoveryAction::InspectActivity
                 }
                 ControlErrorDetails::None
-                | ControlErrorDetails::SourceReadRange { .. }
                 | ControlErrorDetails::PathKind { .. }
                 | ControlErrorDetails::WriterLeaseConflict { .. } => self.code.recovery_action(),
             }
@@ -952,7 +919,7 @@ mod tests {
 
     #[test]
     fn ordinary_service_error_stays_unknown_without_admission_proof() {
-        let view = ControlErrorView::from_service(ControlErrorCode::FileRangeConflict, false);
+        let view = ControlErrorView::from_service(ControlErrorCode::FileConflict, false);
         assert_eq!(view.category(), ControlErrorCategory::SourcePrecondition);
         assert_eq!(view.outcome(), ControlOperationOutcome::Unknown);
         assert!(!view.retryable());
@@ -998,19 +965,6 @@ mod tests {
         assert_eq!(error.details(), details);
         assert_eq!(error.view().details(), details);
         assert_eq!(error.view().after_admission().details(), details);
-
-        let source = ControlErrorView::unknown(ControlErrorCode::FileReadRangeOutOfBounds)
-            .with_details(ControlErrorDetails::SourceReadRange {
-                end_line: 42,
-                total_lines: 7,
-            });
-        assert_eq!(
-            source.details(),
-            ControlErrorDetails::SourceReadRange {
-                end_line: 42,
-                total_lines: 7,
-            }
-        );
     }
 
     #[test]

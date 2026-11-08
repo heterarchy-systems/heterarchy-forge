@@ -24,7 +24,6 @@ mod binding_activation;
 mod binding_reference;
 mod binding_registration;
 mod binding_rejection;
-mod checkpoint;
 mod command;
 mod continuation;
 mod coordinator;
@@ -38,7 +37,6 @@ mod execution;
 mod execution_coordinator;
 mod execution_journal;
 mod execution_stop;
-mod file_mutation_readback;
 mod filesystem;
 mod generated_artifact;
 mod goal;
@@ -51,9 +49,6 @@ mod recovery;
 mod retention;
 mod semantic_projection;
 mod service;
-mod source_tree;
-mod source_tree_digest;
-mod source_tree_readback;
 mod started_activity_lease_resume;
 mod unstarted_activity_continuation;
 mod work_cut;
@@ -192,14 +187,7 @@ pub use execution_coordinator::{
     JournalPersistenceFailure, OwnedWorkspaceExecutionStopObservation,
     WorkspaceExecutionStopObservation,
 };
-pub use file_mutation_readback::FileMutationReadbackRequest;
-pub use filesystem::{
-    FileActivityScope, FileApplyPatchOperation, FileApplyPatchRequest, FileApplyPatchResult,
-    FileListRequest, FileListResult, FileMutationRequest, FileMutationResult, FileMutationStatus,
-    FileReadRequest, FileReadResult, FileReadSliceRequest, FileReadSliceResult,
-    SourceTreeTransactionRequest, SourceTreeTransactionResult, SourceTreeTransactionStatus,
-    TextSearchRequest, TextSearchResult,
-};
+pub use filesystem::FileActivityScope;
 pub use forge_domain::{ProjectCommandCatalogFingerprint, ProjectCommandClass};
 pub use forge_execution::{
     RUST_CI_PINNED_VERSION, RUST_CI_SANDBOX_MARKER_ENV, RUST_CI_SANDBOX_MARKER_VALUE,
@@ -250,9 +238,6 @@ pub use service::{
     ResolvedWorkspaceScope, SupervisedActivityLeaseRenewRequest, WorkspaceActivityProjection,
     WorkspaceActivityProjectionRequest, WorkspaceCatalogEntry, WorkspaceDiscoveryEntry,
 };
-pub use source_tree::SourceTreeMutationRequest;
-pub use source_tree_digest::source_tree_request_digest;
-pub use source_tree_readback::SourceTreeReadbackRequest;
 pub use started_activity_lease_resume::{
     StartedActivityLeaseResumeGetRequest, StartedActivityLeaseResumeProbeRequest,
     StartedActivityLeaseResumeRunRequest,
