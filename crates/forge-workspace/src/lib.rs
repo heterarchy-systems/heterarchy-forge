@@ -1,12 +1,15 @@
 //! Owner-approved Location discovery and explicit Workspace resolution.
 
 mod confinement;
+mod dag_git_store;
 mod diff_artifact;
 mod discovery;
 mod git_safety;
+mod node_workspace;
 mod service;
 mod state_gate;
 mod state_layout;
+mod swarm_workspace;
 
 pub use confinement::{
     CapturedDiffSource, ConfinedFileRead, ConfinedFilesystemError, ConfinedWorkspace,
@@ -47,6 +50,14 @@ pub use git_safety::{
     HomeArtifactRefInventory, HomeArtifactRefInventoryEntry, HomeArtifactRefInventoryLimit,
     HomeArtifactRefIssue, HomeArtifactStore, HomeArtifactStoreError,
 };
+pub use node_workspace::{
+    DagSettlementJournalState, DagSettlementReceipt, NodeWorkspaceCompletedState,
+    NodeWorkspaceCompletionReceipt, NodeWorkspaceError, NodeWorkspaceReceipt,
+    complete_and_handoff_node_workspace, complete_and_handoff_node_workspace_in,
+    inspect_dag_settlement, inspect_node_workspace, provision_node_workspace,
+    provision_node_workspace_in, purge_goal_node_workspaces, settle_dag_revision_workspace,
+    verify_dag_revision_settled,
+};
 pub use service::{
     BoxedRepositoryError, LocationRepository, LocationRepositoryError, LocationService,
     LocationServiceError,
@@ -57,4 +68,12 @@ pub use state_gate::{
 pub use state_layout::{
     ExistingWorkspaceStateLayout, GitLocalState, GitLocalStateDoctor, StateLayoutError,
     WorkspaceStateLayout,
+};
+pub use swarm_workspace::{
+    SettlementJournalState, SwarmConvergenceOutcome, SwarmMemberId, SwarmMemberOutputReceipt,
+    SwarmRunId, SwarmSettlementReceipt, SwarmSettlementTarget, SwarmWorkspaceError,
+    SwarmWorkspaceMode, SwarmWorkspaceReceipt, capture_member_output, converge_swarm_candidates,
+    inspect_swarm_member_workspace, inspect_swarm_settlement, is_forbidden_ssd_worktree_path,
+    materialize_dag_node_hybrid_swarm_workspace, provision_swarm_member_workspace,
+    provision_swarm_member_workspace_in, purge_swarm_workspaces, settle_standalone_swarm_workspace,
 };

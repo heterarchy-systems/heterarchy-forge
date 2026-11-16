@@ -31,6 +31,7 @@ mod recovery;
 mod runtime;
 mod source_tree;
 mod started_activity_lease_resume;
+mod swarm;
 mod unstarted_activity_continuation;
 mod verification;
 mod verification_input;
@@ -381,4 +382,8 @@ pub use coordinator_recovery::{
     ConfirmedCoordinatorRecovery, CoordinatorRecoveryAgent, CoordinatorRecoveryError,
     CoordinatorRecoveryFence, CoordinatorRecoveryReason, CoordinatorRecoveryReceipt,
     MAX_COORDINATOR_RECOVERY_REASON_BYTES,
+};
+pub use swarm::{
+    SwarmMemberId, SwarmMemberIdParseError, SwarmRunId, SwarmRunIdParseError,
+    SwarmSettlementTarget, SwarmWorkspaceMode, SwarmWorkspaceModeParseError,
 };

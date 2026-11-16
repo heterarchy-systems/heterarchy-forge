@@ -50,6 +50,7 @@ mod retention;
 mod semantic_projection;
 mod service;
 mod started_activity_lease_resume;
+mod swarm;
 mod unstarted_activity_continuation;
 mod work_cut;
 mod worker;
@@ -156,7 +157,9 @@ pub use coordinator::{
     CoordinatorActorRequest, CoordinatorClaimRequest, CoordinatorGetRequest,
     CoordinatorTransferRequest,
 };
-pub use dag::{DagNodeCompleteRequest, DagNodeStartRequest, DagNodeUpdateRequest};
+pub use dag::{
+    DagNodeCompleteRequest, DagNodeStartRequest, DagNodeUpdateRequest, DagSettleRequest,
+};
 pub use diff::{
     DiffDoctorRequest, DiffDoctorResult, DiffListRequest, DiffListResult, DiffReadRequest,
     DiffReadResult,
@@ -192,6 +195,13 @@ pub use forge_domain::{ProjectCommandCatalogFingerprint, ProjectCommandClass};
 pub use forge_execution::{
     RUST_CI_PINNED_VERSION, RUST_CI_SANDBOX_MARKER_ENV, RUST_CI_SANDBOX_MARKER_VALUE,
     RustCiDiscoveryInput, RustCiHostArchitecture, RustCiToolchainCapability,
+};
+pub use forge_persistence::SwarmSettledOutboxEntry;
+pub use forge_workspace::{
+    DagSettlementJournalState, DagSettlementReceipt, NodeWorkspaceCompletedState,
+    NodeWorkspaceCompletionReceipt, NodeWorkspaceError, NodeWorkspaceReceipt,
+    SettlementJournalState, SwarmConvergenceOutcome, SwarmMemberOutputReceipt,
+    SwarmSettlementReceipt, SwarmWorkspaceError, SwarmWorkspaceReceipt,
 };
 pub use generated_artifact::{
     GeneratedArtifactAccessError, GeneratedArtifactInventory, GeneratedArtifactInventoryLimit,
@@ -291,6 +301,13 @@ pub type ActivitySupervisor = ForgeControlWorker;
 
 pub use dag_plan_readback::DagPlanReadbackRequest;
 pub use goal_mutation::{GoalMutationReadbackRequest, GoalMutationRequest};
+
+pub use swarm::{
+    MAX_SWARM_CONVERGENCE_CANDIDATES, SwarmConvergeRequest, SwarmConvergenceCandidate,
+    SwarmMaterializeHybridRequest, SwarmMemberCaptureRequest, SwarmPurgeRequest,
+    SwarmSettleOutcome, SwarmSettleRequest, SwarmSettlementGetRequest, SwarmSettlementView,
+    SwarmWorkspaceGetRequest, SwarmWorkspaceProvisionRequest,
+};
 
 mod coordinator_recovery;
 pub use coordinator_recovery::{

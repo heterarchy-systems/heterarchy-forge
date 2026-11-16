@@ -437,12 +437,21 @@ impl ForgeControl {
             trusted_product_cache_root,
             workspace_id: fresh_scope.workspace_id(),
         };
-        match plan {
-            CleanupPlan::SqlOnly(outcome) => Ok(outcome),
+        let outcome = match plan {
+            CleanupPlan::SqlOnly(outcome) => outcome,
             CleanupPlan::Pending(plan) => {
-                process_pending_cleanup(request.target, &plan, &mut deletion_store, &context)
+                process_pending_cleanup(request.target, &plan, &mut deletion_store, &context)?
             }
+        };
+        if outcome.phase() == GoalDeletePhase::Complete {
+            let _ignored = forge_workspace::purge_goal_node_workspaces(
+                &layout,
+                Some(&self.node_worktrees_root),
+                Some(fresh_scope.workspace_id()),
+                request.target.goal_id(),
+            );
         }
+        Ok(outcome)
     }
 }
 

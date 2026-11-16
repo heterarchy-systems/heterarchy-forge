@@ -1136,6 +1136,12 @@ mod tests {
             forge_persistence::EffectFact::AssignmentSubmitted(_) => {
                 unreachable!("assignment review must not produce an assignment-submitted fact")
             }
+            forge_persistence::EffectFact::DagSettled(_) => {
+                unreachable!("assignment review must not produce a dag-settled fact")
+            }
+            forge_persistence::EffectFact::SwarmSettled(_) => {
+                unreachable!("assignment review must not produce a swarm-settled fact")
+            }
         }
         fs::remove_dir_all(fixture.root)?;
         Ok(())
@@ -1199,6 +1205,12 @@ mod tests {
             }
             forge_persistence::EffectFact::AssignmentSubmitted(_) => {
                 unreachable!("assignment offer must not produce an assignment-submitted fact")
+            }
+            forge_persistence::EffectFact::DagSettled(_) => {
+                unreachable!("assignment offer must not produce a dag-settled fact")
+            }
+            forge_persistence::EffectFact::SwarmSettled(_) => {
+                unreachable!("assignment offer must not produce a swarm-settled fact")
             }
         }
         fs::remove_dir_all(fixture.root)?;

@@ -507,6 +507,8 @@ impl ActivityBootstrap {
 pub struct ForgeControl {
     pub(crate) locations: LocationService<GlobalRegistry>,
     pub(crate) session_authority: Box<dyn crate::AgentSessionAuthority>,
+    pub(crate) node_worktrees_root: std::path::PathBuf,
+    pub(crate) swarm_worktrees_root: Option<std::path::PathBuf>,
 }
 
 impl fmt::Debug for ForgeControl {
@@ -515,6 +517,8 @@ impl fmt::Debug for ForgeControl {
             .debug_struct("ForgeControl")
             .field("locations", &self.locations)
             .field("session_authority", &"<injected>")
+            .field("node_worktrees_root", &self.node_worktrees_root)
+            .field("swarm_worktrees_root", &self.swarm_worktrees_root)
             .finish()
     }
 }
@@ -533,9 +537,19 @@ impl ForgeControl {
         locations: LocationService<GlobalRegistry>,
         session_catalog_path: std::path::PathBuf,
     ) -> Self {
+        let parent = session_catalog_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let node_worktrees_root = parent.join("node-worktrees");
+        let swarm_candidate = parent.join("swarm-worktrees");
+        let swarm_worktrees_root =
+            (!forge_workspace::is_forbidden_ssd_worktree_path(&swarm_candidate))
+                .then_some(swarm_candidate);
         Self {
             locations,
             session_authority: crate::agent_session::local_session_authority(session_catalog_path),
+            node_worktrees_root,
+            swarm_worktrees_root,
         }
     }
 
@@ -558,7 +572,23 @@ impl ForgeControl {
         Self {
             locations,
             session_authority: authority,
+            node_worktrees_root: std::env::temp_dir().join("heterarchy-forge-node-worktrees"),
+            swarm_worktrees_root: None,
         }
+    }
+
+    /// Override the external worktrees root used for DAG node isolation.
+    #[must_use]
+    pub fn with_node_worktrees_root(mut self, root: std::path::PathBuf) -> Self {
+        self.node_worktrees_root = root;
+        self
+    }
+
+    /// Override the external worktrees root used for Swarm member isolation.
+    #[must_use]
+    pub fn with_swarm_worktrees_root(mut self, root: std::path::PathBuf) -> Self {
+        self.swarm_worktrees_root = Some(root);
+        self
     }
 
     /// List the bounded registered Location identities needed to begin a
@@ -902,6 +932,42 @@ impl ForgeControl {
             && workspace.revision() == scope.workspace_revision()
             && workspace.location_id() == scope.locator.location_id()
             && workspace.root().as_path() == candidate.absolute_root()
+    }
+
+    pub(crate) fn open_exact_workspace_with_layout(
+        &self,
+        scope: &ResolvedWorkspaceScope,
+    ) -> Result<
+        (
+            ResolvedWorkspaceScope,
+            ExistingWorkspaceStateLayout,
+            WorkspaceStore,
+        ),
+        ControlError,
+    > {
+        let (fresh_scope, layout, store) = self.open_resolved_workspace_with_layout(
+            scope.locator().location_id(),
+            scope.locator().expected_revision(),
+            scope.locator(),
+        )?;
+        if fresh_scope != *scope {
+            return Err(ControlError::new(
+                ControlErrorCode::WorkspaceRevisionConflict,
+            ));
+        }
+        Ok((fresh_scope, layout, store))
+    }
+
+    pub(crate) fn confirm_scope_write(
+        &self,
+        scope: &ResolvedWorkspaceScope,
+        store: &WorkspaceStore,
+    ) -> Result<(), ControlError> {
+        if self.committed_scope_matches_with_store(scope, store) {
+            Ok(())
+        } else {
+            Err(ControlError::committed())
+        }
     }
     /// Renew caller-owned Activity leases in one atomic, deterministic batch.
     pub fn renew_activity_lease_batch(
@@ -2294,6 +2360,7 @@ mod integration_tests {
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     fn transfer_and_commit_successor_dag(
         client: &crate::ForgeControlClient,
         scope: &ResolvedWorkspaceScope,
@@ -2349,30 +2416,59 @@ mod integration_tests {
                 "Successor implementation verified".to_owned(),
             )?],
         )?;
+        let downstream_definition = DagNodeDefinition::new(
+            DagNodeId::from_uuid(id(0xEA20)),
+            DagNodeOrdinal::new(1)?,
+            DagNodeTitle::new("Verify handed-off workspace".to_owned())?,
+            DagNodeObjective::new(
+                "Consume the isolated workspace handed off by the upstream node".to_owned(),
+            )?,
+            vec![DagAcceptanceCriterion::new(
+                "Downstream workspace handoff verified".to_owned(),
+            )?],
+        )?;
         let successor_revision = DagRevision::new(
             DagRevisionId::from_uuid(id(0xEA1A)),
             initial.goal.id(),
             initial.goal.revision(),
             DagRevisionNumber::new(2)?,
             Some(initial.revision.number()),
-            vec![successor_definition.clone()],
-            Vec::new(),
+            vec![successor_definition.clone(), downstream_definition.clone()],
+            vec![forge_domain::DagEdge::new(
+                successor_definition.id(),
+                downstream_definition.id(),
+            )],
             timestamp(13)?,
         )?;
-        let successor_nodes = vec![RegisteredDagNode::create(
-            initial.goal.id(),
-            successor_revision.number(),
-            successor_definition.clone(),
-            timestamp(13)?,
-        )];
+        let successor_nodes = vec![
+            RegisteredDagNode::create(
+                initial.goal.id(),
+                successor_revision.number(),
+                successor_definition.clone(),
+                timestamp(13)?,
+            ),
+            RegisteredDagNode::create(
+                initial.goal.id(),
+                successor_revision.number(),
+                downstream_definition.clone(),
+                timestamp(13)?,
+            ),
+        ];
         let successor_draft = forge_domain::AgentDagDraft::new(
             successor_revision.clone(),
             successor_nodes.clone(),
-            vec![forge_domain::DagNodeLineage::new(
-                initial.nodes[0].id(),
-                successor_definition.id(),
-                forge_domain::DagLineageKind::Replace,
-            )],
+            vec![
+                forge_domain::DagNodeLineage::new(
+                    initial.nodes[0].id(),
+                    successor_definition.id(),
+                    forge_domain::DagLineageKind::Split,
+                ),
+                forge_domain::DagNodeLineage::new(
+                    initial.nodes[0].id(),
+                    downstream_definition.id(),
+                    forge_domain::DagLineageKind::Split,
+                ),
+            ],
         )?;
         let successor = client.agent_dag_plan_commit(crate::AgentDagPlanCommitRequest {
             scope: scope.clone(),
@@ -2592,6 +2688,29 @@ mod integration_tests {
         Ok(())
     }
 
+    fn assert_unsettled_dag_review(
+        client: &crate::ForgeControlClient,
+        scope: &ResolvedWorkspaceScope,
+        activity_id: ActivityId,
+        goal_id: GoalId,
+        dag_revision: forge_domain::DagRevisionNumber,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let review = client.goal_review(scope.clone(), activity_id, goal_id)?;
+        assert!(
+            review
+                .hard_checks()
+                .iter()
+                .all(forge_domain::GoalHardCheck::is_passed)
+        );
+        assert_eq!(
+            review.blockers(),
+            &[forge_domain::GoalCompletionBlocker::UnsettledDagRevision(
+                dag_revision
+            )]
+        );
+        Ok(())
+    }
+
     fn complete_attributed_goal_node(
         client: &crate::ForgeControlClient,
         scope: &ResolvedWorkspaceScope,
@@ -2609,6 +2728,23 @@ mod integration_tests {
             completed_node.lifecycle(),
             &forge_domain::DagNodeLifecycle::Completed
         );
+        let settlement = client.dag_settle(crate::DagSettleRequest {
+            scope: scope.clone(),
+            activity_id: goal.activity_id(),
+            session_id: actor.session_id(),
+            principal: actor.principal(),
+            goal_id: goal.id(),
+            expected_goal_revision: goal.revision(),
+            expected_dag_revision: completed_node.dag_revision(),
+            settlement_id: id(0xEBCA),
+            observed_at: timestamp(75_000)?,
+        })?;
+        assert_eq!(
+            settlement.state(),
+            crate::DagSettlementJournalState::Applied
+        );
+        let review_after = client.goal_review(scope.clone(), goal.activity_id(), goal.id())?;
+        assert!(review_after.blockers().is_empty());
         let completed_goal = client.goal_complete(GoalCompletionRequest {
             scope: scope.clone(),
             activity_id: goal.activity_id(),
@@ -3895,6 +4031,22 @@ mod integration_tests {
             expected_revision: successor_nodes[0].revision(),
             observed_at: timestamp(14)?,
         })?;
+        let ws_root = cleanup_root.join("location").join("workspace-0");
+        let ws_layout = WorkspaceStateLayout::inspect_existing(&ws_root)?
+            .ok_or("expected workspace-0 state layout")?;
+        let node0_ws = forge_workspace::inspect_node_workspace(
+            &ws_layout,
+            initial.goal.id(),
+            successor_nodes[0].dag_revision(),
+            successor_nodes[0].id(),
+        )?
+        .ok_or("expected Node 0 isolated workspace after start")?;
+        fs::write(
+            node0_ws.worktree_path().join("handoff_from_node0.txt"),
+            "baton-pass-payload\n",
+        )?;
+        assert!(!ws_root.join("handoff_from_node0.txt").exists());
+
         let completed = active.complete(active.revision(), timestamp(15)?)?;
         assert_eq!(
             client.dag_node_update(DagNodeUpdateRequest {
@@ -3903,6 +4055,18 @@ mod integration_tests {
                 expected_revision: active.revision(),
             })?,
             completed
+        );
+        let node1_ws = forge_workspace::inspect_node_workspace(
+            &ws_layout,
+            initial.goal.id(),
+            successor_nodes[1].dag_revision(),
+            successor_nodes[1].id(),
+        )?
+        .ok_or("expected Node 1 isolated workspace after Node 0 completion handoff")?;
+        assert_eq!(node1_ws.upstream_node_ids(), &[successor_nodes[0].id()]);
+        assert_eq!(
+            fs::read_to_string(node1_ws.worktree_path().join("handoff_from_node0.txt"))?,
+            "baton-pass-payload\n"
         );
         worker.shutdown()?;
         fs::remove_dir_all(cleanup_root)?;
@@ -4183,14 +4347,13 @@ mod integration_tests {
             2,
             &forge_domain::DagNodeLifecycle::Active,
         )?;
-        let review = client.goal_review(scope.clone(), activity_id, goal.id())?;
-        assert!(
-            review
-                .hard_checks()
-                .iter()
-                .all(forge_domain::GoalHardCheck::is_passed)
-        );
-        assert!(review.blockers().is_empty());
+        assert_unsettled_dag_review(
+            &client,
+            &scope,
+            activity_id,
+            goal.id(),
+            active.dag_revision(),
+        )?;
         complete_attributed_goal_node(&client, &scope, coordinator_actor, &goal, &active)?;
 
         let approval_report = approval_coordinator.shutdown()?;
@@ -4390,6 +4553,326 @@ mod integration_tests {
             .get_execution(execution_id)?
             .ok_or("auto approved execution missing")?;
         assert!(execution.state().is_terminal());
+        Ok(())
+    }
+
+    struct DiamondControlCase {
+        name: &'static str,
+        b1_content: &'static str,
+        b2_content: &'static str,
+        expect_conflict_on_b2_complete: bool,
+        expected_settled_content: Option<&'static str>,
+    }
+
+    #[test]
+    fn diamond_dag_handoff_and_explicit_settlement_gate_goal_completion()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let cases = [
+            DiamondControlCase {
+                name: "disjoint_diamond_settles_and_completes_goal",
+                b1_content: "line1-b1\nline2\nline3\nline4\nline5\n",
+                b2_content: "line1\nline2\nline3\nline4\nline5-b2\n",
+                expect_conflict_on_b2_complete: false,
+                expected_settled_content: Some("line1-b1\nline2\nline3-c\nline4\nline5-b2\n"),
+            },
+            DiamondControlCase {
+                name: "conflicting_diamond_fails_closed_before_sql_commit",
+                b1_content: "line1-b1\nline2\nline3\nline4\nline5\n",
+                b2_content: "line1-b2-conflict\nline2\nline3\nline4\nline5\n",
+                expect_conflict_on_b2_complete: true,
+                expected_settled_content: None,
+            },
+        ];
+        for (idx, case) in cases.iter().enumerate() {
+            run_diamond_control_case(idx, case)?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines, clippy::similar_names)]
+    fn run_diamond_control_case(
+        idx: usize,
+        case: &DiamondControlCase,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = fixture(&format!("diamond-dag-{}", case.name), &[0], 1)?;
+        let workspace_root = fixture.workspaces[0].clone();
+        let cleanup_root = fixture.root.clone();
+        fs::write(
+            workspace_root.join("shared.txt"),
+            "line1\nline2\nline3\nline4\nline5\n",
+        )?;
+        let locator = locator_for(&fixture.control, fixture.location_id, "workspace-0")?;
+        let (client, mut worker) = ForgeControlWorker::start(fixture.control)?;
+        let scope = client.resolve_workspace(
+            fixture.location_id,
+            forge_domain::LocationRevision::INITIAL,
+            locator,
+        )?;
+        let base_seed = 0xED00_u128 + (idx as u128) * 0x100;
+        let activity_id = ActivityId::from_uuid(id(base_seed + 1));
+        let owner = RuntimeInstanceId::from_uuid(id(base_seed + 2));
+        let _activity = client
+            .bootstrap_activity(
+                scope.clone(),
+                activity_id,
+                owner,
+                timestamp(0)?,
+                timestamp(60_000)?,
+            )?
+            .activity()
+            .cloned()
+            .ok_or("diamond Activity missing")?;
+        let actor = claim_stdio_coordinator(
+            &client,
+            &scope,
+            activity_id,
+            forge_domain::AgentInstanceId::from_uuid(id(base_seed + 3)),
+            "Diamond coordinator",
+            timestamp(1)?,
+        )?;
+        let goal = RegisteredGoal::create(
+            GoalId::from_uuid(id(base_seed + 4)),
+            scope.workspace_id(),
+            activity_id,
+            GoalContract::new(
+                GoalObjective::new(format!("Diamond case {}", case.name))?,
+                vec![GoalStatement::new("Diamond nodes settled".to_owned())?],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )?,
+            timestamp(2)?,
+        );
+        let _ = client.goal_create(scope.clone(), actor, goal.clone())?;
+
+        let node_a_id = forge_domain::DagNodeId::from_uuid(id(base_seed + 10));
+        let node_b1_id = forge_domain::DagNodeId::from_uuid(id(base_seed + 11));
+        let node_b2_id = forge_domain::DagNodeId::from_uuid(id(base_seed + 12));
+        let node_c_id = forge_domain::DagNodeId::from_uuid(id(base_seed + 13));
+        let make_def =
+            |nid,
+             ord,
+             title: &str|
+             -> Result<forge_domain::DagNodeDefinition, Box<dyn std::error::Error>> {
+                Ok(forge_domain::DagNodeDefinition::new(
+                    nid,
+                    forge_domain::DagNodeOrdinal::new(ord)?,
+                    forge_domain::DagNodeTitle::new(title.to_owned())?,
+                    forge_domain::DagNodeObjective::new(format!("{title} summary"))?,
+                    vec![forge_domain::DagAcceptanceCriterion::new(format!(
+                        "{title} criterion"
+                    ))?],
+                )?)
+            };
+        let def_a = make_def(node_a_id, 0, "Node A")?;
+        let def_b1 = make_def(node_b1_id, 1, "Node B1")?;
+        let def_b2 = make_def(node_b2_id, 2, "Node B2")?;
+        let def_c = make_def(node_c_id, 3, "Node C")?;
+        let edges = vec![
+            forge_domain::DagEdge::new(node_a_id, node_b1_id),
+            forge_domain::DagEdge::new(node_a_id, node_b2_id),
+            forge_domain::DagEdge::new(node_b1_id, node_c_id),
+            forge_domain::DagEdge::new(node_b2_id, node_c_id),
+        ];
+        let ts3 = timestamp(3)?;
+        let revision = forge_domain::DagRevision::new(
+            forge_domain::DagRevisionId::from_uuid(id(base_seed + 14)),
+            goal.id(),
+            goal.revision(),
+            forge_domain::DagRevisionNumber::INITIAL,
+            None,
+            vec![def_a.clone(), def_b1.clone(), def_b2.clone(), def_c.clone()],
+            edges,
+            ts3,
+        )?;
+        let dag_rev = revision.number();
+        let nodes = [def_a, def_b1, def_b2, def_c]
+            .into_iter()
+            .map(|def| RegisteredDagNode::create(goal.id(), dag_rev, def, ts3))
+            .collect::<Vec<_>>();
+        let draft = forge_domain::AgentDagDraft::new(revision, nodes, Vec::new())?;
+        let _stored = commit_initial_agent_dag_plan(
+            &client,
+            &scope,
+            actor,
+            GoalAttribution::new(goal.id(), goal.revision()),
+            draft,
+            InitialAgentDagPlanIdentity {
+                request_id: forge_domain::AgentDagPlanRequestId::from_uuid(id(base_seed + 15)),
+                history_update_id: forge_domain::AgentWorkUpdateId::from_uuid(id(base_seed + 16)),
+                observed_at: ts3,
+            },
+        )?;
+
+        let start_node = |nid, rev, ts| {
+            client.dag_node_start(DagNodeStartRequest {
+                scope: scope.clone(),
+                activity_id,
+                session_id: actor.session_id(),
+                principal: actor.principal(),
+                goal_id: goal.id(),
+                expected_goal_revision: goal.revision(),
+                expected_dag_revision: dag_rev,
+                node_id: nid,
+                expected_revision: rev,
+                observed_at: ts,
+            })
+        };
+        let complete_node = |nid, rev, ts| {
+            client.dag_node_complete(crate::DagNodeCompleteRequest {
+                scope: scope.clone(),
+                activity_id,
+                session_id: actor.session_id(),
+                principal: actor.principal(),
+                goal_id: goal.id(),
+                expected_goal_revision: goal.revision(),
+                expected_dag_revision: dag_rev,
+                node_id: nid,
+                expected_revision: rev,
+                observed_at: ts,
+            })
+        };
+
+        let active_a = start_node(
+            node_a_id,
+            forge_domain::DagNodeRevision::INITIAL,
+            timestamp(4)?,
+        )?;
+        let receipt_a = client
+            .dag_node_workspace(scope.clone(), goal.id(), dag_rev, node_a_id)?
+            .ok_or("node A workspace missing")?;
+        assert!(!receipt_a.worktree_path().starts_with(&workspace_root));
+        let _done_a = complete_node(node_a_id, active_a.revision(), timestamp(5)?)?;
+
+        let active_b1 = start_node(
+            node_b1_id,
+            forge_domain::DagNodeRevision::INITIAL,
+            timestamp(6)?,
+        )?;
+        let active_b2 = start_node(
+            node_b2_id,
+            forge_domain::DagNodeRevision::INITIAL,
+            timestamp(7)?,
+        )?;
+        let receipt_b1 = client
+            .dag_node_workspace(scope.clone(), goal.id(), dag_rev, node_b1_id)?
+            .ok_or("node B1 workspace missing")?;
+        let receipt_b2 = client
+            .dag_node_workspace(scope.clone(), goal.id(), dag_rev, node_b2_id)?
+            .ok_or("node B2 workspace missing")?;
+        fs::write(
+            receipt_b1.worktree_path().join("shared.txt"),
+            case.b1_content,
+        )?;
+        fs::write(
+            receipt_b2.worktree_path().join("shared.txt"),
+            case.b2_content,
+        )?;
+
+        let _done_b1 = complete_node(node_b1_id, active_b1.revision(), timestamp(8)?)?;
+        let b2_result = complete_node(node_b2_id, active_b2.revision(), timestamp(9)?);
+        if case.expect_conflict_on_b2_complete {
+            let err = b2_result.err().ok_or("expected B2 completion conflict")?;
+            assert_eq!(err.code(), ControlErrorCode::DagConflict);
+            let current_dag = client
+                .dag_get_current(scope.clone(), goal.id())?
+                .ok_or("current DAG missing")?;
+            let b2_state = current_dag
+                .nodes()
+                .iter()
+                .find(|node| node.id() == node_b2_id)
+                .ok_or("node B2 missing")?;
+            assert_eq!(
+                b2_state.lifecycle(),
+                &forge_domain::DagNodeLifecycle::Active
+            );
+            worker.shutdown()?;
+            fs::remove_dir_all(cleanup_root)?;
+            return Ok(());
+        }
+
+        let _done_b2 = b2_result?;
+        let active_c = start_node(
+            node_c_id,
+            forge_domain::DagNodeRevision::INITIAL,
+            timestamp(10)?,
+        )?;
+        let receipt_c = client
+            .dag_node_workspace(scope.clone(), goal.id(), dag_rev, node_c_id)?
+            .ok_or("node C workspace missing")?;
+        assert_eq!(
+            fs::read_to_string(receipt_c.worktree_path().join("shared.txt"))?,
+            "line1-b1\nline2\nline3\nline4\nline5-b2\n"
+        );
+        fs::write(
+            receipt_c.worktree_path().join("shared.txt"),
+            "line1-b1\nline2\nline3-c\nline4\nline5-b2\n",
+        )?;
+        let _done_c = complete_node(node_c_id, active_c.revision(), timestamp(11)?)?;
+
+        assert_eq!(
+            fs::read_to_string(workspace_root.join("shared.txt"))?,
+            "line1\nline2\nline3\nline4\nline5\n"
+        );
+        let review_before = client.goal_review(scope.clone(), activity_id, goal.id())?;
+        assert!(review_before.blockers().contains(
+            &forge_domain::GoalCompletionBlocker::UnsettledDagRevision(dag_rev)
+        ));
+        let blocked = client.goal_complete(GoalCompletionRequest {
+            scope: scope.clone(),
+            activity_id,
+            actor,
+            goal_id: goal.id(),
+            expected_revision: goal.revision(),
+            review_id: id(base_seed + 20),
+            observed_at: timestamp(12)?,
+        });
+        assert_eq!(
+            blocked.err().map(|e| e.code()),
+            Some(ControlErrorCode::GoalCompletionBlocked)
+        );
+
+        let settlement = client.dag_settle(crate::DagSettleRequest {
+            scope: scope.clone(),
+            activity_id,
+            session_id: actor.session_id(),
+            principal: actor.principal(),
+            goal_id: goal.id(),
+            expected_goal_revision: goal.revision(),
+            expected_dag_revision: dag_rev,
+            settlement_id: id(base_seed + 21),
+            observed_at: timestamp(13)?,
+        })?;
+        assert_eq!(
+            settlement.state(),
+            crate::DagSettlementJournalState::Applied
+        );
+        if let Some(expected_settled) = case.expected_settled_content {
+            assert_eq!(
+                fs::read_to_string(workspace_root.join("shared.txt"))?,
+                expected_settled
+            );
+        }
+
+        let review_after = client.goal_review(scope.clone(), activity_id, goal.id())?;
+        assert!(review_after.blockers().is_empty());
+        let completed_goal = client.goal_complete(GoalCompletionRequest {
+            scope,
+            activity_id,
+            actor,
+            goal_id: goal.id(),
+            expected_revision: goal.revision(),
+            review_id: id(base_seed + 22),
+            observed_at: timestamp(14)?,
+        })?;
+        assert_eq!(
+            completed_goal.status().kind(),
+            forge_domain::GoalStatusKind::Completed
+        );
+
+        worker.shutdown()?;
+        fs::remove_dir_all(cleanup_root)?;
         Ok(())
     }
 }

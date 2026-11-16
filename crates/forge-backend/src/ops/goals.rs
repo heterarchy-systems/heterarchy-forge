@@ -333,6 +333,10 @@ fn blocker_json(value: &GoalCompletionBlocker) -> Value {
             "kind": "unsealed_evidence",
             "evidence": evidence_json(*value),
         }),
+        GoalCompletionBlocker::UnsettledDagRevision(revision) => json!({
+            "kind": "unsettled_dag_revision",
+            "dag_revision": revision.get(),
+        }),
     }
 }
 

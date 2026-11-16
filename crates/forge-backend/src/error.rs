@@ -302,6 +302,16 @@ pub enum ReadbackHint {
         initiating_session_id: Uuid,
         principal: PrincipalReadback,
     },
+    SwarmWorkspace {
+        workspace_id: Uuid,
+        swarm_run_id: Uuid,
+        member_id: Uuid,
+    },
+    SwarmSettlement {
+        workspace_id: Uuid,
+        swarm_run_id: Uuid,
+        settlement_id: Uuid,
+    },
 }
 
 /// Closed transport identity mirroring the native evaluation mutation cases.

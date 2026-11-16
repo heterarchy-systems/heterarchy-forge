@@ -289,7 +289,84 @@ fn assert_entry_projection(native: &forge_persistence::EffectFactOutboxEntry, wi
         EffectFact::AssignmentReviewed(fact) => assert_review_projection(fact, wire),
         EffectFact::AssignmentOffered(fact) => assert_offer_projection(fact, wire),
         EffectFact::AssignmentSubmitted(fact) => assert_submission_projection(fact, wire),
+        EffectFact::DagSettled(fact) => assert_dag_settled_projection(fact, wire),
+        EffectFact::SwarmSettled(fact) => assert_swarm_settled_projection(fact, wire),
     }
+}
+
+fn assert_swarm_settled_projection(fact: &forge_persistence::SwarmSettledEffectFact, wire: &Value) {
+    assert_eq!(wire["fact"]["kind"], "swarm_settled");
+    assert_eq!(
+        wire["fact"]["settlement_id"],
+        fact.settlement_id().to_string()
+    );
+    assert_eq!(
+        wire["fact"]["workspace_id"],
+        fact.workspace_id().into_uuid().to_string()
+    );
+    assert_eq!(
+        wire["fact"]["activity_id"],
+        json!(fact.activity_id().map(forge_domain::ActivityId::into_uuid))
+    );
+    assert_eq!(
+        wire["fact"]["swarm_run_id"],
+        fact.swarm_run_id().into_uuid().to_string()
+    );
+    assert_eq!(
+        wire["fact"]["settled_file_count"],
+        fact.settled_file_count()
+    );
+    assert_eq!(
+        wire["fact"]["settled_tree_digest"],
+        forge_backend::events::hex_encode(&fact.settled_tree_digest())
+    );
+    assert_eq!(
+        wire["fact"]["converged_diff_digest"],
+        forge_backend::events::hex_encode(&fact.converged_diff_digest())
+    );
+    assert_eq!(
+        wire["fact"]["coordinator_agent_id"],
+        fact.coordinator_agent_id().into_uuid().to_string()
+    );
+    assert_eq!(
+        wire["fact"]["coordinator_session_id"],
+        json!(
+            fact.coordinator_session_id()
+                .map(forge_domain::AgentSessionId::into_uuid)
+        )
+    );
+    assert_eq!(wire["fact"]["settled_at_ms"], fact.settled_at().get());
+}
+
+fn assert_dag_settled_projection(fact: &forge_persistence::DagSettledEffectFact, wire: &Value) {
+    assert_eq!(wire["fact"]["kind"], "dag_settled");
+    assert_eq!(
+        wire["fact"]["settlement_id"],
+        fact.settlement_id().to_string()
+    );
+    assert_eq!(
+        wire["fact"]["workspace_id"],
+        fact.workspace_id().into_uuid().to_string()
+    );
+    assert_eq!(
+        wire["fact"]["activity_id"],
+        fact.activity_id().into_uuid().to_string()
+    );
+    assert_eq!(
+        wire["fact"]["goal_id"],
+        fact.goal_id().into_uuid().to_string()
+    );
+    assert_eq!(wire["fact"]["goal_revision"], fact.goal_revision().get());
+    assert_eq!(wire["fact"]["dag_revision"], fact.dag_revision().get());
+    assert_eq!(
+        wire["fact"]["settled_file_count"],
+        fact.settled_file_count()
+    );
+    assert_eq!(
+        wire["fact"]["coordinator_agent_id"],
+        fact.coordinator_agent_id().into_uuid().to_string()
+    );
+    assert_eq!(wire["fact"]["settled_at_ms"], fact.settled_at().get());
 }
 
 fn assert_execution_projection(

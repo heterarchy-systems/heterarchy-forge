@@ -353,12 +353,37 @@ pub(crate) fn goal_from_store(
     Ok(goal)
 }
 
+fn unsettled_dag_revision_for_goal(
+    store: &WorkspaceStore,
+    layout: &ExistingWorkspaceStateLayout,
+    goal_id: GoalId,
+) -> Result<Option<forge_domain::DagRevisionNumber>, ControlError> {
+    let Some(stored_dag) = store
+        .get_current_dag(goal_id)
+        .map_err(map_goal_store_error)?
+    else {
+        return Ok(None);
+    };
+    let sinks = crate::dag::terminal_sink_node_ids(&stored_dag);
+    let settled = forge_workspace::verify_dag_revision_settled(
+        layout,
+        goal_id,
+        stored_dag.revision().number(),
+        &sinks,
+    )
+    .map_err(crate::dag::map_node_workspace_error)?;
+    Ok((!settled).then(|| stored_dag.revision().number()))
+}
+
+#[allow(clippy::too_many_lines)]
 pub(crate) fn review_goal_with_files(
     store: &WorkspaceStore,
     layout: &ExistingWorkspaceStateLayout,
     goal: &RegisteredGoal,
 ) -> Result<GoalReview, ControlError> {
     let durable = store.review_goal(goal.id()).map_err(map_goal_store_error)?;
+    let unsettled_dag_revision = unsettled_dag_revision_for_goal(store, layout, goal.id())?;
+
     let file_requirements = goal
         .contract()
         .verification_requirements()
@@ -378,48 +403,50 @@ pub(crate) fn review_goal_with_files(
                 .map(|index| (index, path, expected_hash))
         })
         .collect::<Vec<_>>();
-    if file_requirements.is_empty() {
+    if file_requirements.is_empty() && unsettled_dag_revision.is_none() {
         return Ok(durable);
     }
-    let confined = ConfinedWorkspace::open(layout).map_err(map_filesystem_error)?;
     let mut observations = HashMap::with_capacity(file_requirements.len());
-    for (index, path, expected_hash) in file_requirements {
-        let check = match confined.observe(path) {
-            Ok(FilePathState::Regular { hash, .. })
-                if expected_hash.is_none_or(|value| value == hash) =>
-            {
-                GoalHardCheck::Passed {
-                    requirement_index: index,
+    if !file_requirements.is_empty() {
+        let confined = ConfinedWorkspace::open(layout).map_err(map_filesystem_error)?;
+        for (index, path, expected_hash) in file_requirements {
+            let check = match confined.observe(path) {
+                Ok(FilePathState::Regular { hash, .. })
+                    if expected_hash.is_none_or(|value| value == hash) =>
+                {
+                    GoalHardCheck::Passed {
+                        requirement_index: index,
+                    }
                 }
-            }
-            Ok(FilePathState::Absent) | Err(ConfinedFilesystemError::NotFound) => {
-                GoalHardCheck::Missing {
-                    requirement_index: index,
+                Ok(FilePathState::Absent) | Err(ConfinedFilesystemError::NotFound) => {
+                    GoalHardCheck::Missing {
+                        requirement_index: index,
+                    }
                 }
-            }
-            Ok(FilePathState::Regular { .. })
-            | Err(
-                ConfinedFilesystemError::ProtectedPath
-                | ConfinedFilesystemError::InvalidPath
-                | ConfinedFilesystemError::TooManyComponents
-                | ConfinedFilesystemError::SymlinkRejected
-                | ConfinedFilesystemError::NonDirectoryAncestor
-                | ConfinedFilesystemError::NonRegularLeaf
-                | ConfinedFilesystemError::HardlinkRejected
-                | ConfinedFilesystemError::PathConflict
-                | ConfinedFilesystemError::StaleWrite
-                | ConfinedFilesystemError::FileTooLarge { .. }
-                | ConfinedFilesystemError::WriteTooLarge { .. }
-                | ConfinedFilesystemError::InvalidPayload
-                | ConfinedFilesystemError::AtomicCreateUnsupported
-                | ConfinedFilesystemError::LockBusy
-                | ConfinedFilesystemError::PostStateMismatch,
-            ) => GoalHardCheck::Failed {
-                requirement_index: index,
-            },
-            Err(error) => return Err(map_filesystem_error(error)),
-        };
-        observations.insert(index, check);
+                Ok(FilePathState::Regular { .. })
+                | Err(
+                    ConfinedFilesystemError::ProtectedPath
+                    | ConfinedFilesystemError::InvalidPath
+                    | ConfinedFilesystemError::TooManyComponents
+                    | ConfinedFilesystemError::SymlinkRejected
+                    | ConfinedFilesystemError::NonDirectoryAncestor
+                    | ConfinedFilesystemError::NonRegularLeaf
+                    | ConfinedFilesystemError::HardlinkRejected
+                    | ConfinedFilesystemError::PathConflict
+                    | ConfinedFilesystemError::StaleWrite
+                    | ConfinedFilesystemError::FileTooLarge { .. }
+                    | ConfinedFilesystemError::WriteTooLarge { .. }
+                    | ConfinedFilesystemError::InvalidPayload
+                    | ConfinedFilesystemError::AtomicCreateUnsupported
+                    | ConfinedFilesystemError::LockBusy
+                    | ConfinedFilesystemError::PostStateMismatch,
+                ) => GoalHardCheck::Failed {
+                    requirement_index: index,
+                },
+                Err(error) => return Err(map_filesystem_error(error)),
+            };
+            observations.insert(index, check);
+        }
     }
     let hard_checks = durable
         .hard_checks()
@@ -431,7 +458,7 @@ pub(crate) fn review_goal_with_files(
                 .unwrap_or_else(|| check.clone())
         })
         .collect::<Vec<_>>();
-    let blockers = durable
+    let mut blockers = durable
         .blockers()
         .iter()
         .copied()
@@ -441,9 +468,15 @@ pub(crate) fn review_goal_with_files(
                 .is_none_or(|check| !check.is_passed()),
             GoalCompletionBlocker::PendingApproval(_)
             | GoalCompletionBlocker::ActiveExecution(_)
-            | GoalCompletionBlocker::UnsealedEvidence(_) => true,
+            | GoalCompletionBlocker::UnsealedEvidence(_)
+            | GoalCompletionBlocker::UnsettledDagRevision(_) => true,
         })
         .collect::<Vec<_>>();
+    if let Some(revision) = unsettled_dag_revision
+        && !blockers.contains(&GoalCompletionBlocker::UnsettledDagRevision(revision))
+    {
+        blockers.push(GoalCompletionBlocker::UnsettledDagRevision(revision));
+    }
     GoalReview::new(
         durable.goal_id(),
         durable.goal_revision(),

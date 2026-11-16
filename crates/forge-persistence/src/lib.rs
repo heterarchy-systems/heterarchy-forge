@@ -3,6 +3,7 @@
 mod agent_session_catalog;
 mod global_registry;
 mod queue_settings_catalog;
+mod swarm_settled;
 mod workspace_activity_successors;
 mod workspace_admission_envelopes;
 mod workspace_agent_assignments;
@@ -99,6 +100,11 @@ pub use queue_settings_catalog::{
     QueueSettings, QueueSettingsCatalog, QueueSettingsCatalogError, QueueSettingsRevision,
     QueueSettingsRevisionError, QueueSettingsTransitionError, RegisteredQueueSettings,
 };
+pub use swarm_settled::{
+    MAX_SWARM_SETTLED_QUERY_LIMIT, SWARM_SETTLED_KIND, SwarmSettledEffectFact,
+    SwarmSettledEffectFactParts, SwarmSettledOutboxEntry, enqueue_swarm_settled,
+    query_swarm_settled,
+};
 pub use workspace_activity_successors::ActivitySuccessorStoreError;
 pub use workspace_admission_envelopes::{
     AdmissionConsumeOutcome, AdmissionEnvelopeConsumption, AdmissionEnvelopeError,
@@ -159,8 +165,9 @@ pub use workspace_diffs::{
 pub use workspace_effect_fact_outbox::{
     AssignmentOfferedEffectFact, AssignmentReviewedEffectFact, AssignmentReviewedOutcome,
     AssignmentSourceRefError, AssignmentSubmittedEffectFact, AssignmentSubmittedSourceRef,
-    ChangeSetTerminalEffectFact, EffectFact, EffectFactOutboxEntry, EffectFactOutboxError,
-    EffectFactVerificationEvidence, ExecutionTerminalEffectFact,
+    ChangeSetTerminalEffectFact, DAG_SETTLED_KIND, DagSettledEffectFact, DagSettledEffectFactParts,
+    EffectFact, EffectFactOutboxEntry, EffectFactOutboxError, EffectFactVerificationEvidence,
+    ExecutionTerminalEffectFact,
 };
 pub use workspace_execution_stops::{
     ExecutionStopCapture, ExecutionStopCaptureStatus, ExecutionStopRecord, ExecutionStopRequest,

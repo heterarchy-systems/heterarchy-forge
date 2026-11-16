@@ -631,6 +631,12 @@ fn delegated_work_focus_and_coordinator_transfer_use_facts_and_deny_legacy_write
         crate::EffectFact::AssignmentSubmitted(_) => {
             unreachable!("execution work must not produce an assignment-submission fact")
         }
+        crate::EffectFact::DagSettled(_) => {
+            unreachable!("execution work must not produce a dag-settled fact")
+        }
+        crate::EffectFact::SwarmSettled(_) => {
+            unreachable!("execution work must not produce a swarm-settled fact")
+        }
     }
     assert!(
         store
@@ -763,6 +769,72 @@ fn delegated_activation_rolls_back_receipt_focus_and_fact_on_agent_insert_failur
     assert_eq!(count(&connection, "SELECT COUNT(*) FROM agent_events")?, 0);
     assert_eq!(count(&connection, "SELECT COUNT(*) FROM agent_inbox")?, 0);
     drop(connection);
+    fs::remove_dir_all(fixture.root)?;
+    Ok(())
+}
+
+#[test]
+fn dag_settled_effect_fact_outbox_round_trips_replays_and_detects_conflicts() -> TestResult {
+    let fixture = fixture("dag-settled-outbox")?;
+    let mut store = reopen(&fixture)?;
+    let fact = crate::DagSettledEffectFact::from_parts(crate::DagSettledEffectFactParts {
+        settlement_id: id(0xD800),
+        workspace_id: fixture.workspace_id,
+        activity_id: fixture.activity_id,
+        goal_id: forge_domain::GoalId::from_uuid(id(0xD801)),
+        goal_revision: forge_domain::GoalRevision::INITIAL,
+        dag_revision: forge_domain::DagRevisionNumber::INITIAL,
+        settled_file_count: 3,
+        settled_tree_digest: [0xAB; 32],
+        coordinator_agent_id: AgentInstanceId::from_uuid(id(0xD802)),
+        coordinator_session_id: Some(AgentSessionId::from_uuid(id(0xD803))),
+        settled_at: timestamp(30)?,
+    })?;
+
+    // Non-delegated workspace is a clean no-op.
+    store.append_dag_settled_effect_fact(&fact)?;
+    assert!(store.effect_fact_outbox(0, 16)?.is_empty());
+
+    let freeze = store.freeze_agent_operations(&AgentOperationsFreezeRequest::new(
+        id(0xD810),
+        id(0xD811),
+        timestamp(4)?,
+    )?)?;
+    let delegation = store.delegate_agent_operations(&freeze, [0x71; 32], timestamp(20)?)?;
+
+    // Append + exact idempotent replay emit a single durable outbox entry.
+    store.append_dag_settled_effect_fact(&fact)?;
+    store.append_dag_settled_effect_fact(&fact)?;
+    let entries = store.effect_fact_outbox(0, 16)?;
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].migration_id(), delegation.migration_id());
+    assert_eq!(entries[0].destination_id(), delegation.destination_id());
+    assert_eq!(
+        entries[0].fact(),
+        &crate::EffectFact::DagSettled(Box::new(fact))
+    );
+
+    // Mutated replay for the same settlement/DAG revision fails closed with ReplayConflict.
+    let conflicting = crate::DagSettledEffectFact::from_parts(crate::DagSettledEffectFactParts {
+        settlement_id: id(0xD800),
+        workspace_id: fixture.workspace_id,
+        activity_id: fixture.activity_id,
+        goal_id: forge_domain::GoalId::from_uuid(id(0xD801)),
+        goal_revision: forge_domain::GoalRevision::INITIAL,
+        dag_revision: forge_domain::DagRevisionNumber::INITIAL,
+        settled_file_count: 4,
+        settled_tree_digest: [0xCD; 32],
+        coordinator_agent_id: AgentInstanceId::from_uuid(id(0xD802)),
+        coordinator_session_id: Some(AgentSessionId::from_uuid(id(0xD803))),
+        settled_at: timestamp(30)?,
+    })?;
+    assert!(matches!(
+        store.append_dag_settled_effect_fact(&conflicting),
+        Err(crate::WorkspaceStoreError::EffectFactOutbox(
+            crate::EffectFactOutboxError::ReplayConflict
+        ))
+    ));
+    drop(store);
     fs::remove_dir_all(fixture.root)?;
     Ok(())
 }

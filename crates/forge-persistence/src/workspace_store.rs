@@ -3572,6 +3572,76 @@ impl WorkspaceStore {
         Ok(result)
     }
 
+    /// Append one terminal `DagSettled` outbox fact once `dag.settle` reaches `Applied`.
+    ///
+    /// # Errors
+    /// Rejects foreign workspace identities, replay conflicts, and SQLite/sidecar write failures.
+    pub fn append_dag_settled_effect_fact(
+        &mut self,
+        fact: &crate::DagSettledEffectFact,
+    ) -> Result<(), WorkspaceStoreError> {
+        self.ensure_live_binding()?;
+        let bound_workspace = self.workspace()?.id();
+        if bound_workspace != fact.workspace_id() {
+            return Err(
+                crate::EffectFactOutboxError::CorruptRecord("effect_fact.workspace_id").into(),
+            );
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        workspace_effect_fact_outbox::append_dag_settled(&transaction, fact)?;
+        transaction.commit()?;
+        self.capture_sidecar_identities()?;
+        Ok(())
+    }
+
+    /// Atomically enqueue one terminal `SwarmSettled` outbox entry (`fact_kind = 6`)
+    /// once a `StandaloneSwarm` settlement reaches `Applied`.
+    ///
+    /// # Errors
+    /// Rejects foreign workspace identities, replay conflicts, and SQLite/sidecar write failures.
+    pub fn append_swarm_settled_effect_fact(
+        &mut self,
+        fact: &crate::SwarmSettledEffectFact,
+    ) -> Result<Option<crate::SwarmSettledOutboxEntry>, WorkspaceStoreError> {
+        self.ensure_live_binding()?;
+        let bound_workspace = self.workspace()?.id();
+        if bound_workspace != fact.workspace_id() {
+            return Err(
+                crate::EffectFactOutboxError::CorruptRecord("effect_fact.workspace_id").into(),
+            );
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let entry = crate::swarm_settled::enqueue_swarm_settled(&transaction, fact)?;
+        transaction.commit()?;
+        self.capture_sidecar_identities()?;
+        Ok(entry)
+    }
+
+    /// Read one bounded page of `SWARM_SETTLED_KIND = 6` outbox entries for this Workspace.
+    ///
+    /// # Errors
+    /// Rejects invalid cursors/bounds, missing/corrupt sidecars, and SQLite read failures.
+    pub fn swarm_settled_effect_facts(
+        &self,
+        after: u64,
+        limit: u32,
+    ) -> Result<Vec<crate::SwarmSettledOutboxEntry>, WorkspaceStoreError> {
+        self.ensure_live_binding()?;
+        let workspace_id = self.workspace()?.id();
+        let entries = crate::swarm_settled::query_swarm_settled(
+            &self.connection,
+            workspace_id,
+            after,
+            limit,
+        )?;
+        self.ensure_live_binding()?;
+        Ok(entries)
+    }
+
     /// Read one bounded page of the durable semantic event stream. The cursor
     /// is the last observed monotonically increasing sequence; the result also
     /// exposes the durable high-water and retention-floor cursors. Pure read.
@@ -16435,6 +16505,12 @@ mod tests {
             crate::EffectFact::AssignmentSubmitted(_) => {
                 unreachable!("file work must not produce an assignment-submission fact")
             }
+            crate::EffectFact::DagSettled(_) => {
+                unreachable!("file work must not produce a dag-settled fact")
+            }
+            crate::EffectFact::SwarmSettled(_) => {
+                unreachable!("file work must not produce a swarm-settled fact")
+            }
         }
         Ok(())
     }
@@ -16520,6 +16596,12 @@ mod tests {
             }
             crate::EffectFact::AssignmentSubmitted(_) => {
                 unreachable!("file work must not produce an assignment-submission fact")
+            }
+            crate::EffectFact::DagSettled(_) => {
+                unreachable!("file work must not produce a dag-settled fact")
+            }
+            crate::EffectFact::SwarmSettled(_) => {
+                unreachable!("file work must not produce a swarm-settled fact")
             }
         }
         assert!(
@@ -16985,6 +17067,12 @@ mod tests {
             }
             crate::EffectFact::AssignmentSubmitted(_) => {
                 unreachable!("tree work must not produce an assignment-submission fact")
+            }
+            crate::EffectFact::DagSettled(_) => {
+                unreachable!("tree work must not produce a dag-settled fact")
+            }
+            crate::EffectFact::SwarmSettled(_) => {
+                unreachable!("tree work must not produce a swarm-settled fact")
             }
         }
         assert_eq!(facts.len(), 1);

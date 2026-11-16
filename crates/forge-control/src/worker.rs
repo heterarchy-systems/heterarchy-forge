@@ -7,14 +7,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use forge_domain::{
     ActivityCoordinatorActor, ActivityId, ActivityLeaseRevision, ActivityListLimit,
     ActivityProjection, ApprovalRequestId, AuthorizedExecutionRead, AutoApprovalScope,
-    AutoApprovalScopeId, ClaimRecoveryLease, CloseActivity, CompleteExecution, DagRevisionNumber,
-    EvaluationClockReading, ExecutionGrant, ExecutionId, ExecutionListLimit, ExecutionOutputCursor,
-    ExecutionOutputEvent, ExecutionOutputRead, FailExecution, GoalId, GoalListLimit, GoalReview,
-    LocationId, LocationRevision, MarkExecutionRunning, RecoveryLeaseDurationMillis,
-    RecoveryMaintenanceLease, RegisteredActivity, RegisteredApprovalRequest, RegisteredDagNode,
-    RegisteredExecution, RegisteredGoal, RegisteredLocation, ReleaseActivityLease,
-    ReleaseRecoveryLease, RenewActivityLease, RenewRecoveryLease, RuntimeInstanceId,
-    SetLocationState, TimestampMillis, VerificationProjection, WorkspaceId, WorkspacePolicy,
+    AutoApprovalScopeId, ClaimRecoveryLease, CloseActivity, CompleteExecution, DagNodeId,
+    DagRevisionNumber, EvaluationClockReading, ExecutionGrant, ExecutionId, ExecutionListLimit,
+    ExecutionOutputCursor, ExecutionOutputEvent, ExecutionOutputRead, FailExecution, GoalId,
+    GoalListLimit, GoalReview, LocationId, LocationRevision, MarkExecutionRunning,
+    RecoveryLeaseDurationMillis, RecoveryMaintenanceLease, RegisteredActivity,
+    RegisteredApprovalRequest, RegisteredDagNode, RegisteredExecution, RegisteredGoal,
+    RegisteredLocation, ReleaseActivityLease, ReleaseRecoveryLease, RenewActivityLease,
+    RenewRecoveryLease, RuntimeInstanceId, SetLocationState, TimestampMillis,
+    VerificationProjection, WorkspaceId, WorkspacePolicy,
 };
 use forge_persistence::{
     ApprovalCleanupApplyOutcome, ApprovalCleanupAttemptId, DagNodeAssignmentSnapshot,
@@ -68,7 +69,9 @@ use crate::coordinator_recovery::{
     CoordinatorRecoveryConfirmRequest, CoordinatorRecoveryHistoryRequest,
     CoordinatorRecoveryPrepareRequest, CoordinatorRecoveryReadRequest,
 };
-use crate::dag::{DagNodeCompleteRequest, DagNodeStartRequest, DagNodeUpdateRequest};
+use crate::dag::{
+    DagNodeCompleteRequest, DagNodeStartRequest, DagNodeUpdateRequest, DagSettleRequest,
+};
 use crate::diff::{
     DiffDoctorRequest, DiffDoctorResult, DiffListRequest, DiffListResult, DiffReadRequest,
     DiffReadResult,
@@ -102,6 +105,11 @@ use crate::service::{
 use crate::started_activity_lease_resume::{
     StartedActivityLeaseResumeGetRequest, StartedActivityLeaseResumeProbeRequest,
     StartedActivityLeaseResumeRunRequest,
+};
+use crate::swarm::{
+    SwarmConvergeRequest, SwarmMaterializeHybridRequest, SwarmMemberCaptureRequest,
+    SwarmPurgeRequest, SwarmSettleOutcome, SwarmSettleRequest, SwarmSettlementGetRequest,
+    SwarmSettlementView, SwarmWorkspaceGetRequest, SwarmWorkspaceProvisionRequest,
 };
 use crate::unstarted_activity_continuation::{
     DurableUnstartedActivityContinuationRequest, UnstartedActivityContinuationGetRequest,
@@ -863,6 +871,13 @@ pub(crate) enum ForgeControlRequest {
         number: DagRevisionNumber,
         response: Response<Option<StoredDagRevision>>,
     },
+    DagNodeWorkspace {
+        scope: ResolvedWorkspaceScope,
+        goal_id: GoalId,
+        dag_revision: DagRevisionNumber,
+        node_id: DagNodeId,
+        response: Response<Option<forge_workspace::NodeWorkspaceReceipt>>,
+    },
     DagNodeStart {
         request: DagNodeStartRequest,
         response: Response<RegisteredDagNode>,
@@ -874,6 +889,42 @@ pub(crate) enum ForgeControlRequest {
     DagNodeUpdate {
         request: DagNodeUpdateRequest,
         response: Response<RegisteredDagNode>,
+    },
+    DagSettle {
+        request: DagSettleRequest,
+        response: Response<forge_workspace::DagSettlementReceipt>,
+    },
+    SwarmWorkspaceProvision {
+        request: SwarmWorkspaceProvisionRequest,
+        response: Response<forge_workspace::SwarmWorkspaceReceipt>,
+    },
+    SwarmWorkspaceGet {
+        request: SwarmWorkspaceGetRequest,
+        response: Response<Option<forge_workspace::SwarmWorkspaceReceipt>>,
+    },
+    SwarmMemberCapture {
+        request: SwarmMemberCaptureRequest,
+        response: Response<forge_workspace::SwarmMemberOutputReceipt>,
+    },
+    SwarmConverge {
+        request: SwarmConvergeRequest,
+        response: Response<forge_workspace::SwarmConvergenceOutcome>,
+    },
+    SwarmSettle {
+        request: SwarmSettleRequest,
+        response: Response<SwarmSettleOutcome>,
+    },
+    SwarmMaterializeHybrid {
+        request: SwarmMaterializeHybridRequest,
+        response: Response<forge_workspace::SwarmSettlementReceipt>,
+    },
+    SwarmSettlementGet {
+        request: SwarmSettlementGetRequest,
+        response: Response<SwarmSettlementView>,
+    },
+    SwarmPurge {
+        request: SwarmPurgeRequest,
+        response: Response<()>,
     },
     RecoveryLeaseGet {
         scope: ResolvedWorkspaceScope,
@@ -3199,6 +3250,22 @@ impl ForgeControlClient {
         })
     }
 
+    pub fn dag_node_workspace(
+        &self,
+        scope: ResolvedWorkspaceScope,
+        goal_id: GoalId,
+        dag_revision: DagRevisionNumber,
+        node_id: DagNodeId,
+    ) -> Result<Option<forge_workspace::NodeWorkspaceReceipt>, ControlClientError> {
+        self.submit(|response| ForgeControlRequest::DagNodeWorkspace {
+            scope,
+            goal_id,
+            dag_revision,
+            node_id,
+            response,
+        })
+    }
+
     pub fn dag_node_start(
         &self,
         request: DagNodeStartRequest,
@@ -3239,6 +3306,73 @@ impl ForgeControlClient {
         request: DagNodeUpdateRequest,
     ) -> Result<PendingControl<RegisteredDagNode>, ControlClientError> {
         self.submit_pending(|response| ForgeControlRequest::DagNodeUpdate { request, response })
+    }
+
+    pub fn dag_settle(
+        &self,
+        request: DagSettleRequest,
+    ) -> Result<forge_workspace::DagSettlementReceipt, ControlClientError> {
+        self.submit_dag_settle(request)?.recv()
+    }
+
+    pub fn submit_dag_settle(
+        &self,
+        request: DagSettleRequest,
+    ) -> Result<PendingControl<forge_workspace::DagSettlementReceipt>, ControlClientError> {
+        self.submit_pending(|response| ForgeControlRequest::DagSettle { request, response })
+    }
+
+    pub fn swarm_workspace_provision(
+        &self,
+        request: SwarmWorkspaceProvisionRequest,
+    ) -> Result<forge_workspace::SwarmWorkspaceReceipt, ControlClientError> {
+        self.submit(|response| ForgeControlRequest::SwarmWorkspaceProvision { request, response })
+    }
+
+    pub fn swarm_workspace_get(
+        &self,
+        request: SwarmWorkspaceGetRequest,
+    ) -> Result<Option<forge_workspace::SwarmWorkspaceReceipt>, ControlClientError> {
+        self.submit(|response| ForgeControlRequest::SwarmWorkspaceGet { request, response })
+    }
+
+    pub fn swarm_member_capture(
+        &self,
+        request: SwarmMemberCaptureRequest,
+    ) -> Result<forge_workspace::SwarmMemberOutputReceipt, ControlClientError> {
+        self.submit(|response| ForgeControlRequest::SwarmMemberCapture { request, response })
+    }
+
+    pub fn swarm_converge(
+        &self,
+        request: SwarmConvergeRequest,
+    ) -> Result<forge_workspace::SwarmConvergenceOutcome, ControlClientError> {
+        self.submit(|response| ForgeControlRequest::SwarmConverge { request, response })
+    }
+
+    pub fn swarm_settle(
+        &self,
+        request: SwarmSettleRequest,
+    ) -> Result<SwarmSettleOutcome, ControlClientError> {
+        self.submit(|response| ForgeControlRequest::SwarmSettle { request, response })
+    }
+
+    pub fn swarm_materialize_hybrid(
+        &self,
+        request: SwarmMaterializeHybridRequest,
+    ) -> Result<forge_workspace::SwarmSettlementReceipt, ControlClientError> {
+        self.submit(|response| ForgeControlRequest::SwarmMaterializeHybrid { request, response })
+    }
+
+    pub fn swarm_settlement_get(
+        &self,
+        request: SwarmSettlementGetRequest,
+    ) -> Result<SwarmSettlementView, ControlClientError> {
+        self.submit(|response| ForgeControlRequest::SwarmSettlementGet { request, response })
+    }
+
+    pub fn swarm_purge(&self, request: SwarmPurgeRequest) -> Result<(), ControlClientError> {
+        self.submit(|response| ForgeControlRequest::SwarmPurge { request, response })
     }
 
     /// Observe the durable Workspace recovery-maintenance lease through the
@@ -4199,6 +4333,33 @@ fn queue_attribution_for_request(request: &ForgeControlRequest) -> QueueAttribut
         ForgeControlRequest::DagNodeUpdate { request, .. } => {
             QueueAttribution::Workspace(request.scope.workspace_id())
         }
+        ForgeControlRequest::DagSettle { request, .. } => {
+            QueueAttribution::Workspace(request.scope.workspace_id())
+        }
+        ForgeControlRequest::SwarmWorkspaceProvision { request, .. } => {
+            QueueAttribution::Workspace(request.scope.workspace_id())
+        }
+        ForgeControlRequest::SwarmWorkspaceGet { request, .. } => {
+            QueueAttribution::Workspace(request.scope.workspace_id())
+        }
+        ForgeControlRequest::SwarmMemberCapture { request, .. } => {
+            QueueAttribution::Workspace(request.scope.workspace_id())
+        }
+        ForgeControlRequest::SwarmConverge { request, .. } => {
+            QueueAttribution::Workspace(request.scope.workspace_id())
+        }
+        ForgeControlRequest::SwarmSettle { request, .. } => {
+            QueueAttribution::Workspace(request.scope.workspace_id())
+        }
+        ForgeControlRequest::SwarmMaterializeHybrid { request, .. } => {
+            QueueAttribution::Workspace(request.scope.workspace_id())
+        }
+        ForgeControlRequest::SwarmSettlementGet { request, .. } => {
+            QueueAttribution::Workspace(request.scope.workspace_id())
+        }
+        ForgeControlRequest::SwarmPurge { request, .. } => {
+            QueueAttribution::Workspace(request.scope.workspace_id())
+        }
         ForgeControlRequest::RecoveryMaintenanceRun { request, .. } => {
             QueueAttribution::Workspace(request.scope.workspace_id())
         }
@@ -4410,6 +4571,7 @@ fn queue_attribution_for_request(request: &ForgeControlRequest) -> QueueAttribut
         | ForgeControlRequest::GoalReview { scope, .. }
         | ForgeControlRequest::DagGetCurrent { scope, .. }
         | ForgeControlRequest::DagGetRevision { scope, .. }
+        | ForgeControlRequest::DagNodeWorkspace { scope, .. }
         | ForgeControlRequest::DagNodeAssignmentSnapshot { scope, .. }
         | ForgeControlRequest::RecoveryLeaseGet { scope, .. }
         | ForgeControlRequest::RecoveryMaintenanceGet { scope, .. }
@@ -4614,7 +4776,10 @@ fn service_class_for_request(request: &ForgeControlRequest) -> ServiceClass {
         | ForgeControlRequest::GoalReview { .. }
         | ForgeControlRequest::DagGetCurrent { .. }
         | ForgeControlRequest::DagGetRevision { .. }
+        | ForgeControlRequest::DagNodeWorkspace { .. }
         | ForgeControlRequest::DagNodeAssignmentSnapshot { .. }
+        | ForgeControlRequest::SwarmWorkspaceGet { .. }
+        | ForgeControlRequest::SwarmSettlementGet { .. }
         | ForgeControlRequest::ActivitySuccessorGet { .. }
         | ForgeControlRequest::ExpiredActivityRecoveryProbe { .. }
         | ForgeControlRequest::ExpiredActivityRecoveryRun { .. }
@@ -4658,6 +4823,13 @@ fn service_class_for_request(request: &ForgeControlRequest) -> ServiceClass {
         | ForgeControlRequest::DagNodeStart { .. }
         | ForgeControlRequest::DagNodeComplete { .. }
         | ForgeControlRequest::DagNodeUpdate { .. }
+        | ForgeControlRequest::DagSettle { .. }
+        | ForgeControlRequest::SwarmWorkspaceProvision { .. }
+        | ForgeControlRequest::SwarmMemberCapture { .. }
+        | ForgeControlRequest::SwarmConverge { .. }
+        | ForgeControlRequest::SwarmSettle { .. }
+        | ForgeControlRequest::SwarmMaterializeHybrid { .. }
+        | ForgeControlRequest::SwarmPurge { .. }
         | ForgeControlRequest::GeneratedPackageAccess { .. } => Work,
         ForgeControlRequest::GeneratedArtifactInventory { .. }
         | ForgeControlRequest::RecoveryLeaseGet { .. }
@@ -5755,10 +5927,20 @@ fn dispatch_activity_request(control: &ForgeControl, request: ForgeControlReques
         | ForgeControlRequest::GoalComplete { .. }
         | ForgeControlRequest::DagGetCurrent { .. }
         | ForgeControlRequest::DagGetRevision { .. }
+        | ForgeControlRequest::DagNodeWorkspace { .. }
         | ForgeControlRequest::DagNodeAssignmentSnapshot { .. }
+        | ForgeControlRequest::SwarmWorkspaceGet { .. }
+        | ForgeControlRequest::SwarmSettlementGet { .. }
         | ForgeControlRequest::DagNodeStart { .. }
         | ForgeControlRequest::DagNodeComplete { .. }
         | ForgeControlRequest::DagNodeUpdate { .. }
+        | ForgeControlRequest::DagSettle { .. }
+        | ForgeControlRequest::SwarmWorkspaceProvision { .. }
+        | ForgeControlRequest::SwarmMemberCapture { .. }
+        | ForgeControlRequest::SwarmConverge { .. }
+        | ForgeControlRequest::SwarmSettle { .. }
+        | ForgeControlRequest::SwarmMaterializeHybrid { .. }
+        | ForgeControlRequest::SwarmPurge { .. }
         | ForgeControlRequest::RecoveryLeaseGet { .. }
         | ForgeControlRequest::RecoveryLeaseClaim { .. }
         | ForgeControlRequest::RecoveryLeaseRenew { .. }
@@ -6000,10 +6182,20 @@ fn dispatch_effect_request_inner(control: &ForgeControl, request: ForgeControlRe
         | ForgeControlRequest::GoalComplete { .. }) => dispatch_goal_request(control, request),
         request @ (ForgeControlRequest::DagGetCurrent { .. }
         | ForgeControlRequest::DagGetRevision { .. }
+        | ForgeControlRequest::DagNodeWorkspace { .. }
         | ForgeControlRequest::DagNodeAssignmentSnapshot { .. }
         | ForgeControlRequest::DagNodeStart { .. }
         | ForgeControlRequest::DagNodeComplete { .. }
-        | ForgeControlRequest::DagNodeUpdate { .. }) => dispatch_dag_request(control, request),
+        | ForgeControlRequest::DagNodeUpdate { .. }
+        | ForgeControlRequest::DagSettle { .. }) => dispatch_dag_request(control, request),
+        request @ (ForgeControlRequest::SwarmWorkspaceProvision { .. }
+        | ForgeControlRequest::SwarmWorkspaceGet { .. }
+        | ForgeControlRequest::SwarmMemberCapture { .. }
+        | ForgeControlRequest::SwarmConverge { .. }
+        | ForgeControlRequest::SwarmSettle { .. }
+        | ForgeControlRequest::SwarmMaterializeHybrid { .. }
+        | ForgeControlRequest::SwarmSettlementGet { .. }
+        | ForgeControlRequest::SwarmPurge { .. }) => dispatch_swarm_request(control, request),
         request @ (ForgeControlRequest::RecoveryLeaseGet { .. }
         | ForgeControlRequest::RecoveryLeaseClaim { .. }
         | ForgeControlRequest::RecoveryLeaseRenew { .. }
@@ -6947,6 +7139,16 @@ fn dispatch_dag_request(control: &ForgeControl, request: ForgeControlRequest) {
         } => {
             let _ignored = response.send(control.dag_get_revision(&scope, goal_id, number));
         }
+        ForgeControlRequest::DagNodeWorkspace {
+            scope,
+            goal_id,
+            dag_revision,
+            node_id,
+            response,
+        } => {
+            let _ignored =
+                response.send(control.dag_node_workspace(&scope, goal_id, dag_revision, node_id));
+        }
         ForgeControlRequest::DagNodeAssignmentSnapshot {
             scope,
             node_scope,
@@ -6968,6 +7170,45 @@ fn dispatch_dag_request(control: &ForgeControl, request: ForgeControlRequest) {
             let result = runtime_timestamp_millis()
                 .and_then(|admitted_at| control.dag_node_update(&request, admitted_at));
             let _ignored = response.send(result);
+        }
+        ForgeControlRequest::DagSettle { request, response } => {
+            let result = runtime_timestamp_millis()
+                .and_then(|admitted_at| control.dag_settle(&request, admitted_at));
+            let _ignored = response.send(result);
+        }
+        other => dispatch_supervisor_request(control, other),
+    }
+}
+
+fn dispatch_swarm_request(control: &ForgeControl, request: ForgeControlRequest) {
+    match request {
+        ForgeControlRequest::SwarmWorkspaceProvision { request, response } => {
+            let _ignored = response.send(control.swarm_workspace_provision(&request));
+        }
+        ForgeControlRequest::SwarmWorkspaceGet { request, response } => {
+            let _ignored = response.send(control.swarm_workspace_get(&request));
+        }
+        ForgeControlRequest::SwarmMemberCapture { request, response } => {
+            let _ignored = response.send(control.swarm_member_capture(&request));
+        }
+        ForgeControlRequest::SwarmConverge { request, response } => {
+            let _ignored = response.send(control.swarm_converge(&request));
+        }
+        ForgeControlRequest::SwarmSettle { request, response } => {
+            let result = runtime_timestamp_millis()
+                .and_then(|admitted_at| control.swarm_settle(&request, admitted_at));
+            let _ignored = response.send(result);
+        }
+        ForgeControlRequest::SwarmMaterializeHybrid { request, response } => {
+            let result = runtime_timestamp_millis()
+                .and_then(|admitted_at| control.swarm_materialize_hybrid(&request, admitted_at));
+            let _ignored = response.send(result);
+        }
+        ForgeControlRequest::SwarmSettlementGet { request, response } => {
+            let _ignored = response.send(control.swarm_settlement_get(&request));
+        }
+        ForgeControlRequest::SwarmPurge { request, response } => {
+            let _ignored = response.send(control.swarm_purge(&request));
         }
         other => dispatch_supervisor_request(control, other),
     }
@@ -7816,10 +8057,20 @@ where
             | ForgeControlRequest::GoalComplete { .. }) => reject_queued_goal(request),
             request @ (ForgeControlRequest::DagGetCurrent { .. }
             | ForgeControlRequest::DagGetRevision { .. }
+            | ForgeControlRequest::DagNodeWorkspace { .. }
             | ForgeControlRequest::DagNodeAssignmentSnapshot { .. }
             | ForgeControlRequest::DagNodeStart { .. }
             | ForgeControlRequest::DagNodeComplete { .. }
-            | ForgeControlRequest::DagNodeUpdate { .. }) => reject_queued_dag(request),
+            | ForgeControlRequest::DagNodeUpdate { .. }
+            | ForgeControlRequest::DagSettle { .. }) => reject_queued_dag(request),
+            request @ (ForgeControlRequest::SwarmWorkspaceProvision { .. }
+            | ForgeControlRequest::SwarmWorkspaceGet { .. }
+            | ForgeControlRequest::SwarmMemberCapture { .. }
+            | ForgeControlRequest::SwarmConverge { .. }
+            | ForgeControlRequest::SwarmSettle { .. }
+            | ForgeControlRequest::SwarmMaterializeHybrid { .. }
+            | ForgeControlRequest::SwarmSettlementGet { .. }
+            | ForgeControlRequest::SwarmPurge { .. }) => reject_queued_swarm(request),
             request @ (ForgeControlRequest::RecoveryLeaseGet { .. }
             | ForgeControlRequest::RecoveryLeaseClaim { .. }
             | ForgeControlRequest::RecoveryLeaseRenew { .. }
@@ -8314,12 +8565,48 @@ fn reject_queued_dag(request: ForgeControlRequest) {
         | ForgeControlRequest::DagGetRevision { response, .. } => {
             let _ignored = response.send(worker_shutting_down());
         }
+        ForgeControlRequest::DagNodeWorkspace { response, .. } => {
+            let _ignored = response.send(worker_shutting_down());
+        }
         ForgeControlRequest::DagNodeAssignmentSnapshot { response, .. } => {
             let _ignored = response.send(worker_shutting_down());
         }
         ForgeControlRequest::DagNodeStart { response, .. }
         | ForgeControlRequest::DagNodeComplete { response, .. }
         | ForgeControlRequest::DagNodeUpdate { response, .. } => {
+            let _ignored = response.send(worker_shutting_down());
+        }
+        ForgeControlRequest::DagSettle { response, .. } => {
+            let _ignored = response.send(worker_shutting_down());
+        }
+        _ => {}
+    }
+}
+
+fn reject_queued_swarm(request: ForgeControlRequest) {
+    match request {
+        ForgeControlRequest::SwarmWorkspaceProvision { response, .. } => {
+            let _ignored = response.send(worker_shutting_down());
+        }
+        ForgeControlRequest::SwarmWorkspaceGet { response, .. } => {
+            let _ignored = response.send(worker_shutting_down());
+        }
+        ForgeControlRequest::SwarmMemberCapture { response, .. } => {
+            let _ignored = response.send(worker_shutting_down());
+        }
+        ForgeControlRequest::SwarmConverge { response, .. } => {
+            let _ignored = response.send(worker_shutting_down());
+        }
+        ForgeControlRequest::SwarmSettle { response, .. } => {
+            let _ignored = response.send(worker_shutting_down());
+        }
+        ForgeControlRequest::SwarmMaterializeHybrid { response, .. } => {
+            let _ignored = response.send(worker_shutting_down());
+        }
+        ForgeControlRequest::SwarmSettlementGet { response, .. } => {
+            let _ignored = response.send(worker_shutting_down());
+        }
+        ForgeControlRequest::SwarmPurge { response, .. } => {
             let _ignored = response.send(worker_shutting_down());
         }
         _ => {}

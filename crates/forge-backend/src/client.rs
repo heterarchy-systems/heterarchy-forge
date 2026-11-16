@@ -43,6 +43,8 @@ mod evaluation_evidence;
 mod home_transfer;
 #[path = "client/root_recovery.rs"]
 mod root_recovery;
+#[path = "client/swarm.rs"]
+mod swarm;
 
 pub use evaluation_evidence::ForgeHttpEvaluationEvidenceError;
 pub use home_transfer::{
@@ -1546,7 +1548,82 @@ fn validate_entry(
         EffectFactWire::AssignmentReviewed { .. } => validate_assignment_reviewed(entry),
         EffectFactWire::AssignmentOffered { .. } => validate_assignment_offered(entry),
         EffectFactWire::AssignmentSubmitted { .. } => validate_assignment_submitted(entry),
+        EffectFactWire::DagSettled { .. } => validate_dag_settled(entry),
+        EffectFactWire::SwarmSettled { .. } => validate_swarm_settled(entry),
     }
+}
+
+fn validate_dag_settled(
+    entry: &crate::ops::effect_facts::wire::EffectFactOutboxEntryWire,
+) -> Result<(), ForgeHttpClientError> {
+    let crate::ops::effect_facts::wire::EffectFactWire::DagSettled {
+        settlement_id,
+        workspace_id,
+        activity_id,
+        goal_id,
+        goal_revision,
+        dag_revision,
+        settled_file_count,
+        settled_tree_digest,
+        coordinator_agent_id,
+        coordinator_session_id,
+        settled_at_ms,
+    } = &entry.fact
+    else {
+        return Err(ForgeHttpClientError::Protocol);
+    };
+    if !all_ids(&[
+        *settlement_id,
+        *workspace_id,
+        *activity_id,
+        *goal_id,
+        *coordinator_agent_id,
+    ]) || !optional_id(*coordinator_session_id)
+        || !positive(&[*goal_revision, *dag_revision])
+        || i64::try_from(*settled_file_count).is_err()
+        || !non_zero_hash(settled_tree_digest)
+        || *settled_at_ms < 0
+        || *workspace_id != entry.workspace_id
+    {
+        return Err(ForgeHttpClientError::Protocol);
+    }
+    reject_non_submitted_refs(entry)
+}
+
+fn validate_swarm_settled(
+    entry: &crate::ops::effect_facts::wire::EffectFactOutboxEntryWire,
+) -> Result<(), ForgeHttpClientError> {
+    let crate::ops::effect_facts::wire::EffectFactWire::SwarmSettled {
+        settlement_id,
+        workspace_id,
+        activity_id,
+        swarm_run_id,
+        settled_file_count,
+        settled_tree_digest,
+        converged_diff_digest,
+        coordinator_agent_id,
+        coordinator_session_id,
+        settled_at_ms,
+    } = &entry.fact
+    else {
+        return Err(ForgeHttpClientError::Protocol);
+    };
+    if !all_ids(&[
+        *settlement_id,
+        *workspace_id,
+        *swarm_run_id,
+        *coordinator_agent_id,
+    ]) || !optional_id(*activity_id)
+        || !optional_id(*coordinator_session_id)
+        || i64::try_from(*settled_file_count).is_err()
+        || !non_zero_hash(settled_tree_digest)
+        || !non_zero_hash(converged_diff_digest)
+        || *settled_at_ms < 0
+        || *workspace_id != entry.workspace_id
+    {
+        return Err(ForgeHttpClientError::Protocol);
+    }
+    reject_non_submitted_refs(entry)
 }
 
 fn validate_execution_entry(
@@ -1893,6 +1970,10 @@ fn hash(value: &str) -> bool {
         && value
             .bytes()
             .all(|value| matches!(value, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn non_zero_hash(value: &str) -> bool {
+    hash(value) && !value.bytes().all(|byte| byte == b'0')
 }
 
 fn header_bytes(headers: &HeaderMap) -> usize {
@@ -2632,5 +2713,50 @@ mod tests {
             r#"{"forge_api":1,"op":"effect_fact.outbox","payload":{"after":0,"destination_id":"00000000-0000-0000-0000-000000000104","limit":1,"migration_id":"00000000-0000-0000-0000-000000000103","scope":{"locator":{"expected_revision":1,"location_id":"00000000-0000-0000-0000-000000000102","relative_root":"."},"workspace_id":"00000000-0000-0000-0000-000000000101","workspace_revision":1}},"request_id":"00000000-0000-0000-0000-00000000010b"}"#
         );
         Ok(())
+    }
+
+    #[test]
+    fn swarm_settled_client_validation_enforces_ids_digests_and_no_source_refs() {
+        let workspace_id = Uuid::from_u128(0x101);
+        let valid = crate::ops::effect_facts::wire::EffectFactOutboxEntryWire {
+            sequence: 1,
+            migration_id: Uuid::from_u128(0x103),
+            destination_id: Uuid::from_u128(0x104),
+            workspace_id,
+            fact: crate::ops::effect_facts::wire::EffectFactWire::SwarmSettled {
+                settlement_id: Uuid::from_u128(0x601),
+                workspace_id,
+                activity_id: None,
+                swarm_run_id: Uuid::from_u128(0x602),
+                settled_file_count: 3,
+                settled_tree_digest: "ab".repeat(32),
+                converged_diff_digest: "cd".repeat(32),
+                coordinator_agent_id: Uuid::from_u128(0x603),
+                coordinator_session_id: None,
+                settled_at_ms: 42,
+            },
+            submitted_source_refs: None,
+        };
+        assert_eq!(validate_entry(&valid), Ok(()));
+
+        let mut zero_diff = valid.clone();
+        if let crate::ops::effect_facts::wire::EffectFactWire::SwarmSettled {
+            converged_diff_digest,
+            ..
+        } = &mut zero_diff.fact
+        {
+            *converged_diff_digest = "00".repeat(32);
+        }
+        assert_eq!(
+            validate_entry(&zero_diff),
+            Err(ForgeHttpClientError::Protocol)
+        );
+
+        let mut spurious_refs = valid;
+        spurious_refs.submitted_source_refs = Some(Vec::new());
+        assert_eq!(
+            validate_entry(&spurious_refs),
+            Err(ForgeHttpClientError::Protocol)
+        );
     }
 }

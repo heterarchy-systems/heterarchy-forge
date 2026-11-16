@@ -20,21 +20,26 @@ use thiserror::Error;
 use uuid::Uuid;
 
 mod assignment_submitted;
+mod dag_settled;
+pub(crate) mod settled_sidecar;
 
 pub(crate) use assignment_submitted::append_assignment_submitted;
 pub use assignment_submitted::{
     AssignmentSourceRefError, AssignmentSubmittedEffectFact, AssignmentSubmittedSourceRef,
 };
+pub(crate) use dag_settled::append_dag_settled;
+pub use dag_settled::{DagSettledEffectFact, DagSettledEffectFactParts};
 
-const MAX_PAGE_SIZE: u32 = 64;
+pub(crate) const MAX_PAGE_SIZE: u32 = 64;
 const MAX_SCHEMA_SQL_BYTES: i64 = 16 * 1024;
-const UUID_BYTES: usize = 16;
-const DIGEST_BYTES: usize = 32;
+pub(crate) const UUID_BYTES: usize = 16;
+pub(crate) const DIGEST_BYTES: usize = 32;
 const EXECUTION_TERMINAL_KIND: i64 = 0;
 const CHANGE_SET_TERMINAL_KIND: i64 = 1;
 const ASSIGNMENT_REVIEWED_KIND: i64 = 2;
 const ASSIGNMENT_OFFERED_KIND: i64 = 3;
 const ASSIGNMENT_SUBMITTED_KIND: i64 = 4;
+pub const DAG_SETTLED_KIND: i64 = 5;
 
 const ENTRIES_SQL: &str = "CREATE TABLE effect_fact_outbox_entries (sequence INTEGER PRIMARY KEY NOT NULL CHECK(sequence >= 1), migration_id BLOB NOT NULL CHECK(length(migration_id) = 16 AND migration_id != zeroblob(16)), destination_id BLOB NOT NULL CHECK(length(destination_id) = 16 AND destination_id != zeroblob(16)), workspace_id BLOB NOT NULL REFERENCES workspace(workspace_id) CHECK(length(workspace_id) = 16 AND workspace_id != zeroblob(16)), fact_kind INTEGER NOT NULL CHECK(fact_kind BETWEEN 0 AND 7))";
 const EXECUTION_TERMINAL_SQL: &str = "CREATE TABLE effect_fact_outbox_execution_terminal (outbox_sequence INTEGER PRIMARY KEY NOT NULL REFERENCES effect_fact_outbox_entries(sequence), execution_id BLOB NOT NULL UNIQUE CHECK(length(execution_id) = 16 AND execution_id != zeroblob(16)), activity_id BLOB NOT NULL CHECK(length(activity_id) = 16 AND activity_id != zeroblob(16)), execution_revision INTEGER NOT NULL CHECK(execution_revision >= 1), execution_state INTEGER NOT NULL CHECK(execution_state IN (2,3,4,5,6)), observed_at_ms INTEGER NOT NULL CHECK(observed_at_ms >= 0), agent_id BLOB NOT NULL CHECK(length(agent_id) = 16 AND agent_id != zeroblob(16)), agent_revision INTEGER NOT NULL CHECK(agent_revision >= 1), session_id BLOB CHECK(session_id IS NULL OR (length(session_id) = 16 AND session_id != zeroblob(16))), goal_id BLOB NOT NULL CHECK(length(goal_id) = 16 AND goal_id != zeroblob(16)), goal_revision INTEGER NOT NULL CHECK(goal_revision >= 1), dag_revision INTEGER NOT NULL CHECK(dag_revision >= 1), node_id BLOB NOT NULL CHECK(length(node_id) = 16 AND node_id != zeroblob(16)), node_revision INTEGER NOT NULL CHECK(node_revision >= 1), verification_input_id BLOB CHECK(verification_input_id IS NULL OR (length(verification_input_id) = 16 AND verification_input_id != zeroblob(16))), verification_input_fingerprint BLOB CHECK(verification_input_fingerprint IS NULL OR length(verification_input_fingerprint) = 32), verification_disposition INTEGER CHECK(verification_disposition IS NULL OR verification_disposition BETWEEN 0 AND 3), verification_output_integrity INTEGER CHECK(verification_output_integrity IS NULL OR verification_output_integrity BETWEEN 0 AND 3), verification_output_fingerprint BLOB CHECK(verification_output_fingerprint IS NULL OR length(verification_output_fingerprint) = 32), CHECK((verification_input_id IS NULL AND verification_input_fingerprint IS NULL AND verification_disposition IS NULL AND verification_output_integrity IS NULL AND verification_output_fingerprint IS NULL) OR (verification_input_id IS NOT NULL AND verification_input_fingerprint IS NOT NULL AND verification_disposition IS NOT NULL AND ((verification_disposition = 3 AND ((verification_output_integrity IS NULL AND verification_output_fingerprint IS NULL) OR (verification_output_integrity IS NOT NULL AND verification_output_fingerprint IS NOT NULL))) OR (verification_disposition != 3 AND verification_output_integrity IS NOT NULL AND verification_output_fingerprint IS NOT NULL)))))";
@@ -430,6 +435,8 @@ pub enum EffectFact {
     AssignmentReviewed(Box<AssignmentReviewedEffectFact>),
     AssignmentOffered(Box<AssignmentOfferedEffectFact>),
     AssignmentSubmitted(Box<AssignmentSubmittedEffectFact>),
+    DagSettled(Box<DagSettledEffectFact>),
+    SwarmSettled(Box<crate::SwarmSettledEffectFact>),
 }
 
 /// Terminal Main review outcome recorded by one assignment-review fact.
@@ -1022,8 +1029,7 @@ pub(crate) fn append_execution_terminal(
     {
         let existing = load_entry(connection, existing_sequence)?;
         let expected = EffectFactOutboxEntry {
-            sequence: u64::try_from(existing_sequence)
-                .map_err(|_| EffectFactOutboxError::CorruptRecord("effect_fact.sequence"))?,
+            sequence: decode_sequence(existing_sequence)?,
             migration_id: delegation.migration_id(),
             destination_id: delegation.destination_id(),
             workspace_id: delegation.workspace_id(),
@@ -1099,8 +1105,7 @@ pub(crate) fn append_change_set_terminal(
     {
         let existing = load_entry(connection, existing_sequence)?;
         let expected = EffectFactOutboxEntry {
-            sequence: u64::try_from(existing_sequence)
-                .map_err(|_| EffectFactOutboxError::CorruptRecord("effect_fact.sequence"))?,
+            sequence: decode_sequence(existing_sequence)?,
             migration_id: delegation.migration_id(),
             destination_id: delegation.destination_id(),
             workspace_id: delegation.workspace_id(),
@@ -1172,8 +1177,7 @@ pub(crate) fn append_assignment_reviewed(
     {
         let existing = load_entry(connection, existing_sequence)?;
         let expected = EffectFactOutboxEntry {
-            sequence: u64::try_from(existing_sequence)
-                .map_err(|_| EffectFactOutboxError::CorruptRecord("effect_fact.sequence"))?,
+            sequence: decode_sequence(existing_sequence)?,
             migration_id: delegation.migration_id(),
             destination_id: delegation.destination_id(),
             workspace_id: delegation.workspace_id(),
@@ -1243,8 +1247,7 @@ pub(crate) fn append_assignment_offered(
     {
         let existing = load_entry(connection, existing_sequence)?;
         let expected = EffectFactOutboxEntry {
-            sequence: u64::try_from(existing_sequence)
-                .map_err(|_| EffectFactOutboxError::CorruptRecord("effect_fact.sequence"))?,
+            sequence: decode_sequence(existing_sequence)?,
             migration_id: delegation.migration_id(),
             destination_id: delegation.destination_id(),
             workspace_id: delegation.workspace_id(),
@@ -1313,7 +1316,7 @@ pub(crate) fn read(
         .collect()
 }
 
-fn source_delegation(
+pub(crate) fn source_delegation(
     connection: &Connection,
     workspace_id: WorkspaceId,
 ) -> Result<
@@ -1362,14 +1365,29 @@ fn load_entry(
                 workspace_id,
             )?;
             return Ok(EffectFactOutboxEntry {
-                sequence: u64::try_from(sequence)
-                    .map_err(|_| EffectFactOutboxError::CorruptRecord("effect_fact.sequence"))?,
+                sequence: decode_sequence(sequence)?,
                 migration_id,
                 destination_id,
                 workspace_id,
                 fact: EffectFact::AssignmentSubmitted(Box::new(fact)),
                 submitted_source_refs,
             });
+        }
+        DAG_SETTLED_KIND => EffectFact::DagSettled(Box::new(dag_settled::load(
+            connection,
+            sequence,
+            migration_id,
+            destination_id,
+            workspace_id,
+        )?)),
+        crate::SWARM_SETTLED_KIND => {
+            EffectFact::SwarmSettled(Box::new(crate::swarm_settled::load_record(
+                connection,
+                sequence,
+                migration_id,
+                destination_id,
+                workspace_id,
+            )?))
         }
         _ => {
             return Err(EffectFactOutboxError::CorruptRecord(
@@ -1378,8 +1396,7 @@ fn load_entry(
         }
     };
     Ok(EffectFactOutboxEntry {
-        sequence: u64::try_from(sequence)
-            .map_err(|_| EffectFactOutboxError::CorruptRecord("effect_fact.sequence"))?,
+        sequence: decode_sequence(sequence)?,
         migration_id,
         destination_id,
         workspace_id,
@@ -1850,7 +1867,17 @@ fn decode_assignment_reviewed_outcome(
     }
 }
 
-fn decode_uuid(bytes: &[u8], field: &'static str) -> Result<Uuid, EffectFactOutboxError> {
+pub(crate) fn decode_sequence(sequence: i64) -> Result<u64, EffectFactOutboxError> {
+    u64::try_from(sequence)
+        .ok()
+        .filter(|&seq| seq >= 1)
+        .ok_or(EffectFactOutboxError::CorruptRecord("effect_fact.sequence"))
+}
+
+pub(crate) fn decode_uuid(
+    bytes: &[u8],
+    field: &'static str,
+) -> Result<Uuid, EffectFactOutboxError> {
     if bytes.len() != UUID_BYTES {
         return Err(EffectFactOutboxError::CorruptRecord(field));
     }

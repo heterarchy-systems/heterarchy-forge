@@ -10,8 +10,8 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
-    ActivityId, ApprovalRequestId, ChangeSetId, CheckpointId, ExecutionId, ExecutionRequestDigest,
-    FileContentHash, TimestampMillis, WorkspaceId, WorkspaceRelativePath,
+    ActivityId, ApprovalRequestId, ChangeSetId, CheckpointId, DagRevisionNumber, ExecutionId,
+    ExecutionRequestDigest, FileContentHash, TimestampMillis, WorkspaceId, WorkspaceRelativePath,
 };
 
 pub const MAX_GOAL_OBJECTIVE_BYTES: usize = 4 * 1024;
@@ -897,6 +897,7 @@ pub enum GoalCompletionBlocker {
     PendingApproval(ApprovalRequestId),
     ActiveExecution(ExecutionId),
     UnsealedEvidence(GoalEvidenceRef),
+    UnsettledDagRevision(DagRevisionNumber),
 }
 
 #[must_use]

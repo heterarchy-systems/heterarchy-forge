@@ -7,7 +7,8 @@ use forge_domain::{
 use forge_persistence::{
     AssignmentOfferedEffectFact, AssignmentReviewedEffectFact, AssignmentReviewedOutcome,
     AssignmentSubmittedEffectFact, AssignmentSubmittedSourceRef, ChangeSetTerminalEffectFact,
-    EffectFact, EffectFactOutboxEntry, ExecutionTerminalEffectFact,
+    DagSettledEffectFact, EffectFact, EffectFactOutboxEntry, ExecutionTerminalEffectFact,
+    SwarmSettledEffectFact,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use uuid::Uuid;
@@ -163,6 +164,31 @@ pub enum EffectFactWire {
         result_digest: Option<String>,
         submitted_at_ms: i64,
     },
+    DagSettled {
+        settlement_id: Uuid,
+        workspace_id: Uuid,
+        activity_id: Uuid,
+        goal_id: Uuid,
+        goal_revision: i64,
+        dag_revision: i64,
+        settled_file_count: u64,
+        settled_tree_digest: String,
+        coordinator_agent_id: Uuid,
+        coordinator_session_id: Option<Uuid>,
+        settled_at_ms: i64,
+    },
+    SwarmSettled {
+        settlement_id: Uuid,
+        workspace_id: Uuid,
+        activity_id: Option<Uuid>,
+        swarm_run_id: Uuid,
+        settled_file_count: u64,
+        settled_tree_digest: String,
+        converged_diff_digest: String,
+        coordinator_agent_id: Uuid,
+        coordinator_session_id: Option<Uuid>,
+        settled_at_ms: i64,
+    },
 }
 
 impl EffectFactWire {
@@ -173,6 +199,8 @@ impl EffectFactWire {
             EffectFact::AssignmentReviewed(fact) => Ok(assignment_reviewed_wire(fact)),
             EffectFact::AssignmentOffered(fact) => Ok(assignment_offered_wire(fact)),
             EffectFact::AssignmentSubmitted(fact) => assignment_submitted_wire(fact),
+            EffectFact::DagSettled(fact) => Ok(dag_settled_wire(fact)),
+            EffectFact::SwarmSettled(fact) => Ok(swarm_settled_wire(fact)),
         }
     }
 }
@@ -429,6 +457,41 @@ fn assignment_submitted_wire(
     })
 }
 
+fn dag_settled_wire(value: &DagSettledEffectFact) -> EffectFactWire {
+    EffectFactWire::DagSettled {
+        settlement_id: value.settlement_id(),
+        workspace_id: value.workspace_id().into_uuid(),
+        activity_id: value.activity_id().into_uuid(),
+        goal_id: value.goal_id().into_uuid(),
+        goal_revision: value.goal_revision().get(),
+        dag_revision: value.dag_revision().get(),
+        settled_file_count: value.settled_file_count(),
+        settled_tree_digest: hex(&value.settled_tree_digest()),
+        coordinator_agent_id: value.coordinator_agent_id().into_uuid(),
+        coordinator_session_id: value
+            .coordinator_session_id()
+            .map(forge_domain::AgentSessionId::into_uuid),
+        settled_at_ms: value.settled_at().get(),
+    }
+}
+
+pub(crate) fn swarm_settled_wire(value: &SwarmSettledEffectFact) -> EffectFactWire {
+    EffectFactWire::SwarmSettled {
+        settlement_id: value.settlement_id(),
+        workspace_id: value.workspace_id().into_uuid(),
+        activity_id: value.activity_id().map(forge_domain::ActivityId::into_uuid),
+        swarm_run_id: value.swarm_run_id().into_uuid(),
+        settled_file_count: value.settled_file_count(),
+        settled_tree_digest: hex(&value.settled_tree_digest()),
+        converged_diff_digest: hex(&value.converged_diff_digest()),
+        coordinator_agent_id: value.coordinator_agent_id().into_uuid(),
+        coordinator_session_id: value
+            .coordinator_session_id()
+            .map(forge_domain::AgentSessionId::into_uuid),
+        settled_at_ms: value.settled_at().get(),
+    }
+}
+
 fn source_ref_wire(value: &AssignmentSubmittedSourceRef) -> AssignmentSubmittedSourceRefWire {
     AssignmentSubmittedSourceRefWire {
         ordinal: value.ordinal(),
@@ -552,4 +615,39 @@ const fn verification_output_integrity_wire(
 
 fn hex(value: &[u8]) -> String {
     super::super::encode_hex(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use forge_domain::{
+        ActivityId, AgentInstanceId, AgentSessionId, SwarmRunId, TimestampMillis, WorkspaceId,
+    };
+    use forge_persistence::SwarmSettledEffectFactParts;
+
+    use super::*;
+
+    #[test]
+    fn swarm_settled_wire_projects_native_fact_and_round_trips_json()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let native = SwarmSettledEffectFact::from_parts(SwarmSettledEffectFactParts {
+            settlement_id: Uuid::from_u128(0x7001),
+            workspace_id: WorkspaceId::from_uuid(Uuid::from_u128(0x7002)),
+            activity_id: Some(ActivityId::from_uuid(Uuid::from_u128(0x7003))),
+            swarm_run_id: SwarmRunId::from_uuid(Uuid::from_u128(0x7004)),
+            settled_file_count: 5,
+            settled_tree_digest: [0xaa; 32],
+            converged_diff_digest: [0xbb; 32],
+            coordinator_agent_id: AgentInstanceId::from_uuid(Uuid::from_u128(0x7005)),
+            coordinator_session_id: Some(AgentSessionId::from_uuid(Uuid::from_u128(0x7006))),
+            settled_at: TimestampMillis::new(9_000)?,
+        })?;
+        let projected = EffectFactWire::from_native(&EffectFact::SwarmSettled(Box::new(native)))?;
+        let json = serde_json::to_value(&projected)?;
+        assert_eq!(json["kind"], "swarm_settled");
+        assert_eq!(json["settled_tree_digest"], "aa".repeat(32));
+        assert_eq!(json["converged_diff_digest"], "bb".repeat(32));
+        let decoded: EffectFactWire = serde_json::from_value(json)?;
+        assert_eq!(decoded, projected);
+        Ok(())
+    }
 }

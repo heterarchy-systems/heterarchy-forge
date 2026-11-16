@@ -49,6 +49,12 @@ pub use forge_control::{
     HomeTransferSourceService,
 };
 pub use http::{AppState, ServerJoinState, ShutdownPhase, ShutdownReport, router, serve};
+pub use ops::swarm::{
+    SettlementJournalStateWire, SwarmConvergenceOutcomeWire, SwarmMemberOutputWire, SwarmPurgeWire,
+    SwarmSettleWire, SwarmSettledOutboxEntryWire, SwarmSettlementGetWire,
+    SwarmSettlementReceiptWire, SwarmTargetWire, SwarmWorkspaceGetWire, SwarmWorkspaceModeWire,
+    SwarmWorkspaceReceiptWire,
+};
 pub use ops::workspace_root_recovery::{
     WorkspaceRootRecoveryAuthorityModeWire, WorkspaceRootRecoveryCommitStatus,
     WorkspaceRootRecoveryCommitWire, WorkspaceRootRecoveryDelegationFenceWire,

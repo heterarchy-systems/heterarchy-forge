@@ -11,8 +11,8 @@ use serde_json::json;
 use uuid::Uuid;
 
 use forge_control::{
-    DagNodeCompleteRequest, DagNodeStartRequest, ForgeControlClient, ProjectCommandListRequest,
-    ResolvedWorkspaceScope,
+    DagNodeCompleteRequest, DagNodeStartRequest, DagSettleRequest, ForgeControlClient,
+    ProjectCommandListRequest, ResolvedWorkspaceScope,
 };
 use forge_domain::{
     ActivityId, DagNodeId, DagNodeRevision, DagRevisionNumber, ExecutionGrantRevision, ExecutionId,
@@ -54,6 +54,7 @@ pub mod queue_observation;
 pub mod queue_preference;
 pub mod recovery_leases;
 mod recovery_maintenance;
+pub mod swarm;
 mod work_cuts;
 pub mod workspace_root_recovery;
 pub mod workspace_stop;
@@ -172,6 +173,16 @@ define_command_ops! {
     AgentAssignmentOfferSealGet => "agent.assignment_offer_seal_get",
     NodeStart => "node.start",
     NodeComplete => "node.complete",
+    NodeWorkspace => "node.workspace",
+    DagSettle => "dag.settle",
+    SwarmWorkspaceProvision => "swarm.workspace_provision",
+    SwarmWorkspaceGet => "swarm.workspace_get",
+    SwarmMemberCapture => "swarm.member_capture",
+    SwarmConverge => "swarm.converge",
+    SwarmSettle => "swarm.settle",
+    SwarmMaterializeHybrid => "swarm.materialize_hybrid",
+    SwarmSettlementGet => "swarm.settlement_get",
+    SwarmPurge => "swarm.purge",
     CommandList => "command.list",
     ExecutionBegin => "execution.begin",
     WorkspaceStop => "execution.stop_workspace",
@@ -265,6 +276,13 @@ impl CommandOp {
                 | Self::AgentAssignmentOfferSealGet
                 | Self::NodeStart
                 | Self::NodeComplete
+                | Self::DagSettle
+                | Self::SwarmWorkspaceProvision
+                | Self::SwarmMemberCapture
+                | Self::SwarmConverge
+                | Self::SwarmSettle
+                | Self::SwarmMaterializeHybrid
+                | Self::SwarmPurge
                 | Self::ExecutionBegin
                 | Self::WorkspaceStop
                 | Self::WorkspaceStopGet
@@ -346,6 +364,28 @@ pub struct PrincipalDto {
     token_id: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     grant_id: Option<Uuid>,
+}
+
+impl PrincipalDto {
+    pub(crate) fn from_domain(value: forge_domain::AuthenticatedPrincipal) -> Self {
+        match value {
+            forge_domain::AuthenticatedPrincipal::TrustedStdio => Self {
+                kind: PrincipalKindDto::TrustedStdio,
+                token_id: None,
+                grant_id: None,
+            },
+            forge_domain::AuthenticatedPrincipal::DirectToken(id) => Self {
+                kind: PrincipalKindDto::DirectToken,
+                token_id: Some(id.into_uuid()),
+                grant_id: None,
+            },
+            forge_domain::AuthenticatedPrincipal::OAuthGrant(id) => Self {
+                kind: PrincipalKindDto::OAuthGrant,
+                token_id: None,
+                grant_id: Some(id.into_uuid()),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -533,6 +573,21 @@ pub enum Command {
     NodeComplete {
         request_id: Uuid,
         request: DagNodeCompleteRequest,
+    },
+    NodeWorkspace {
+        request_id: Uuid,
+        scope: ResolvedWorkspaceScope,
+        goal_id: GoalId,
+        dag_revision: DagRevisionNumber,
+        node_id: DagNodeId,
+    },
+    DagSettle {
+        request_id: Uuid,
+        request: DagSettleRequest,
+    },
+    Swarm {
+        request_id: Uuid,
+        request: Box<swarm::SwarmCommand>,
     },
     CommandList {
         request_id: Uuid,
@@ -845,6 +900,9 @@ impl Command {
             | Self::AgentAssignmentOfferSealGet { request_id, .. }
             | Self::NodeStart { request_id, .. }
             | Self::NodeComplete { request_id, .. }
+            | Self::NodeWorkspace { request_id, .. }
+            | Self::DagSettle { request_id, .. }
+            | Self::Swarm { request_id, .. }
             | Self::CommandList { request_id, .. }
             | Self::ExecutionBegin { request_id, .. }
             | Self::ExecutionCancel { request_id, .. }
@@ -1016,6 +1074,9 @@ impl Command {
         if let Self::GoalDelete { request, .. } = self {
             return Some(crate::error::ReadbackHint::goal_deletion(request.request));
         }
+        if let Self::Swarm { request, .. } = self {
+            return swarm::readback_hint(request);
+        }
         if let Self::GoalMutation { request, .. } = self {
             let command = &request.command;
             return Some(crate::error::ReadbackHint::GoalMutation {
@@ -1115,6 +1176,9 @@ impl Command {
             Self::AgentAssignmentOfferSealGet { .. } => CommandOp::AgentAssignmentOfferSealGet,
             Self::NodeStart { .. } => CommandOp::NodeStart,
             Self::NodeComplete { .. } => CommandOp::NodeComplete,
+            Self::NodeWorkspace { .. } => CommandOp::NodeWorkspace,
+            Self::DagSettle { .. } => CommandOp::DagSettle,
+            Self::Swarm { request, .. } => request.op(),
             Self::CommandList { .. } => CommandOp::CommandList,
             Self::ExecutionBegin { .. } => CommandOp::ExecutionBegin,
             Self::ExecutionCancel { .. } => CommandOp::ExecutionCancel,
@@ -1388,6 +1452,19 @@ pub fn parse_command(op: CommandOp, request_id: Uuid, payload: &serde_json::Valu
         }),
         CommandOp::NodeStart => parse_node_start(request_id, payload),
         CommandOp::NodeComplete => parse_node_complete(request_id, payload),
+        CommandOp::NodeWorkspace => parse_node_workspace(request_id, payload),
+        CommandOp::DagSettle => parse_dag_settle(request_id, payload),
+        CommandOp::SwarmWorkspaceProvision
+        | CommandOp::SwarmWorkspaceGet
+        | CommandOp::SwarmMemberCapture
+        | CommandOp::SwarmConverge
+        | CommandOp::SwarmSettle
+        | CommandOp::SwarmMaterializeHybrid
+        | CommandOp::SwarmSettlementGet
+        | CommandOp::SwarmPurge => Ok(Command::Swarm {
+            request_id,
+            request: Box::new(swarm::parse(op, payload)?),
+        }),
         CommandOp::CommandList => parse_command_list(request_id, payload),
         CommandOp::ExecutionBegin
         | CommandOp::ExecutionCancel
@@ -1806,6 +1883,60 @@ fn parse_node_complete(request_id: Uuid, payload: &serde_json::Value) -> ParseRe
     })
 }
 
+fn parse_node_workspace(request_id: Uuid, payload: &serde_json::Value) -> ParseResult {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Body {
+        scope: ScopeDto,
+        goal_id: Uuid,
+        dag_revision: i64,
+        node_id: Uuid,
+    }
+    let body: Body = parse_body(payload, "node.workspace payload is invalid")?;
+    Ok(Command::NodeWorkspace {
+        request_id,
+        scope: decode_scope(&body.scope)?,
+        goal_id: GoalId::from_uuid(body.goal_id),
+        dag_revision: decode_dag_revision(body.dag_revision)?,
+        node_id: DagNodeId::from_uuid(body.node_id),
+    })
+}
+
+fn parse_dag_settle(request_id: Uuid, payload: &serde_json::Value) -> ParseResult {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Body {
+        scope: ScopeDto,
+        activity_id: Uuid,
+        actor: SessionActorDto,
+        goal_id: Uuid,
+        expected_goal_revision: i64,
+        expected_dag_revision: i64,
+        settlement_id: Uuid,
+        observed_at_ms: i64,
+    }
+    let body: Body = parse_body(payload, "dag.settle payload is invalid")?;
+    if body.actor.workspace_id != body.scope.workspace_id {
+        return Err(ForgeError::invalid_input(
+            "actor Workspace does not match command scope",
+        ));
+    }
+    Ok(Command::DagSettle {
+        request_id,
+        request: DagSettleRequest {
+            scope: decode_scope(&body.scope)?,
+            activity_id: ActivityId::from_uuid(body.activity_id),
+            session_id: forge_domain::AgentSessionId::from_uuid(body.actor.session_id),
+            principal: decode_principal(&body.actor.principal)?,
+            goal_id: GoalId::from_uuid(body.goal_id),
+            expected_goal_revision: decode_goal_revision(body.expected_goal_revision)?,
+            expected_dag_revision: decode_dag_revision(body.expected_dag_revision)?,
+            settlement_id: body.settlement_id,
+            observed_at: decode_timestamp(body.observed_at_ms)?,
+        },
+    })
+}
+
 fn parse_command_list(request_id: Uuid, payload: &serde_json::Value) -> ParseResult {
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -1884,7 +2015,7 @@ fn parse_diff_read(request_id: Uuid, payload: &serde_json::Value) -> ParseResult
     })
 }
 
-fn parse_body<T: for<'de> Deserialize<'de>>(
+pub(super) fn parse_body<T: for<'de> Deserialize<'de>>(
     payload: &serde_json::Value,
     message: &'static str,
 ) -> Result<T, ForgeError> {
@@ -2165,6 +2296,15 @@ fn execute_on_bridge_inner(
         }
         Command::NodeStart { request, .. } => execute_node_start(client, request),
         Command::NodeComplete { request, .. } => execute_node_complete(client, request),
+        Command::NodeWorkspace {
+            scope,
+            goal_id,
+            dag_revision,
+            node_id,
+            ..
+        } => execute_node_workspace(client, scope, *goal_id, *dag_revision, *node_id),
+        Command::DagSettle { request, .. } => execute_dag_settle(client, request),
+        Command::Swarm { request, .. } => swarm::execute(client, request),
         Command::CommandList { request, .. } => execute_command_list(client, request),
         Command::ExecutionBegin { request, .. } => {
             execution::execute_begin(client, approval, backend_id, issuer, request)
@@ -2560,7 +2700,15 @@ fn execute_node_start(
     let node = client
         .dag_node_start(request.clone())
         .map_err(|error| forge_error_of_client(&error))?;
-    Ok(node_lifecycle_json(&node))
+    let receipt = client
+        .dag_node_workspace(
+            request.scope.clone(),
+            request.goal_id,
+            request.expected_dag_revision,
+            request.node_id,
+        )
+        .map_err(|error| forge_error_of_client(&error))?;
+    Ok(node_lifecycle_json(&node, receipt.as_ref()))
 }
 
 fn execute_node_complete(
@@ -2570,7 +2718,104 @@ fn execute_node_complete(
     let node = client
         .dag_node_complete(request.clone())
         .map_err(|error| forge_error_of_client(&error))?;
-    Ok(node_lifecycle_json(&node))
+    let receipt = client
+        .dag_node_workspace(
+            request.scope.clone(),
+            request.goal_id,
+            request.expected_dag_revision,
+            request.node_id,
+        )
+        .map_err(|error| forge_error_of_client(&error))?;
+    Ok(node_lifecycle_json(&node, receipt.as_ref()))
+}
+
+fn execute_node_workspace(
+    client: &ForgeControlClient,
+    scope: &ResolvedWorkspaceScope,
+    goal_id: GoalId,
+    dag_revision: DagRevisionNumber,
+    node_id: DagNodeId,
+) -> Result<serde_json::Value, ForgeError> {
+    let receipt = client
+        .dag_node_workspace(scope.clone(), goal_id, dag_revision, node_id)
+        .map_err(|error| forge_error_of_client(&error))?;
+    let Some(receipt) = receipt else {
+        return Ok(json!({
+            "goal_id": goal_id.into_uuid(),
+            "dag_revision": dag_revision.get(),
+            "node_id": node_id.into_uuid(),
+            "provisioned": false,
+        }));
+    };
+    Ok(node_workspace_receipt_json(&receipt))
+}
+
+fn execute_dag_settle(
+    client: &ForgeControlClient,
+    request: &DagSettleRequest,
+) -> Result<serde_json::Value, ForgeError> {
+    let receipt = client
+        .dag_settle(request.clone())
+        .map_err(|error| forge_error_of_client(&error))?;
+    let sinks = receipt
+        .terminal_sink_node_ids()
+        .iter()
+        .map(|id| id.into_uuid())
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "settlement_id": receipt.settlement_id(),
+        "goal_id": receipt.goal_id().into_uuid(),
+        "dag_revision": receipt.dag_revision().get(),
+        "state": receipt.state().as_str(),
+        "settled_at_ms": receipt.settled_at().get(),
+        "terminal_sink_node_ids": sinks,
+        "baseline_commit_oid": receipt.baseline_commit_oid(),
+        "candidate_commit_oid": receipt.candidate_commit_oid(),
+        "baseline_tree_blake3": receipt.baseline_tree_blake3(),
+        "settled_tree_blake3": receipt.settled_tree_blake3(),
+        "settled_file_count": receipt.settled_file_count(),
+        "upserted_paths": receipt.upserted_paths(),
+        "deleted_paths": receipt.deleted_paths(),
+    }))
+}
+
+fn node_workspace_receipt_json(receipt: &forge_control::NodeWorkspaceReceipt) -> serde_json::Value {
+    let upstreams = receipt
+        .upstream_node_ids()
+        .iter()
+        .map(|id| id.into_uuid())
+        .collect::<Vec<_>>();
+    let mut value = json!({
+        "goal_id": receipt.goal_id().into_uuid(),
+        "dag_revision": receipt.dag_revision().get(),
+        "node_id": receipt.node_id().into_uuid(),
+        "provisioned": true,
+        "worktree_path": receipt.worktree_path().to_string_lossy(),
+        "upstream_node_ids": upstreams,
+        "provisioned_at_ms": receipt.provisioned_at().get(),
+        "initial_tree_blake3": receipt.initial_tree_blake3(),
+        "initial_file_count": receipt.initial_file_count(),
+        "input_commit_oid": receipt.input_commit_oid(),
+    });
+    if let (Some(object), Some(completed)) = (value.as_object_mut(), receipt.completed()) {
+        object.insert(
+            "completed_at_ms".to_owned(),
+            json!(completed.completed_at().get()),
+        );
+        object.insert(
+            "final_tree_blake3".to_owned(),
+            json!(completed.final_tree_blake3()),
+        );
+        object.insert(
+            "final_file_count".to_owned(),
+            json!(completed.final_file_count()),
+        );
+        object.insert(
+            "output_commit_oid".to_owned(),
+            json!(completed.output_commit_oid()),
+        );
+    }
+    value
 }
 
 /// Full node lifecycle readback from the same in-transaction
@@ -2578,8 +2823,11 @@ fn execute_node_complete(
 /// references, canonical lifecycle vocabulary with its durable reason, the
 /// node revision, and the transition timestamp. The legacy `state` field is
 /// retained additively for existing readers.
-fn node_lifecycle_json(node: &forge_domain::RegisteredDagNode) -> serde_json::Value {
-    json!({
+fn node_lifecycle_json(
+    node: &forge_domain::RegisteredDagNode,
+    receipt: Option<&forge_control::NodeWorkspaceReceipt>,
+) -> serde_json::Value {
+    let mut value = json!({
         "node_id": node.id().into_uuid(),
         "state": format!("{:?}", node.lifecycle()),
         "goal_id": node.goal_id().into_uuid(),
@@ -2588,7 +2836,38 @@ fn node_lifecycle_json(node: &forge_domain::RegisteredDagNode) -> serde_json::Va
         "lifecycle": plan::dag_lifecycle_json(node.lifecycle()),
         "lifecycle_reason": plan::dag_lifecycle_reason_json(node.lifecycle()),
         "updated_at_ms": node.updated_at().get(),
-    })
+    });
+    if let (Some(object), Some(receipt)) = (value.as_object_mut(), receipt) {
+        let upstreams = receipt
+            .upstream_node_ids()
+            .iter()
+            .map(|id| id.into_uuid())
+            .collect::<Vec<_>>();
+        object.insert(
+            "worktree_path".to_owned(),
+            json!(receipt.worktree_path().to_string_lossy()),
+        );
+        object.insert("upstream_node_ids".to_owned(), json!(upstreams));
+        object.insert(
+            "initial_tree_blake3".to_owned(),
+            json!(receipt.initial_tree_blake3()),
+        );
+        object.insert(
+            "input_commit_oid".to_owned(),
+            json!(receipt.input_commit_oid()),
+        );
+        if let Some(completed) = receipt.completed() {
+            object.insert(
+                "final_tree_blake3".to_owned(),
+                json!(completed.final_tree_blake3()),
+            );
+            object.insert(
+                "output_commit_oid".to_owned(),
+                json!(completed.output_commit_oid()),
+            );
+        }
+    }
+    value
 }
 
 fn execute_command_list(
@@ -2825,7 +3104,7 @@ pub(crate) const fn diff_health_json(value: forge_domain::DiffArtifactHealth) ->
     }
 }
 
-fn forge_error_of_client(error: &forge_control::ControlClientError) -> ForgeError {
+pub(super) fn forge_error_of_client(error: &forge_control::ControlClientError) -> ForgeError {
     ForgeError::from_control_client_error(error)
 }
 
@@ -2959,7 +3238,7 @@ fn decode_approval_activity(
     })
 }
 
-fn decode_principal(
+pub(super) fn decode_principal(
     principal: &PrincipalDto,
 ) -> Result<forge_domain::AuthenticatedPrincipal, ForgeError> {
     match (principal.kind, principal.token_id, principal.grant_id) {
@@ -2987,7 +3266,7 @@ fn decode_location_revision(value: i64) -> Result<forge_domain::LocationRevision
         .map_err(|_| ForgeError::invalid_input("revision is invalid"))
 }
 
-fn decode_goal_revision(value: i64) -> Result<GoalRevision, ForgeError> {
+pub(super) fn decode_goal_revision(value: i64) -> Result<GoalRevision, ForgeError> {
     GoalRevision::new(value).map_err(|_| ForgeError::invalid_input("goal revision is invalid"))
 }
 
@@ -2996,7 +3275,7 @@ fn decode_grant_revision(value: i64) -> Result<ExecutionGrantRevision, ForgeErro
         .map_err(|_| ForgeError::invalid_input("grant revision is invalid"))
 }
 
-fn decode_dag_revision(value: i64) -> Result<DagRevisionNumber, ForgeError> {
+pub(super) fn decode_dag_revision(value: i64) -> Result<DagRevisionNumber, ForgeError> {
     DagRevisionNumber::new(value).map_err(|_| ForgeError::invalid_input("dag revision is invalid"))
 }
 
@@ -3004,7 +3283,7 @@ fn decode_node_revision(value: i64) -> Result<DagNodeRevision, ForgeError> {
     DagNodeRevision::new(value).map_err(|_| ForgeError::invalid_input("node revision is invalid"))
 }
 
-fn decode_timestamp(value: i64) -> Result<TimestampMillis, ForgeError> {
+pub(super) fn decode_timestamp(value: i64) -> Result<TimestampMillis, ForgeError> {
     TimestampMillis::new(value).map_err(|_| ForgeError::invalid_input("timestamp is invalid"))
 }
 
@@ -3038,7 +3317,7 @@ fn decode_catalog_fingerprint(
     ))
 }
 
-fn encode_hex(bytes: &[u8]) -> String {
+pub(crate) fn encode_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut encoded = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -3048,7 +3327,7 @@ fn encode_hex(bytes: &[u8]) -> String {
     encoded
 }
 
-fn decode_hex(value: &str) -> Result<Vec<u8>, ForgeError> {
+pub(crate) fn decode_hex(value: &str) -> Result<Vec<u8>, ForgeError> {
     let bytes = value.as_bytes();
     let (pairs, remainder) = bytes.as_chunks::<2>();
     if !remainder.is_empty() {
