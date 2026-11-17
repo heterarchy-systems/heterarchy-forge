@@ -5,6 +5,15 @@ Forge control worker. The standalone host uses Orchestration's logical-session
 authority. HTTP API parity and deployment cutover are still in progress; the
 capability endpoint lists the operations implemented by the current binary.
 
+## Private container image
+
+The private GHCR image is `ghcr.io/heterarchy-systems/heterarchy-forge`.
+Trusted `container-v<Cargo version>` tags publish the numeric Cargo version
+and `latest` after the full Rust CI and Compose smoke pass; the numeric version
+is not overwritten. Pull by numeric version or manifest digest, then provide
+the strict backend configuration, initialized Registry and separate bearer
+secret files described below.
+
 ## Start the two services
 
 Use an existing Forge Registry and an existing Orchestration session catalog.

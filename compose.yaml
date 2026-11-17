@@ -18,6 +18,7 @@
 
 services:
   forge:
+    image: "${FORGE_IMAGE:-forge-backend:local}"
     build:
       context: .
       dockerfile: Dockerfile

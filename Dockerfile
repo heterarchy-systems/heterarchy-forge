@@ -15,6 +15,8 @@
 FROM rust:1.98.0-slim AS build
 WORKDIR /build
 ENV CARGO_TARGET_DIR=/build/target
+ENV TMPDIR=/build/tmp
+RUN mkdir -p "$TMPDIR"
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY vendor ./vendor
 COPY xtask ./xtask
@@ -52,6 +54,7 @@ RUN --security=insecure HETERARCHY_FORGE_RUST_CI_SANDBOX=v1 \
 # Same Debian release as the build stage: the dynamic binary must find a
 # compatible glibc (rust:1.98-slim is Debian 13 trixie).
 FROM debian:trixie-slim AS runtime
+ARG OCI_VERSION=dev
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl bubblewrap git \
     && rm -rf /var/lib/apt/lists/* \
@@ -60,6 +63,8 @@ RUN apt-get update \
     && mkdir -p /state \
     && chown forge:forge /state
 COPY --from=build /build/target/release/forge-backend /usr/local/bin/forge-backend
+LABEL org.opencontainers.image.source="https://github.com/heterarchy-systems/heterarchy-forge" \
+      org.opencontainers.image.version="${OCI_VERSION}"
 USER forge
 WORKDIR /state
 # No environment-variable compatibility layer: the existing strict JSON

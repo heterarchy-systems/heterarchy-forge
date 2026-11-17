@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - main
+    tags:
+      - "container-v*"
   pull_request:
     branches:
       - main
@@ -40,3 +42,135 @@ jobs:
 
       - name: Run canonical CI harness
         run: make ci
+
+  image:
+    name: Private Linux backend image
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/container-v'))
+    needs: ci
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    concurrency:
+      group: container-${{ github.ref }}
+      cancel-in-progress: false
+    env:
+      FORGE_IMAGE: ghcr.io/heterarchy-systems/heterarchy-forge
+      BUILDX_BUILDER: forge-insecure
+
+    steps:
+      - name: Check out trusted source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Validate container reference against Cargo version
+        id: version
+        shell: bash
+        run: .github/scripts/container_version.sh "$GITHUB_REF" Cargo.toml >> "$GITHUB_OUTPUT"
+
+      - name: Verify private package and numeric version preconditions
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/container-v* ]]; then
+            phase=prepare
+          else
+            phase=inspect
+          fi
+          .github/scripts/check_ghcr.sh "$FORGE_IMAGE" "$VERSION" "$phase"
+
+      - name: Set up Buildx with the confined-test entitlement
+        uses: docker/setup-buildx-action@v3
+        with:
+          name: forge-insecure
+          driver: docker-container
+          buildkitd-flags: --allow-insecure-entitlement security.insecure
+
+      - name: Build the exact Linux image locally
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx build \
+            --allow security.insecure \
+            --platform linux/amd64 \
+            --load \
+            --build-arg "OCI_VERSION=$VERSION" \
+            --tag "$FORGE_IMAGE:$VERSION" \
+            .
+
+      - name: Smoke the local image before publication
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          FORGE_PULL_IMAGE: "false"
+        shell: bash
+        run: FORGE_IMAGE="$FORGE_IMAGE:$VERSION" ./docker/smoke.sh
+
+      - name: Log in to GHCR for the tagged publication
+        if: startsWith(github.ref, 'refs/tags/container-v')
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish immutable numeric version and latest
+        if: startsWith(github.ref, 'refs/tags/container-v')
+        id: publish
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          metadata_file="$RUNNER_TEMP/forge-ghcr-image.json"
+          docker buildx build \
+            --allow security.insecure \
+            --platform linux/amd64 \
+            --push \
+            --build-arg "OCI_VERSION=$VERSION" \
+            --tag "$FORGE_IMAGE:$VERSION" \
+            --tag "$FORGE_IMAGE:latest" \
+            --metadata-file "$metadata_file" \
+            .
+          digest="$(jq -er '."containerimage.digest" | select(test("^sha256:[0-9a-f]{64}$"))' "$metadata_file")"
+          printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Verify private publication and numeric tag
+        if: startsWith(github.ref, 'refs/tags/container-v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: .github/scripts/check_ghcr.sh "$FORGE_IMAGE" "$VERSION" published
+
+      - name: Pull the published digest and verify its version label
+        if: startsWith(github.ref, 'refs/tags/container-v')
+        id: published_digest
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          DIGEST: ${{ steps.publish.outputs.digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          image_ref="$FORGE_IMAGE@$DIGEST"
+          docker pull "$image_ref"
+          image_version="$(docker image inspect "$image_ref" --format '{{ index .Config.Labels "org.opencontainers.image.version" }}')"
+          if [[ "$image_version" != "$VERSION" ]]; then
+            echo "published image version label $image_version does not match $VERSION" >&2
+            exit 1
+          fi
+          printf 'image_ref=%s\n' "$image_ref" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke the published digest from the private registry
+        if: startsWith(github.ref, 'refs/tags/container-v')
+        env:
+          FORGE_IMAGE: ${{ steps.published_digest.outputs.image_ref }}
+          FORGE_PULL_IMAGE: "true"
+        shell: bash
+        run: ./docker/smoke.sh

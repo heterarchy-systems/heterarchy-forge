@@ -55,14 +55,6 @@ exec_in_forge() {
     docker compose exec -T forge "$@"
 }
 
-log "step 1/7: compose build"
-docker compose build
-
-generate_secrets
-
-log "step 2/7: compose up"
-docker compose up -d --wait
-
 cleanup() {
     log "compose down -v for isolated project ${COMPOSE_PROJECT_NAME}"
     docker compose down -v --remove-orphans || true
@@ -72,7 +64,34 @@ cleanup() {
     fi
     log "cleanup verified: smoke volume removed, other projects untouched"
 }
+
+FORGE_IMAGE="${FORGE_IMAGE:-}"
+FORGE_PULL_IMAGE="${FORGE_PULL_IMAGE:-false}"
+export FORGE_IMAGE
+case "$FORGE_PULL_IMAGE" in
+    true|false) ;;
+    *) log "FORGE_PULL_IMAGE must be true or false"; exit 2 ;;
+esac
+
+if [ -n "$FORGE_IMAGE" ]; then
+    log "step 1/7: use prebuilt image $FORGE_IMAGE"
+    if [ "$FORGE_PULL_IMAGE" = "true" ]; then
+        docker compose pull forge
+    fi
+else
+    log "step 1/7: compose build"
+    docker compose build
+fi
+
+generate_secrets
+
+log "step 2/7: compose up"
 trap cleanup EXIT
+if [ -n "$FORGE_IMAGE" ]; then
+    docker compose up -d --wait --no-build
+else
+    docker compose up -d --wait
+fi
 
 log "step 3/7: /healthz and /readyz"
 HEALTH="$(exec_in_forge curl -fsS "$HEALTH_URL")"

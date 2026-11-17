@@ -369,6 +369,13 @@ versioned backend tarball attached to the GitHub Release. To publish a version,
 update the workspace version, land it on `main`, then create and push the
 matching tag, for example `v0.2.0`.
 
+Private Linux container images are built and smoke-tested on `main`; only a
+matching `container-v<version>` tag publishes them to
+`ghcr.io/heterarchy-systems/heterarchy-forge` with numeric `<version>` and
+`latest` tags. The numeric image tag is never overwritten, GHCR visibility is
+checked before and after publication, and the published digest is pulled for a
+second startup smoke. The public macOS tarball continues to use `v<version>`.
+
 The backend product slices not yet complete: production Linux
 execution/deployment evidence, production CAS restore authority, two-endpoint
 source move with ChangeSet/Diff/checkpoint recovery, automatic Diff retention
