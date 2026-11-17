@@ -2490,6 +2490,12 @@ mod tests {
     }
 
     impl Fixture {
+        fn for_current_host() -> Result<Self, Box<dyn std::error::Error>> {
+            let architecture = RustCiHostArchitecture::current()
+                .ok_or("Rust CI fixtures require a supported host architecture")?;
+            Self::new(architecture)
+        }
+
         fn new(architecture: RustCiHostArchitecture) -> Result<Self, Box<dyn std::error::Error>> {
             let serial = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
             let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
@@ -2548,7 +2554,7 @@ mod tests {
     #[test]
     fn missing_or_wrong_source_is_unavailable_without_a_fallback()
     -> Result<(), Box<dyn std::error::Error>> {
-        let fixture = Fixture::new(RustCiHostArchitecture::Aarch64)?;
+        let fixture = Fixture::for_current_host()?;
         let availability = RustCiToolchainCapability::availability(&fixture.input);
         assert!(!availability.is_available());
         assert!(matches!(
@@ -2595,7 +2601,7 @@ mod tests {
     #[test]
     fn noncanonical_host_and_wrong_source_types_fail_closed()
     -> Result<(), Box<dyn std::error::Error>> {
-        let fixture = Fixture::new(RustCiHostArchitecture::Aarch64)?;
+        let fixture = Fixture::for_current_host()?;
         let host_alias = fixture.root.join("host-alias");
         std::os::unix::fs::symlink(fixture.input.host_home(), &host_alias)?;
         let aliased_input = RustCiDiscoveryInput::new(
@@ -2634,7 +2640,7 @@ mod tests {
     #[test]
     fn product_view_contains_only_allowed_entries_and_excludes_credentials()
     -> Result<(), Box<dyn std::error::Error>> {
-        let fixture = Fixture::new(RustCiHostArchitecture::Aarch64)?;
+        let fixture = Fixture::for_current_host()?;
         let host = fixture.input.host_home();
         fs::write(host.join(".cargo/credentials.toml"), b"secret")?;
         fs::write(host.join(".cargo/config.toml"), b"[net]\noffline = false\n")?;
@@ -2662,7 +2668,7 @@ mod tests {
     #[test]
     fn mismatched_existing_view_is_typed_and_not_repaired() -> Result<(), Box<dyn std::error::Error>>
     {
-        let fixture = Fixture::new(RustCiHostArchitecture::Aarch64)?;
+        let fixture = Fixture::for_current_host()?;
         fs::create_dir_all(fixture.input.product_cache_root())?;
         let marker = fixture.input.product_cache_root().join("unexpected");
         fs::write(&marker, b"preserve")?;
@@ -2676,7 +2682,7 @@ mod tests {
 
     #[test]
     fn capability_debug_is_redacted() -> Result<(), Box<dyn std::error::Error>> {
-        let fixture = Fixture::new(RustCiHostArchitecture::Aarch64)?;
+        let fixture = Fixture::for_current_host()?;
         let capability = RustCiToolchainCapability::prepare(&fixture.input)?;
         let debug = format!("{capability:?}");
         assert!(!debug.contains(fixture.input.host_home().to_string_lossy().as_ref()));
@@ -2695,7 +2701,7 @@ mod tests {
 
     #[test]
     fn runtime_paths_isolate_workspaces_and_executions() -> Result<(), Box<dyn std::error::Error>> {
-        let fixture = Fixture::new(RustCiHostArchitecture::Aarch64)?;
+        let fixture = Fixture::for_current_host()?;
         let capability = RustCiToolchainCapability::prepare(&fixture.input)?;
         let first = capability.ensure_runtime_paths(
             WorkspaceId::from_uuid(Uuid::from_u128(101)),
@@ -2733,7 +2739,7 @@ mod tests {
     #[test]
     fn generated_package_output_is_execution_scoped_and_reuse_fails_closed()
     -> Result<(), Box<dyn std::error::Error>> {
-        let fixture = Fixture::new(RustCiHostArchitecture::Aarch64)?;
+        let fixture = Fixture::for_current_host()?;
         let capability = RustCiToolchainCapability::prepare(&fixture.input)?;
         let workspace = WorkspaceId::from_uuid(Uuid::from_u128(0x801));
         let fingerprint = WorkspaceRootFingerprint::from_bytes([0x80; 16]);
@@ -2753,7 +2759,7 @@ mod tests {
     #[test]
     fn generated_package_cleanup_requires_exact_hash_and_size()
     -> Result<(), Box<dyn std::error::Error>> {
-        let fixture = Fixture::new(RustCiHostArchitecture::Aarch64)?;
+        let fixture = Fixture::for_current_host()?;
         let capability = RustCiToolchainCapability::prepare(&fixture.input)?;
         let workspace = WorkspaceId::from_uuid(Uuid::from_u128(0x803));
         let fingerprint = WorkspaceRootFingerprint::from_bytes([0x83; 16]);
@@ -2780,7 +2786,7 @@ mod tests {
     #[test]
     fn retained_generated_package_output_can_be_reopened_without_materialization()
     -> Result<(), Box<dyn std::error::Error>> {
-        let fixture = Fixture::new(RustCiHostArchitecture::Aarch64)?;
+        let fixture = Fixture::for_current_host()?;
         let capability = RustCiToolchainCapability::prepare(&fixture.input)?;
         let workspace = WorkspaceId::from_uuid(Uuid::from_u128(0x811));
         let fingerprint = WorkspaceRootFingerprint::from_bytes([0x81; 16]);
@@ -2807,7 +2813,7 @@ mod tests {
     #[test]
     fn startup_accepts_preserved_runtime_orphans_without_reusing_them()
     -> Result<(), Box<dyn std::error::Error>> {
-        let fixture = Fixture::new(RustCiHostArchitecture::Aarch64)?;
+        let fixture = Fixture::for_current_host()?;
         let first_capability = RustCiToolchainCapability::prepare(&fixture.input)?;
         let workspace = WorkspaceId::from_uuid(Uuid::from_u128(301));
         let fingerprint = WorkspaceRootFingerprint::from_bytes([3; 16]);
@@ -2847,7 +2853,7 @@ mod tests {
     #[test]
     fn capability_revalidation_rejects_product_view_symlink_swap()
     -> Result<(), Box<dyn std::error::Error>> {
-        let fixture = Fixture::new(RustCiHostArchitecture::Aarch64)?;
+        let fixture = Fixture::for_current_host()?;
         let capability = RustCiToolchainCapability::prepare(&fixture.input)?;
         let replacement = fixture.root.join("replacement-rustup");
         fs::write(&replacement, b"replacement")?;
@@ -2867,7 +2873,7 @@ mod tests {
         if outer_rust_ci_native_filesystem_checks_unavailable() {
             return Ok(());
         }
-        let fixture = Fixture::new(RustCiHostArchitecture::Aarch64)?;
+        let fixture = Fixture::for_current_host()?;
         let capability = RustCiToolchainCapability::prepare(&fixture.input)?;
         let runtime = capability.ensure_runtime_paths(
             WorkspaceId::from_uuid(Uuid::from_u128(401)),
@@ -2891,7 +2897,7 @@ mod tests {
     #[test]
     fn disk_scan_rejects_top_level_real_directory_replacement()
     -> Result<(), Box<dyn std::error::Error>> {
-        let fixture = Fixture::new(RustCiHostArchitecture::Aarch64)?;
+        let fixture = Fixture::for_current_host()?;
         let capability = RustCiToolchainCapability::prepare(&fixture.input)?;
         let runtime = capability.ensure_runtime_paths(
             WorkspaceId::from_uuid(Uuid::from_u128(551)),
@@ -2920,7 +2926,7 @@ mod tests {
         if outer_rust_ci_native_filesystem_checks_unavailable() {
             return Ok(());
         }
-        let fixture = Fixture::new(RustCiHostArchitecture::Aarch64)?;
+        let fixture = Fixture::for_current_host()?;
         let capability = RustCiToolchainCapability::prepare(&fixture.input)?;
         let runtime = capability.ensure_runtime_paths(
             WorkspaceId::from_uuid(Uuid::from_u128(601)),
@@ -2960,7 +2966,7 @@ mod tests {
     #[test]
     fn cleanup_and_disk_scan_reject_excessive_traversal_depth()
     -> Result<(), Box<dyn std::error::Error>> {
-        let fixture = Fixture::new(RustCiHostArchitecture::Aarch64)?;
+        let fixture = Fixture::for_current_host()?;
         let capability = RustCiToolchainCapability::prepare(&fixture.input)?;
         let runtime = capability.ensure_runtime_paths(
             WorkspaceId::from_uuid(Uuid::from_u128(651)),
@@ -2990,7 +2996,7 @@ mod tests {
         if outer_rust_ci_native_filesystem_checks_unavailable() {
             return Ok(());
         }
-        let fixture = Fixture::new(RustCiHostArchitecture::Aarch64)?;
+        let fixture = Fixture::for_current_host()?;
         let capability = RustCiToolchainCapability::prepare(&fixture.input)?;
         let runtime = capability.ensure_runtime_paths(
             WorkspaceId::from_uuid(Uuid::from_u128(681)),
@@ -3031,7 +3037,7 @@ mod tests {
         if outer_rust_ci_native_filesystem_checks_unavailable() {
             return Ok(());
         }
-        let fixture = Fixture::new(RustCiHostArchitecture::Aarch64)?;
+        let fixture = Fixture::for_current_host()?;
         let capability = RustCiToolchainCapability::prepare(&fixture.input)?;
         let runtime = capability.ensure_runtime_paths(
             WorkspaceId::from_uuid(Uuid::from_u128(701)),
@@ -3078,7 +3084,7 @@ mod tests {
         if outer_rust_ci_native_filesystem_checks_unavailable() {
             return Ok(());
         }
-        let fixture = Fixture::new(RustCiHostArchitecture::Aarch64)?;
+        let fixture = Fixture::for_current_host()?;
         let capability = RustCiToolchainCapability::prepare(&fixture.input)?;
         let runtime = capability.ensure_runtime_paths(
             WorkspaceId::from_uuid(Uuid::from_u128(501)),
@@ -3110,7 +3116,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         use std::cell::Cell;
 
-        let fixture = Fixture::new(RustCiHostArchitecture::Aarch64)?;
+        let fixture = Fixture::for_current_host()?;
         let capability = RustCiToolchainCapability::prepare(&fixture.input)?;
         for successful_attempt in 1_u8..=4 {
             let attempts = Cell::new(0_u8);
@@ -3206,7 +3212,7 @@ mod tests {
     #[test]
     fn fallback_preserves_legacy_view_and_never_creates_a_fake_ssd()
     -> Result<(), Box<dyn std::error::Error>> {
-        let fixture = Fixture::new(RustCiHostArchitecture::Aarch64)?;
+        let fixture = Fixture::for_current_host()?;
         fs::create_dir(fixture.input.product_cache_root())?;
         let retained = fixture.input.product_cache_root().join("retained-artifact");
         fs::write(&retained, b"preserve old execution evidence")?;

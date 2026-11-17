@@ -2480,12 +2480,14 @@ mod tests {
         root: &Path,
     ) -> Result<RustCiToolchainCapability, Box<dyn std::error::Error>> {
         let root = fs::canonicalize(root)?;
+        let architecture = RustCiHostArchitecture::current()
+            .ok_or("Rust CI fixtures require a supported host architecture")?;
         let host = root.join("rust-ci-host");
         fs::create_dir_all(host.join(".cargo/bin"))?;
         fs::create_dir_all(host.join(".cargo/registry"))?;
         fs::create_dir_all(host.join(format!(
             ".rustup/toolchains/{}",
-            crate::rust_ci::pinned_toolchain_name(RustCiHostArchitecture::Aarch64)
+            crate::rust_ci::pinned_toolchain_name(architecture)
         )))?;
         fs::write(host.join(".cargo/bin/rustup"), b"rustup")?;
         fs::write(host.join(".rustup/settings.toml"), b"version = 12\n")?;
@@ -2493,7 +2495,7 @@ mod tests {
         let input = RustCiDiscoveryInput::new(
             host,
             cache,
-            RustCiHostArchitecture::Aarch64,
+            architecture,
             forge_domain::RuntimeInstanceId::from_uuid(uuid::Uuid::from_u128(0x5201)),
         )?;
         Ok(RustCiToolchainCapability::prepare(&input)?)
