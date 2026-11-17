@@ -123,19 +123,22 @@ fn network_probe_child() -> TestResult {
 #[ignore = "requires a direct Linux sandbox host; run the explicit confinement gate"]
 fn verification_mounts_exact_runtime_and_output_without_live_workspace() -> TestResult {
     let (root, layout) = fixture("verification")?;
+    let architecture = crate::RustCiHostArchitecture::current()
+        .ok_or("verification fixture requires a supported host architecture")?;
     let host = root.with_extension("host");
     fs::create_dir_all(host.join(".cargo/bin"))?;
     fs::create_dir_all(host.join(".cargo/registry"))?;
-    fs::create_dir_all(host.join(".rustup/toolchains").join(
-        crate::rust_ci::pinned_toolchain_name(crate::RustCiHostArchitecture::Aarch64),
-    ))?;
+    fs::create_dir_all(
+        host.join(".rustup/toolchains")
+            .join(crate::rust_ci::pinned_toolchain_name(architecture)),
+    )?;
     fs::write(host.join(".cargo/bin/rustup"), b"capability-fixture")?;
     fs::write(host.join(".rustup/settings.toml"), b"version = 12\n")?;
     let cache = root.with_extension("cache");
     let input = crate::RustCiDiscoveryInput::new(
         host.clone(),
         cache.clone(),
-        crate::RustCiHostArchitecture::Aarch64,
+        architecture,
         forge_domain::RuntimeInstanceId::from_uuid(uuid::Uuid::now_v7()),
     )?;
     let capability = RustCiToolchainCapability::prepare(&input)?;
